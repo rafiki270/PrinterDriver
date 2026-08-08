@@ -299,6 +299,12 @@ class PrinterRuntime {
   std::shared_ptr<PrintJob> submit(std::shared_ptr<Payload> payload, JobOptions options,
                                    bool reprint);
 
+  // Addon hooks (docs/sdk-spec.md §12); see the comments on Printer::reserveJob.
+  std::shared_ptr<PrintJob> reserve(const std::string& key, PayloadKind kind,
+                                    uint64_t payload_bytes, bool* created);
+  void submitReserved(const std::shared_ptr<PrintJob>& job,
+                      std::shared_ptr<Payload> payload, JobOptions options);
+
   DeviceStatus status() const {
     std::lock_guard<std::mutex> lock(status_mutex_);
     return status_;
@@ -1062,6 +1068,80 @@ std::shared_ptr<PrintJob> PrinterRuntime::submit(std::shared_ptr<Payload> payloa
   return job;
 }
 
+std::shared_ptr<PrintJob> PrinterRuntime::reserve(const std::string& key, PayloadKind kind,
+                                                  uint64_t payload_bytes, bool* created) {
+  if (created != nullptr) {
+    *created = false;
+  }
+  std::lock_guard<std::mutex> index_lock(index_->mutex);
+  std::string effective_key = key;
+  if (!effective_key.empty()) {
+    const auto existing = index_->by_key.find(effective_key);
+    if (existing != index_->by_key.end()) {
+      // Same rule as submit(): an existing key never produces a second copy, whether
+      // the first one is printing, queued, held or long finished.
+      return existing->second.job;
+    }
+  } else {
+    effective_key = "auto-" + newJobId();
+  }
+
+  const std::string job_id = newJobId();
+  auto job = std::shared_ptr<PrintJob>(new PrintJob(job_id, effective_key, config_.id, 1));
+
+  JobRecord record;
+  record.id = job_id;
+  record.key = effective_key;
+  record.printer_id = config_.id;
+  record.attempt = 1;
+  record.payload_kind = kind;
+  record.payload_bytes = payload_bytes;
+  store_->createJob(record);
+  job->emit(JobState::Queued, ConfidenceLevel::TransportAccepted, std::nullopt);
+
+  JobEntry entry;
+  entry.job = job;
+  entry.printer_id = config_.id;
+  entry.payload = nullptr;  // filled in by submitReserved, once the bytes are released
+  entry.attempt = 1;
+  index_->by_key[effective_key] = entry;
+
+  if (created != nullptr) {
+    *created = true;
+  }
+  return job;
+}
+
+void PrinterRuntime::submitReserved(const std::shared_ptr<PrintJob>& job,
+                                    std::shared_ptr<Payload> payload, JobOptions options) {
+  if (!job || !payload || job->isTerminal()) {
+    return;
+  }
+  {
+    // Recording the payload now is what makes forceReprint work on a job that was
+    // held: the reprint path reuses the entry's payload.
+    std::lock_guard<std::mutex> index_lock(index_->mutex);
+    const auto entry = index_->by_key.find(job->key());
+    if (entry != index_->by_key.end()) {
+      entry->second.payload = payload;
+      entry->second.options = options;
+    }
+  }
+  if (stopping_.load()) {
+    terminate(job, JobState::FailedKnown,
+              JobResult::failed(FailureReason::TransportUnreachable,
+                                ConfidenceLevel::TransportAccepted));
+    return;
+  }
+  Task task;
+  task.run = [this, job, payload, options] { runJob(job, *payload, options, 1); };
+  task.cancel = [this, job] {
+    terminate(job, JobState::FailedKnown,
+              JobResult::failed(FailureReason::Unknown, ConfidenceLevel::TransportAccepted));
+  };
+  push(std::move(task));
+}
+
 DeviceStatus PrinterRuntime::refreshStatus(std::chrono::milliseconds timeout) {
   if (stopping_.load()) {
     return status();
@@ -1161,6 +1241,16 @@ void Printer::subscribe(DeviceEventCallback callback) {
 void Printer::openCashDrawer() { rt_->openCashDrawer(); }
 
 void Printer::drain() { rt_->drain(); }
+
+std::shared_ptr<PrintJob> Printer::reserveJob(const std::string& key, PayloadKind kind,
+                                              uint64_t payload_bytes, bool* created) {
+  return rt_->reserve(key, kind, payload_bytes, created);
+}
+
+void Printer::submitReserved(const std::shared_ptr<PrintJob>& job, Payload payload,
+                             const JobOptions& options) {
+  rt_->submitReserved(job, std::make_shared<Payload>(std::move(payload)), options);
+}
 
 // --- PrinterDriver ---------------------------------------------------------------
 
