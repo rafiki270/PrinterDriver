@@ -76,6 +76,43 @@ target_link_libraries(printerdriver_capi PUBLIC printerdriver_core)
 
 printerdriver_warnings(printerdriver_capi)
 
+# The same ABI as a shared library, for wrappers that dlopen it instead of linking it
+# (wrappers/dart binds this one through dart:ffi). Off by default: the artifact this
+# project ships is the static library above, and an FFI consumer opts in explicitly.
+option(PD_BUILD_SHARED_CAPI
+  "Also build the C ABI as a shared library for FFI wrappers (Dart, Python, ...)" OFF)
+
+if(PD_BUILD_SHARED_CAPI)
+  # The core is static and gets linked into a shared object here, so it has to be
+  # position-independent. Scoped to this option so the default build is untouched.
+  set_property(TARGET printerdriver_core PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+  add_library(printerdriver_capi_shared SHARED capi/src/pd_capi.cpp)
+  set_target_properties(printerdriver_capi_shared PROPERTIES
+    OUTPUT_NAME printerdriver_capi)
+  target_include_directories(printerdriver_capi_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/capi/include>)
+  target_include_directories(printerdriver_capi_shared PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/capi/src)
+  target_link_libraries(printerdriver_capi_shared PRIVATE printerdriver_core)
+  printerdriver_warnings(printerdriver_capi_shared)
+
+  # Same ABI plus the scripted device and the enum bridge, so a wrapper's test suite can
+  # drive a printer that does not exist. A second target rather than a build flag on the
+  # first one: the library that ships must not contain a test double.
+  add_library(printerdriver_capi_testing SHARED
+    capi/src/pd_capi.cpp
+    capi/tests/pd_test_support.cpp)
+  target_include_directories(printerdriver_capi_testing PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/capi/include>)
+  target_include_directories(printerdriver_capi_testing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/capi/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/capi/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
+  target_link_libraries(printerdriver_capi_testing PRIVATE printerdriver_core)
+  printerdriver_warnings(printerdriver_capi_testing)
+endif()
+
 add_executable(pdctl tools/pdctl.cpp)
 target_link_libraries(pdctl PRIVATE printerdriver_core)
 printerdriver_warnings(pdctl)

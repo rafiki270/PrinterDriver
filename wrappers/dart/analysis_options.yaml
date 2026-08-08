@@ -1,0 +1,11 @@
+analyzer:
+  language:
+    strict-casts: true
+    strict-raw-types: true
+
+linter:
+  rules:
+    # A mirrored enum with an unhandled member, or an unhandled JobResult case, is the
+    # exact class of bug this SDK exists to prevent.
+    - exhaustive_cases
+    - unawaited_futures
