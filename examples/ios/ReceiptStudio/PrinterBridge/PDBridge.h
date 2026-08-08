@@ -101,6 +101,9 @@ typedef NS_ENUM(NSInteger, PDDeviceEvent) {
     PDDeviceEventUnrecoverableError,
     PDDeviceEventConnectionLost,
     PDDeviceEventConnectionRestored,
+    /// A GS(H) echo arrived carrying a token this driver never issued: something else is
+    /// writing to the same printer (docs/api.md §14).
+    PDDeviceEventForeignWriterDetected,
 };
 
 #pragma mark - Document ops (docs/api.md §3 tier 2)

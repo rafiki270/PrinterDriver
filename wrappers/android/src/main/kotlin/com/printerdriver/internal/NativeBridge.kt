@@ -103,7 +103,10 @@ internal object NativeBridge {
         cut: Int,
         openDrawer: Boolean,
         preflight: Int,
-        timeoutMs: Int
+        timeoutMs: Int,
+        topFeedDots: Int,
+        bottomFeedDots: Int,
+        suppressVerificationId: Boolean
     ): Long
 
     /** [opKinds]/[opTexts]/[opValues] are parallel arrays, one entry per pd_op (raw
@@ -120,7 +123,10 @@ internal object NativeBridge {
         cut: Int,
         openDrawer: Boolean,
         preflight: Int,
-        timeoutMs: Int
+        timeoutMs: Int,
+        topFeedDots: Int,
+        bottomFeedDots: Int,
+        suppressVerificationId: Boolean
     ): Long
 
     /** Returns 0L on failure. */
@@ -132,7 +138,10 @@ internal object NativeBridge {
         cut: Int,
         openDrawer: Boolean,
         preflight: Int,
-        timeoutMs: Int
+        timeoutMs: Int,
+        topFeedDots: Int,
+        bottomFeedDots: Int,
+        suppressVerificationId: Boolean
     ): Long
 
     /** Returns 0L when [key] is unknown, or when its job was reconstructed from the
@@ -146,11 +155,25 @@ internal object NativeBridge {
         cut: Int,
         openDrawer: Boolean,
         preflight: Int,
-        timeoutMs: Int
+        timeoutMs: Int,
+        topFeedDots: Int,
+        bottomFeedDots: Int,
+        suppressVerificationId: Boolean,
+        suppressBanner: Boolean
     ): Long
 
     /** Returns 0L when [key] is unknown. */
     @JvmStatic external fun findJob(driverHandle: Long, key: String): Long
+
+    /** Paper to job (docs/api.md §14): resolves either of a job's four-character
+     *  verification identifiers, most-recent-first, including jobs reloaded from the
+     *  journal. Returns 0L when no job on this driver ever carried that token. */
+    @JvmStatic external fun jobByToken(driverHandle: Long, token: String): Long
+
+    /** The two characters every identifier this driver issues starts with: which driver
+     *  instance owns an echo. Persisted in the storage directory, so it survives a
+     *  restart. */
+    @JvmStatic external fun instanceNonce(driverHandle: Long): String
 
     // --- Jobs: accessors (none of these take a driver handle -- pd.h doesn't either) -
 
@@ -161,6 +184,14 @@ internal object NativeBridge {
     @JvmStatic external fun jobConfidence(jobHandle: Long): Int
     @JvmStatic external fun jobIsTerminal(jobHandle: Long): Boolean
 
+    /** The identifier the ticket carries as `V:`, or "" until the job reaches a worker
+     *  and for good on a printer whose fence is not GS(H) -- the identifier *is* the
+     *  wire token (docs/api.md §14). */
+    @JvmStatic external fun jobPrintToken(jobHandle: Long): String
+
+    /** The identifier the job's cut fence carried. Same rules as [jobPrintToken]. */
+    @JvmStatic external fun jobCutToken(jobHandle: Long): String
+
     /** Replays every event recorded so far synchronously on the calling thread, then
      *  streams the rest on the printer's worker thread (pd_subscribe_job's documented
      *  contract, unchanged here) -- see README.md "Threading contract". Registers
@@ -168,9 +199,18 @@ internal object NativeBridge {
     @JvmStatic external fun subscribeJob(driverHandle: Long, jobHandle: Long, callback: NativeJobEventCallback)
 
     /** Returns null on timeout (mirrors pd_job_await returning 0 / leaving `out`
-     *  untouched); otherwise the 3 pd_job_result fields packed as
-     *  [outcome, confidence, reason] -- see JobResult.fromRaw. [timeoutMs] 0 waits
-     *  indefinitely; PrintJob.result() never passes 0 directly (it polls with a bounded
-     *  interval instead, for coroutine-cancellation responsiveness -- see PrintJob.kt). */
+     *  untouched); otherwise the five integer pd_job_result fields packed as
+     *  [outcome, confidence, reason, grade, authority] -- see JobResult.fromRaw. The
+     *  sixth field, `method`, is a string and comes from [jobMethod]. [timeoutMs] 0
+     *  waits indefinitely; PrintJob.result() never passes 0 directly (it polls with a
+     *  bounded interval instead, for coroutine-cancellation responsiveness -- see
+     *  PrintJob.kt). */
     @JvmStatic external fun jobAwait(driverHandle: Long, jobHandle: Long, timeoutMs: Int): IntArray?
+
+    /** `pd_job_result.method` for a job [jobAwait] has already settled: the command
+     *  behind the claim, e.g. "GS(H) fn48". A separate call because the value is a
+     *  string and the rest of the struct is an int array; it re-reads the same terminal
+     *  result, which pd_job_await answers immediately once a job is terminal. Returns
+     *  "" if the job is somehow still running. */
+    @JvmStatic external fun jobMethod(driverHandle: Long, jobHandle: Long): String
 }

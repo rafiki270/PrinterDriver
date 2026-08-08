@@ -45,6 +45,7 @@ const char* to_string(DeviceEvent value) noexcept {
     case DeviceEvent::UnrecoverableError: return "UnrecoverableError";
     case DeviceEvent::ConnectionLost: return "ConnectionLost";
     case DeviceEvent::ConnectionRestored: return "ConnectionRestored";
+    case DeviceEvent::ForeignWriterDetected: return "ForeignWriterDetected";
   }
   return "Offline";
 }

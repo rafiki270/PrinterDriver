@@ -2,12 +2,15 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "printerdriver/capability_probe.hpp"
@@ -191,6 +194,11 @@ int usage() {
       "\n"
       "  pdctl identify <host[:port]> [--mac <address>] [--vendor <name>]\n"
       "      Fingerprint only. GS I is never trusted on its own.\n"
+      "\n"
+      "  pdctl verify <token> [--store <dir>]\n"
+      "      Paper to job: resolves the four-character V: code on a receipt and\n"
+      "      prints that job's full journal history - states, timestamps, grade,\n"
+      "      authority, method, attempt. Touches no printer and rewrites nothing.\n"
       "\n"
       "  pdctl print <host[:port]> --text \"...\" [options]\n"
       "      Print a small receipt through the full engine and stream job events.\n"
@@ -725,6 +733,150 @@ int runPrint(const Endpoint& endpoint, const PrintArgs& args) {
   return kExitUnknown;
 }
 
+// --- verify -------------------------------------------------------------------------
+
+std::string wallClock(uint64_t unix_ms) {
+  if (unix_ms == 0) {
+    return "-";
+  }
+  const std::time_t seconds = static_cast<std::time_t>(unix_ms / 1000u);
+  std::tm parts{};
+  if (::localtime_r(&seconds, &parts) == nullptr) {
+    return std::to_string(unix_ms);
+  }
+  char buffer[32];
+  const size_t written = std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &parts);
+  if (written == 0) {
+    return std::to_string(unix_ms);
+  }
+  std::string out(buffer, written);
+  out += ".";
+  const std::string millis = std::to_string(unix_ms % 1000u);
+  out += std::string(3 - millis.size(), '0') + millis;
+  return out;
+}
+
+// Paper -> job (docs/api.md §14). Deliberately reads the journal rather than opening a
+// JobStore: opening one compacts it to a single state line per job, which would destroy
+// the very history this command exists to print.
+int runVerify(const std::string& token, const std::string& store) {
+  const std::string path = store + "/jobs.journal";
+  const std::vector<pd::JournalEntry> entries = pd::readJournal(path);
+  if (entries.empty()) {
+    std::cout << "no journal at " << path << "\n";
+    return kExitFailed;
+  }
+
+  // Most recent first: a sequence wraps, and the newest holder of a token is the one
+  // the receipt in somebody's hand belongs to.
+  std::string job_id;
+  pd::JobRecord created;
+  std::unordered_map<std::string, pd::JobRecord> creation;
+  std::unordered_map<std::string, std::pair<std::string, std::string>> tokens;
+  for (const pd::JournalEntry& entry : entries) {
+    if (entry.kind == pd::JournalEntry::Kind::Job) {
+      creation[entry.record.id] = entry.record;
+      tokens[entry.record.id] = {entry.record.print_token, entry.record.cut_token};
+    } else if (entry.kind == pd::JournalEntry::Kind::Tokens) {
+      tokens[entry.record.id] = {entry.record.print_token, entry.record.cut_token};
+    }
+  }
+  for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+    if (it->kind != pd::JournalEntry::Kind::Job) {
+      continue;
+    }
+    const auto found = tokens.find(it->record.id);
+    if (found == tokens.end()) {
+      continue;
+    }
+    if (found->second.first == token || found->second.second == token) {
+      job_id = it->record.id;
+      created = it->record;
+      created.print_token = found->second.first;
+      created.cut_token = found->second.second;
+      break;
+    }
+  }
+  if (job_id.empty()) {
+    std::cout << "no job in " << path << " carried the verification token \"" << token
+              << "\"\n\n"
+                 "a token is four printable characters: two naming the driver instance\n"
+                 "that printed the receipt, two naming the job. A token whose first two\n"
+                 "characters are not this store's instance nonce belongs to another\n"
+                 "instance's journal.\n";
+    return kExitFailed;
+  }
+
+  std::cout << "Receipt verification - " << token << "\n";
+  section("Job");
+  row("token queried", token);
+  row("print token", created.print_token.empty() ? "none" : created.print_token);
+  row("cut token", created.cut_token.empty() ? "none" : created.cut_token);
+  row("job id", created.id);
+  row("idempotency key", created.key);
+  row("printer", created.printer_id);
+  row("attempt", std::to_string(created.attempt));
+  row("payload", std::string(pd::to_string(created.payload_kind)) + ", " +
+                     std::to_string(created.payload_bytes) + " bytes in");
+  row("created", wallClock(created.created_unix_ms));
+
+  section("History");
+  std::cout << "  " << std::left << std::setw(24) << "when" << std::setw(22) << "state"
+            << std::setw(20) << "confidence" << "evidence\n";
+  size_t transitions = 0;
+  for (const pd::JournalEntry& entry : entries) {
+    if (entry.kind != pd::JournalEntry::Kind::State || entry.record.id != job_id) {
+      continue;
+    }
+    ++transitions;
+    std::cout << "  " << std::left << std::setw(24)
+              << wallClock(entry.record.updated_unix_ms) << std::setw(22)
+              << pd::to_string(entry.record.state) << std::setw(20)
+              << pd::to_string(entry.record.confidence)
+              << pd::gradeLetter(entry.record.grade) << " ("
+              << pd::to_string(entry.record.grade) << ") / "
+              << pd::to_string(entry.record.authority) << " / " << entry.record.method;
+    if (entry.record.reason != pd::FailureReason::None) {
+      std::cout << " / " << pd::to_string(entry.record.reason);
+    }
+    std::cout << "\n";
+  }
+  if (transitions == 0) {
+    std::cout << "  (none: the journal was compacted after this job's last transition)\n";
+    return kExitUnknown;
+  }
+
+  // The question an operator holding two receipts is actually asking. Each attempt is
+  // its own journal record under the same key, so they are listed rather than summed.
+  std::vector<pd::JobRecord> siblings;
+  for (const pd::JournalEntry& entry : entries) {
+    if (entry.kind == pd::JournalEntry::Kind::Job && entry.record.key == created.key &&
+        entry.record.id != job_id) {
+      pd::JobRecord sibling = entry.record;
+      const auto found = tokens.find(sibling.id);
+      if (found != tokens.end()) {
+        sibling.print_token = found->second.first;
+      }
+      siblings.push_back(sibling);
+    }
+  }
+  if (!siblings.empty()) {
+    section("Other attempts of this key");
+    for (const pd::JobRecord& sibling : siblings) {
+      std::cout << "  attempt " << sibling.attempt << "  "
+                << wallClock(sibling.created_unix_ms) << "  "
+                << (sibling.print_token.empty() ? "no token" : sibling.print_token)
+                << "  " << sibling.id << "\n";
+    }
+    std::cout << "\neach attempt is its own record: this key reached paper more than\n"
+                 "once, so the receipt in hand is the one whose V: code is above\n";
+  }
+  std::cout << "\nholding a receipt whose V: code matches a journaled PrintConfirmed\n"
+               "token is end-to-end evidence: this paper is the output of that job,\n"
+               "and the printer acknowledged finishing it\n";
+  return kExitDone;
+}
+
 int listProfiles() {
   std::cout << "device database (docs/device-database.md):\n\n";
   for (const std::string& name : pd::devices::names()) {
@@ -745,6 +897,21 @@ int listProfiles() {
 int main(int argc, char** argv) {
   if (argc >= 3 && std::string(argv[1]) == "print" && std::string(argv[2]) == "list") {
     return listProfiles();
+  }
+  if (argc >= 3 && std::string(argv[1]) == "verify") {
+    // Not an endpoint command: it answers from the journal on disk, so it works with
+    // the printer unplugged, which is exactly when somebody is holding the receipt.
+    std::string store = defaultStore();
+    for (int i = 3; i < argc; ++i) {
+      const std::string flag = argv[i];
+      if (flag == "--store" && i + 1 < argc) {
+        store = argv[++i];
+      } else {
+        std::cout << "unknown option: " << flag << "\n\n";
+        return usage();
+      }
+    }
+    return runVerify(argv[2], store);
   }
   if (argc < 3) {
     return usage();

@@ -7,6 +7,7 @@
 /// fails here rather than in a kitchen.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -228,12 +229,14 @@ void main() {
         'ask an operator: timeoutAwaitingCompletion',
       );
 
-      // The evidence fields of docs/api.md §13 are not carried by pd_job_result at this
-      // ABI revision, and this wrapper reports that rather than inventing a grade.
+      // The evidence of docs/api.md §13 rides on the result itself: never a bare
+      // success, always what class of evidence it is, who said so and which command
+      // produced it.
       final done = results['ok']! as JobDone;
-      expect(done.grade, isNull);
-      expect(done.authority, isNull);
-      expect(done.method, isNull);
+      expect(done.grade, ConfidenceGrade.aJobLevelConfirmation);
+      expect(done.grade.letter, 'A');
+      expect(done.authority, CompletionAuthority.physicalPrinter);
+      expect(done.method, 'GS(H) fn48');
     });
 
     test(
@@ -263,6 +266,152 @@ void main() {
         () => printer.forceReprint('never-submitted'),
         throwsA(isA<PrinterDriverException>()),
       );
+    });
+
+    test('events arrive one transition at a time, not as a batch at the end',
+        () async {
+      // pd.h hands the event over by value, so a NativeCallable.listener can read it
+      // after the native call returned. That is what makes this live: the stream must
+      // deliver states while the job is still moving, not only once it settles.
+      final printer = driver.addScriptedPrinterForTesting(script: 'silent');
+      final job = printer.print(
+        rawText('LIVE PROGRESS'),
+        options: const JobOptions(key: 'dart-live-1'),
+      );
+
+      final seen = <JobState>[];
+      final firstSendStarted = Completer<void>();
+      final subscription = job.events.listen((event) {
+        seen.add(event.state);
+        if (event.state == JobState.sendStarted && !firstSendStarted.isCompleted) {
+          firstSendStarted.complete();
+        }
+      });
+
+      // The silent device never acknowledges, so the job cannot be terminal yet: any
+      // event observed here was observed mid-flight.
+      await firstSendStarted.future;
+      expect(job.isTerminal, isFalse,
+          reason: 'the job is still waiting for a completion that never comes');
+      expect(seen, contains(JobState.queued));
+      expect(seen, contains(JobState.sendStarted));
+
+      expect(await job.result, isA<JobUnknown>());
+      await subscription.asFuture<void>();
+      expect(seen.last, JobState.unknown);
+      // Ordered, complete, and closed on the terminal event.
+      expect(seen, <JobState>[
+        JobState.queued,
+        JobState.preflightOk,
+        JobState.sendStarted,
+        JobState.bytesSent,
+        JobState.unknown,
+      ]);
+    });
+
+    test('the receipt carries its verification id and resolves back to the job',
+        () async {
+      final printer = driver.addScriptedPrinterForTesting(script: 'ok');
+      final device = printer.scriptedDeviceForTesting!;
+      final job = printer.print(
+        rawText('VERIFY ME'),
+        options: const JobOptions(key: 'dart-rvi-1'),
+      );
+      expect(await job.result, isA<JobDone>());
+
+      final printToken = job.printToken!;
+      final cutToken = job.cutToken!;
+      expect(printToken, hasLength(4));
+      expect(cutToken, hasLength(4));
+      expect(printToken, isNot(cutToken));
+      // [2-char instance nonce][2-char sequence]: both name this driver instance.
+      expect(driver.instanceNonce, hasLength(2));
+      expect(printToken.startsWith(driver.instanceNonce), isTrue);
+      expect(cutToken.startsWith(driver.instanceNonce), isTrue);
+
+      expect(device.received('ORDER: dart-rvi-1  V:$printToken'), isTrue);
+      expect(identical(driver.jobByToken(printToken), job), isTrue);
+      expect(identical(driver.jobByToken(cutToken), job), isTrue);
+      expect(driver.jobByToken('!!!!'), isNull);
+    });
+
+    test('suppressing the verification id removes the ink, not the evidence',
+        () async {
+      final printer = driver.addScriptedPrinterForTesting(script: 'ok');
+      final device = printer.scriptedDeviceForTesting!;
+      final job = printer.print(
+        rawText('NO CODE ON THIS ONE'),
+        options: const JobOptions(
+          key: 'dart-rvi-quiet',
+          printsVerificationId: false,
+        ),
+      );
+      expect(await job.result, isA<JobDone>());
+
+      final token = job.printToken!;
+      expect(device.received('V:$token'), isFalse);
+      expect(device.received('ORDER: dart-rvi-quiet'), isFalse);
+      expect(identical(driver.jobByToken(token), job), isTrue);
+    });
+
+    test('a printer without a process-id fence has no identifier to print',
+        () async {
+      final printer = driver.addScriptedPrinterForTesting(script: 'gsr1');
+      final job = printer.print(
+        rawText('QUEUED FENCE ONLY'),
+        options: const JobOptions(key: 'dart-rvi-none'),
+      );
+      expect(await job.result, isA<JobDone>());
+      // The identifier *is* the wire token, so a printer with no wire token has none.
+      expect(job.printToken, isNull);
+      expect(job.cutToken, isNull);
+      expect(printer.scriptedDeviceForTesting!.received('V:'), isFalse);
+    });
+
+    test('the reprint banner is on by default and off only when asked',
+        () async {
+      final printer = driver.addScriptedPrinterForTesting(script: 'ok');
+      final device = printer.scriptedDeviceForTesting!;
+      const key = 'dart-customer-copy';
+
+      expect(
+        await printer.send(rawText('ORIGINAL'), key: key),
+        isA<JobDone>(),
+      );
+
+      final quiet = printer.forceReprint(
+        key,
+        options: const ReprintOptions(banner: false),
+      );
+      expect(await quiet.result, isA<JobDone>());
+      // Still recorded as a duplicate; simply not announced on the paper.
+      expect(quiet.attempt, 2);
+      expect(device.received('*** REPRINT / POSSIBLE DUPLICATE ***'), isFalse);
+
+      final loud = printer.forceReprint(key);
+      expect(await loud.result, isA<JobDone>());
+      expect(device.received('*** REPRINT / POSSIBLE DUPLICATE ***'), isTrue);
+      expect(device.received('PRINT ATTEMPT: 3'), isTrue);
+    });
+
+    test('margins widen the clearance around the print but never narrow it',
+        () async {
+      final printer = driver.addScriptedPrinterForTesting(script: 'ok');
+      final device = printer.scriptedDeviceForTesting!;
+      final job = printer.print(
+        rawText('MARGIN TICKET'),
+        options: const JobOptions(
+          key: 'dart-margins-1',
+          topFeedDots: 40,
+          bottomFeedDots: 8,
+        ),
+      );
+      expect(await job.result, isA<JobDone>());
+
+      // ESC J 40 for the top margin; the profile's 120-dot blade clearance survives a
+      // bottom margin that asked for less than it.
+      expect(device.received('\x1BJ\x28'), isTrue);
+      expect(device.received('\x1BJ\x78'), isTrue);
     });
 
     test('the device event stream reports what the printer said', () async {

@@ -20,19 +20,27 @@ namespace {
 // because a stuck kitchen printer gets debugged at 2 a.m. with `tail`, and over JSON
 // because a JSON parser is a dependency this core is not allowed to have.
 //
-//   #PDJOURNAL<TAB>2
-//   J<TAB>id<TAB>key<TAB>printer<TAB>created_ms<TAB>attempt<TAB>payload_kind<TAB>bytes
+//   #PDJOURNAL<TAB>3
+//   J<TAB>id<TAB>key<TAB>printer<TAB>created_ms<TAB>attempt<TAB>payload_kind<TAB>bytes<TAB>print_token<TAB>cut_token
 //   S<TAB>id<TAB>state<TAB>confidence<TAB>reason<TAB>updated_ms<TAB>grade<TAB>authority<TAB>method
+//   T<TAB>id<TAB>print_token<TAB>cut_token
 //
-// A J line is immutable; the current state of a job is its last S line. Text fields
-// are backslash-escaped so a tab or newline inside an idempotency key cannot forge a
-// record boundary. grade/authority/method are version-2 fields
+// A J line is immutable except through a T line; the current state of a job is its last
+// S line. Text fields are backslash-escaped so a tab or newline inside an idempotency
+// key cannot forge a record boundary. grade/authority/method are version-2 fields
 // (docs/device-database.md "Confidence grades for every route"): an S line written
 // before they existed has only six fields, and parseLine derives them conservatively
 // rather than refusing the line — see the version-2 comment below.
-constexpr char kHeader[] = "#PDJOURNAL\t2";
+//
+// Version 3 adds the two verification identifiers (docs/api.md §14) as trailing J
+// fields, plus the T record for the one path that learns them after the job record
+// exists. Both directions keep working: a version-2 reader stops at field 7 and skips
+// the T record as "written by a newer core", and this reader treats an 8-field J line
+// as a job with no tokens.
+constexpr char kHeader[] = "#PDJOURNAL\t3";
 constexpr char kJobPrefix = 'J';
 constexpr char kStatePrefix = 'S';
+constexpr char kTokenPrefix = 'T';
 
 std::string escapeField(const std::string& value) {
   std::string out;
@@ -126,7 +134,16 @@ std::string jobLine(const JobRecord& record) {
   os << kJobPrefix << '\t' << escapeField(record.id) << '\t' << escapeField(record.key)
      << '\t' << escapeField(record.printer_id) << '\t' << record.created_unix_ms << '\t'
      << record.attempt << '\t' << to_string(record.payload_kind) << '\t'
-     << record.payload_bytes;
+     << record.payload_bytes << '\t' << escapeField(record.print_token) << '\t'
+     << escapeField(record.cut_token);
+  return os.str();
+}
+
+std::string tokenLine(const std::string& id, const std::string& print_token,
+                      const std::string& cut_token) {
+  std::ostringstream os;
+  os << kTokenPrefix << '\t' << escapeField(id) << '\t' << escapeField(print_token)
+     << '\t' << escapeField(cut_token);
   return os.str();
 }
 
@@ -170,6 +187,23 @@ std::optional<JournalEntry> parseLine(const std::string& line) {
     entry.record.created_unix_ms = created;
     entry.record.attempt = static_cast<uint32_t>(attempt);
     entry.record.payload_bytes = payload_bytes;
+    // Fields 8-9 are version 3. A version-1/2 J line simply has no tokens, which is
+    // indistinguishable from a job that ran on a profile without a GS ( H fence — in
+    // both cases there is no receipt verification identifier to resolve.
+    if (fields.size() >= 10) {
+      entry.record.print_token = unescapeField(fields[8]);
+      entry.record.cut_token = unescapeField(fields[9]);
+    }
+    return entry;
+  }
+  if (fields[0][0] == kTokenPrefix) {
+    if (fields.size() < 4) {
+      return std::nullopt;
+    }
+    entry.kind = JournalEntry::Kind::Tokens;
+    entry.record.id = unescapeField(fields[1]);
+    entry.record.print_token = unescapeField(fields[2]);
+    entry.record.cut_token = unescapeField(fields[3]);
     return entry;
   }
   if (fields[0][0] == kStatePrefix) {
@@ -300,6 +334,11 @@ void JobStore::load() {
     const auto it = by_id_.find(entry.record.id);
     if (it == by_id_.end()) {
       continue;  // State line for a job whose creation record was lost.
+    }
+    if (entry.kind == JournalEntry::Kind::Tokens) {
+      it->second.print_token = entry.record.print_token;
+      it->second.cut_token = entry.record.cut_token;
+      continue;
     }
     it->second.state = entry.record.state;
     it->second.confidence = entry.record.confidence;
@@ -463,6 +502,18 @@ void JobStore::recordState(const std::string& job_id, JobState state,
   it->second.authority = evidence.authority;
   it->second.method = evidence.method;
   it->second.updated_unix_ms = now;
+}
+
+void JobStore::recordTokens(const std::string& job_id, const std::string& print_token,
+                            const std::string& cut_token) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = by_id_.find(job_id);
+  if (it == by_id_.end()) {
+    throw StoreError("unknown job id " + job_id);
+  }
+  append(tokenLine(job_id, print_token, cut_token));
+  it->second.print_token = print_token;
+  it->second.cut_token = cut_token;
 }
 
 std::optional<JobRecord> JobStore::findByKey(const std::string& key) const {

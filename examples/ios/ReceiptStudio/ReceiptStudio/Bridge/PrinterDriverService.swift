@@ -291,6 +291,7 @@ extension PDDeviceEvent {
         case .unrecoverableError: return "Unrecoverable error"
         case .connectionLost: return "Connection lost"
         case .connectionRestored: return "Connection restored"
+        case .foreignWriterDetected: return "Another writer on this printer"
         @unknown default: return "Unknown"
         }
     }

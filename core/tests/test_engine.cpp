@@ -82,11 +82,18 @@ PD_TEST(engine_gsparenh_happy_path_reaches_done_cut_fault_free) {
   CHECK_EQ(result.reason, FailureReason::None);
   CHECK_EQ(rig.link.device->cuts(), static_cast<size_t>(1));
   CHECK_EQ(rig.link.device->markers().size(), static_cast<size_t>(2));
-  CHECK_EQ(rig.link.device->markers()[0].token.substr(0, 1), std::string("P"));
-  CHECK_EQ(rig.link.device->markers()[1].token.substr(0, 1), std::string("C"));
-  // Same three-digit suffix on both markers: one receipt, one correlation token.
-  CHECK_EQ(rig.link.device->markers()[0].token.substr(1),
-           rig.link.device->markers()[1].token.substr(1));
+  // [2-char instance nonce][2-char sequence] (docs/api.md §14): both markers of one
+  // receipt carry this driver's nonce, and the print fence takes the even sequence
+  // with the cut fence on its odd successor, which is what keeps P and C apart inside
+  // a fixed four-character layout.
+  const std::string print_marker = rig.link.device->markers()[0].token;
+  const std::string cut_marker = rig.link.device->markers()[1].token;
+  CHECK_EQ(print_marker.size(), static_cast<size_t>(4));
+  CHECK_EQ(print_marker.substr(0, 2), rig.driver->instanceNonce());
+  CHECK_EQ(cut_marker.substr(0, 2), rig.driver->instanceNonce());
+  CHECK(print_marker != cut_marker);
+  CHECK_EQ(print_marker.substr(0, 3), cut_marker.substr(0, 3));
+  CHECK_EQ(cut_marker[3], static_cast<char>(print_marker[3] + 1));
   CHECK(rig.link.device->printText().find("KITCHEN TICKET 7F3A") != std::string::npos);
   CHECK(!rig.link.device->sawConcurrentWrites());
   // Preflight 1-4 then the post-cut cutter read.
@@ -739,6 +746,278 @@ PD_TEST(engine_markers_are_never_reused_while_outstanding) {
     for (size_t j = i + 1; j < markers.size(); ++j) {
       CHECK(markers[i].token != markers[j].token);
     }
+  }
+}
+
+// --- Verification identifiers (docs/api.md §14) ----------------------------------------
+
+PD_TEST(engine_prints_the_verification_id_next_to_the_order_line_and_in_the_qr) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  JobOptions options;
+  options.key = "order-7F3A-92C1";
+  const JobResult result = runOne(rig, "VERIFY ME", options);
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+
+  auto job = rig.driver->findJob(options.key);
+  CHECK(job != nullptr);
+  const std::string token = job->printToken();
+  CHECK_EQ(token, rig.link.device->markers()[0].token);
+
+  const std::string trailer = std::string(kOrderPrefix) + options.key + "  " +
+                              kVerificationPrefix + token;
+  // Printed once as text and once inside the QR, so the eye and the scanner read the
+  // same string. The QR payload rides in a GS ( k block, which the device's scanner
+  // skips wholesale rather than counting as print data.
+  CHECK(rig.link.device->printText().find(trailer) != std::string::npos);
+  const std::vector<uint8_t> raw(trailer.begin(), trailer.end());
+  const size_t first = findSubsequence(rig.link.device->received(), raw);
+  CHECK(first != std::string::npos);
+  CHECK(findSubsequence(rig.link.device->received(), raw, first + 1) != std::string::npos);
+}
+
+PD_TEST(engine_resolves_a_job_from_either_of_its_printed_tokens) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  JobOptions options;
+  options.key = "order-resolvable";
+  CHECK_EQ(runOne(rig, "PAPER TRAIL", options).outcome, JobOutcome::Done);
+
+  auto job = rig.driver->findJob(options.key);
+  CHECK(job != nullptr);
+  CHECK(rig.driver->jobByToken(job->printToken()).get() == job.get());
+  CHECK(rig.driver->jobByToken(job->cutToken()).get() == job.get());
+  CHECK(rig.driver->jobByToken("!!!!") == nullptr);
+  CHECK(rig.driver->jobByToken("") == nullptr);
+}
+
+PD_TEST(engine_reprint_takes_a_fresh_token_and_the_newest_holder_wins) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  JobOptions options;
+  options.key = "order-two-attempts";
+  auto first = rig.printer->print(Payload::raw(textPayload("ORIGINAL")), options);
+  CHECK_EQ(first->result().outcome, JobOutcome::Done);
+  const std::string first_token = first->printToken();
+
+  auto second = rig.driver->forceReprint(options.key);
+  CHECK(second != nullptr);
+  CHECK_EQ(second->result().outcome, JobOutcome::Done);
+  // A second physical print is a second piece of evidence, so it gets its own
+  // identifier rather than inheriting the one already on paper.
+  CHECK(second->printToken() != first_token);
+  CHECK(rig.driver->jobByToken(first_token).get() == first.get());
+  CHECK(rig.driver->jobByToken(second->printToken()).get() == second.get());
+}
+
+PD_TEST(engine_verification_id_can_be_suppressed_without_losing_the_token) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  JobOptions options;
+  options.key = "order-quiet";
+  options.print_verification_id = false;
+  CHECK_EQ(runOne(rig, "NO CODE ON THIS ONE", options).outcome, JobOutcome::Done);
+
+  auto job = rig.driver->findJob(options.key);
+  CHECK(job != nullptr);
+  CHECK(!job->printToken().empty());
+  // Nothing printed, everything still journaled and resolvable: the toggle is about
+  // ink, not about evidence.
+  CHECK(!rig.link.device->receivedContains(std::string(kVerificationPrefix) +
+                                           job->printToken()));
+  CHECK(!rig.link.device->receivedContains(std::string(kOrderPrefix) + options.key));
+  CHECK(rig.driver->jobByToken(job->printToken()).get() == job.get());
+}
+
+PD_TEST(engine_without_a_gsh_fence_there_is_no_wire_token_to_print) {
+  Rig rig(CompletionMechanism::GsR1);
+  rig.build();
+  JobOptions options;
+  options.key = "order-fallback";
+  CHECK_EQ(runOne(rig, "QUEUED FENCE ONLY", options).outcome, JobOutcome::Done);
+
+  auto job = rig.driver->findJob(options.key);
+  CHECK(job != nullptr);
+  CHECK(job->printToken().empty());
+  CHECK(!rig.link.device->receivedContains(kVerificationPrefix));
+}
+
+PD_TEST(engine_journals_both_tokens_and_resolves_them_after_a_restart) {
+  pdfake::TempDir dir("engine-tokens");
+  std::string print_token;
+  std::string cut_token;
+  std::string nonce;
+  {
+    Rig rig(CompletionMechanism::GsParenH, StorageConfig::at(dir.path()));
+    rig.build();
+    JobOptions options;
+    options.key = "order-persisted-token";
+    CHECK_EQ(runOne(rig, "YESTERDAY", options).outcome, JobOutcome::Done);
+    auto job = rig.driver->findJob(options.key);
+    CHECK(job != nullptr);
+    print_token = job->printToken();
+    cut_token = job->cutToken();
+    nonce = rig.driver->instanceNonce();
+
+    bool journaled = false;
+    for (const JournalEntry& entry : readJournal(dir.path() + "/jobs.journal")) {
+      if (entry.kind == JournalEntry::Kind::Tokens &&
+          entry.record.print_token == print_token &&
+          entry.record.cut_token == cut_token) {
+        journaled = true;
+      }
+    }
+    CHECK(journaled);
+  }
+
+  // A new process on the same store: the nonce is the same instance identity, the
+  // compacted J line carries both tokens, and the paper still resolves.
+  PrinterDriver driver(StorageConfig::at(dir.path()));
+  CHECK_EQ(driver.instanceNonce(), nonce);
+  auto reloaded = driver.jobByToken(print_token);
+  CHECK(reloaded != nullptr);
+  if (reloaded != nullptr) {
+    CHECK_EQ(reloaded->key(), std::string("order-persisted-token"));
+    CHECK_EQ(reloaded->printToken(), print_token);
+    CHECK_EQ(reloaded->cutToken(), cut_token);
+  }
+  CHECK(driver.jobByToken(cut_token) != nullptr);
+}
+
+PD_TEST(engine_reports_a_foreign_echo_without_consuming_a_fence) {
+  Rig rig(CompletionMechanism::GsParenH);
+  pdfake::Script script;
+  // Another instance's nonce, so the token is structurally perfect and provably not
+  // ours (docs/sdk-spec.md §14: direct multi-instance writing is unsupported, and the
+  // instance nonce exists to make a violation loud).
+  script.foreign_process_id = "~~~~";
+  rig.link.device->setScript(script);
+  rig.build();
+
+  std::vector<DeviceEvent> events;
+  rig.printer->subscribe([&events](DeviceEvent event) { events.push_back(event); });
+
+  const JobResult result = runOne(rig, "OURS");
+  // The foreign echo satisfied nothing: our own job still completed on its own fence.
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.confidence, ConfidenceLevel::CutFaultFree);
+  CHECK(std::find(events.begin(), events.end(), DeviceEvent::ForeignWriterDetected) !=
+        events.end());
+  CHECK_EQ(std::string(to_string(DeviceEvent::ForeignWriterDetected)),
+           std::string("ForeignWriterDetected"));
+}
+
+PD_TEST(engine_does_not_cry_foreign_over_our_own_late_echo) {
+  // A marker answered after the job it belonged to has already timed out is late, not
+  // foreign: it carries this instance's nonce, and reporting a multi-writer violation
+  // there would cry wolf on the one case Unknown exists for.
+  Rig rig(CompletionMechanism::GsParenH);
+  pdfake::Script script;
+  script.answer_process_id = false;
+  rig.link.device->setScript(script);
+  rig.build();
+
+  std::vector<DeviceEvent> events;
+  rig.printer->subscribe([&events](DeviceEvent event) { events.push_back(event); });
+
+  auto first = rig.printer->print(Payload::raw(textPayload("TIMES OUT")), {});
+  CHECK_EQ(first->result().outcome, JobOutcome::Unknown);
+
+  // Replay the token the printer never acknowledged, long after the job gave up.
+  pdfake::Script replay;
+  replay.foreign_process_id = first->printToken();
+  rig.link.device->setScript(replay);
+  CHECK_EQ(runOne(rig, "NEXT TICKET").outcome, JobOutcome::Done);
+
+  CHECK(std::find(events.begin(), events.end(), DeviceEvent::ForeignWriterDetected) ==
+        events.end());
+}
+
+// --- Reprint banner and margins ---------------------------------------------------------
+
+PD_TEST(engine_reprint_banner_can_be_turned_off_per_call) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  JobOptions options;
+  options.key = "order-customer-copy";
+  CHECK_EQ(runOne(rig, "ORIGINAL", options).outcome, JobOutcome::Done);
+
+  ReprintOptions quiet;
+  quiet.banner = false;
+  auto copy = rig.printer->forceReprint(options.key, quiet);
+  CHECK(copy != nullptr);
+  CHECK_EQ(copy->result().outcome, JobOutcome::Done);
+  // Still a deliberate duplicate — the attempt counter is the record of that — but
+  // without the banner an operator asked not to print.
+  CHECK_EQ(copy->attempt(), 2u);
+  CHECK(!rig.link.device->receivedContains(kReprintBannerLine));
+  CHECK(!rig.link.device->receivedContains(std::string(kReprintAttemptPrefix) + "2"));
+  CHECK_EQ(rig.link.device->cuts(), static_cast<size_t>(2));
+
+  // The default is unchanged and the constants are untouched.
+  auto loud = rig.printer->forceReprint(options.key);
+  CHECK_EQ(loud->result().outcome, JobOutcome::Done);
+  CHECK(rig.link.device->receivedContains(kReprintBannerLine));
+  CHECK(rig.link.device->receivedContains(std::string(kReprintAttemptPrefix) + "3"));
+}
+
+PD_TEST(engine_top_margin_is_fed_before_any_content) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  JobOptions options;
+  options.top_feed_dots = 40;
+  const JobResult result = runOne(rig, "MARGIN TICKET", options);
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+
+  const std::vector<uint8_t> received = rig.link.device->received();
+  const std::vector<uint8_t> feed_bytes{0x1B, 0x4A, 0x28};  // ESC J 40
+  const std::vector<uint8_t> content{'M', 'A', 'R', 'G', 'I', 'N'};
+  const size_t feed_pos = findSubsequence(received, feed_bytes);
+  CHECK(feed_pos != std::string::npos);
+  CHECK(feed_pos < findSubsequence(received, content));
+}
+
+PD_TEST(engine_top_margin_is_chunked_above_255_dots) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  JobOptions options;
+  options.top_feed_dots = 300;
+  CHECK_EQ(runOne(rig, "WIDE TOP", options).outcome, JobOutcome::Done);
+  // Same ESC J chunking the pre-cut clearance already uses: 255 + 45.
+  const std::vector<uint8_t> feed_bytes{0x1B, 0x4A, 0xFF, 0x1B, 0x4A, 0x2D};
+  CHECK(findSubsequence(rig.link.device->received(), feed_bytes) != std::string::npos);
+}
+
+PD_TEST(engine_bottom_margin_widens_the_blade_clearance_but_never_narrows_it) {
+  {
+    Rig rig(CompletionMechanism::GsParenH);
+    rig.profile.media.head_to_cutter_feed_dots = 120;
+    rig.build();
+    JobOptions options;
+    options.bottom_feed_dots = 200;
+    CHECK_EQ(runOne(rig, "ROOMY BOTTOM", options).outcome, JobOutcome::Done);
+    const std::vector<uint8_t> received = rig.link.device->received();
+    const std::vector<uint8_t> feed_bytes{0x1B, 0x4A, 0xC8};  // ESC J 200
+    const std::vector<uint8_t> cut_bytes{0x1D, 0x56, 0x01};
+    const size_t feed_pos = findSubsequence(received, feed_bytes);
+    CHECK(feed_pos != std::string::npos);
+    CHECK_EQ(feed_pos + feed_bytes.size(), findSubsequence(received, cut_bytes));
+  }
+  {
+    // Below the floor: the profile's blade clearance is unconditional, so asking for
+    // less cannot reintroduce the clipped trailing QR it exists to prevent.
+    Rig rig(CompletionMechanism::GsParenH);
+    rig.profile.media.head_to_cutter_feed_dots = 120;
+    rig.build();
+    JobOptions options;
+    options.bottom_feed_dots = 8;
+    CHECK_EQ(runOne(rig, "TIGHT BOTTOM", options).outcome, JobOutcome::Done);
+    const std::vector<uint8_t> received = rig.link.device->received();
+    const std::vector<uint8_t> floor_bytes{0x1B, 0x4A, 0x78};  // ESC J 120
+    const std::vector<uint8_t> cut_bytes{0x1D, 0x56, 0x01};
+    const size_t feed_pos = findSubsequence(received, floor_bytes);
+    CHECK(feed_pos != std::string::npos);
+    CHECK_EQ(feed_pos + floor_bytes.size(), findSubsequence(received, cut_bytes));
   }
 }
 

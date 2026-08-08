@@ -123,8 +123,32 @@ public final class PrinterDriver: @unchecked Sendable {
   ///   ``Printer/print(_:options:)`` returned.
   public func job(key: String) -> PrintJob? {
     guard let handle = key.withCString({ pd_find_job(core.handle, $0) }) else { return nil }
-    return core.internJob(handle, authority: .none)
+    return core.internJob(handle, mechanism: .none)
   }
+
+  /// Paper → job: resolves the four-character `V:` code printed on a receipt
+  /// (docs/api.md §14).
+  ///
+  /// Accepts either of a job's identifiers, the print fence's or the cut fence's, and
+  /// answers most-recent-first — the sequence wraps, and the receipt somebody is holding
+  /// is far more likely to be the recent one. Includes jobs reconstructed from the
+  /// journal, so a receipt printed before the last restart still resolves.
+  ///
+  /// - Returns: `nil` when no job on this driver ever carried that token.
+  public func job(token: String) -> PrintJob? {
+    guard let handle = token.withCString({ pd_job_by_token(core.handle, $0) }) else {
+      return nil
+    }
+    return core.internJob(handle, mechanism: .none)
+  }
+
+  /// The two characters every identifier this driver issues starts with: which driver
+  /// instance owns an echo, and therefore which instance printed a given receipt.
+  ///
+  /// Persisted in the storage directory, so it survives a restart. A token whose first
+  /// two characters are not this string came from somewhere else — the case
+  /// ``DeviceEvent/foreignWriterDetected`` reports.
+  public var instanceNonce: String { String(cString: pd_instance_nonce(core.handle)) }
 }
 
 /// Runs `body` with a C string for `value`, or with `nil`. The ABI treats `NULL` and `""`

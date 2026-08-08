@@ -14,10 +14,10 @@ final class JobEvent {
     required this.monotonicMs,
   });
 
-  /// Reads a `pd_job_event` the ABI is handing over.
+  /// Reads a `pd_job_event` the ABI handed over by value.
   ///
-  /// Only ever called while the pointer is known to be alive — during the synchronous
-  /// replay inside `pd_subscribe_job`. See [PrintJob] for why that matters.
+  /// By value is what makes this safe from a `NativeCallable.listener`, which runs
+  /// after the native call has already returned: there is no frame left to point into.
   factory JobEvent.fromNative(PdJobEvent event) => JobEvent(
         state: JobState.fromNative(event.state),
         confidence: ConfidenceLevel.fromNative(event.confidence),
@@ -72,28 +72,28 @@ sealed class JobResult {
 final class JobDone extends JobResult {
   const JobDone({
     required super.confidence,
-    this.grade,
-    this.authority,
-    this.method,
+    required this.grade,
+    required this.authority,
+    required this.method,
   });
 
   /// The class of evidence behind the claim (docs/api.md §13).
   ///
-  /// Null against the current C ABI: `pd_job_result` carries `outcome`, `confidence`
-  /// and `reason` and nothing else, and this wrapper does not manufacture a grade from
-  /// the confidence level — deriving one here is the kind of decision pd.h keeps in the
-  /// core. Use [Printer.completion] for the fence the printer actually answers.
-  final ConfidenceGrade? grade;
+  /// The core's own answer, carried by `pd_job_result`. Orthogonal to [confidence]:
+  /// the level says how far up the ladder the job climbed, the grade says what the
+  /// claim is made of.
+  final ConfidenceGrade grade;
 
-  /// Who is making the claim. Null for the same reason as [grade].
-  final CompletionAuthority? authority;
+  /// Who is making the claim — the printer itself, a spooler, or nobody.
+  final CompletionAuthority authority;
 
-  /// The command behind the claim, e.g. `GS(H) fn48`. Null for the same reason as
-  /// [grade].
-  final String? method;
+  /// The command behind the claim, e.g. `GS(H) fn48`. `none` when nothing was
+  /// confirmed: the string a support engineer needs six months later.
+  final String method;
 
   @override
-  String toString() => 'JobDone(${confidence.name})';
+  String toString() =>
+      'JobDone(${confidence.name}, ${grade.letter}/${authority.name}, $method)';
 }
 
 /// The job failed and the failure is confirmed: nothing printed, or the failure itself
@@ -131,7 +131,14 @@ JobResult jobResultFromNative(PdJobResult result) {
   final confidence = ConfidenceLevel.fromNative(result.confidence);
   final reason = FailureReason.fromNative(result.reason);
   return switch (result.outcome) {
-    0 => JobDone(confidence: confidence),
+    0 => JobDone(
+        confidence: confidence,
+        grade: ConfidenceGrade.fromNative(result.grade),
+        authority: CompletionAuthority.fromNative(result.authority),
+        // Copied out here: the ABI owns the buffer, and it lives as long as the driver
+        // rather than as long as this struct.
+        method: readNativeString(result.method),
+      ),
     1 => JobFailed(confidence: confidence, reason: reason),
     2 => JobUnknown(confidence: confidence, reason: reason),
     _ => throw UnrecognizedNativeValue('pd_job_outcome', result.outcome),
@@ -202,6 +209,9 @@ final class JobOptions {
     this.openDrawer = false,
     this.preflight = PreflightMode.strict,
     this.timeout,
+    this.topFeedDots = 0,
+    this.bottomFeedDots = 0,
+    this.printsVerificationId = true,
   });
 
   /// The idempotency key: a caller-supplied stable id such as an order or ticket UUID.
@@ -222,15 +232,67 @@ final class JobOptions {
   /// The completion-wait budget. Null means the profile's own timeout.
   final Duration? timeout;
 
+  /// Blank paper fed before the first content line — tear-off clearance, presentation
+  /// space (docs/receipt-dsl.md "Margins").
+  final int topFeedDots;
+
+  /// The *total* whitespace between the last content and the cut.
+  ///
+  /// The core feeds `max(the profile's blade clearance, this)`, so this can only ever
+  /// add paper: a value below the hardware minimum is ignored rather than allowed to
+  /// slice through a trailing QR.
+  final int bottomFeedDots;
+
+  /// Print the receipt verification identifier in the ticket trailer — the `ORDER:`
+  /// line and the trailer QR (docs/api.md §14). On by default.
+  ///
+  /// Turning it off suppresses the ink, not the evidence: the token is still journaled
+  /// and [PrinterDriver.jobByToken] still resolves it.
+  final bool printsVerificationId;
+
   /// Writes this into a zeroed `pd_job_options`.
-  void fillNative(Arena arena, Pointer<PdJobOptions> out) {
-    final options = out.ref;
+  void fillNative(Arena arena, Pointer<PdJobOptions> out) =>
+      fillStruct(arena, out.ref);
+
+  /// The same, against a struct the caller already has — a nested
+  /// `pd_reprint_options.job`, for instance, where there is no separate pointer.
+  void fillStruct(Arena arena, PdJobOptions options) {
     options.key = arena.string(key);
     options.cut = _requireKnown(cut.nativeValue, 'cut', cut.name);
     options.openDrawer = openDrawer ? 1 : 0;
     options.preflight =
         _requireKnown(preflight.nativeValue, 'preflight', preflight.name);
     options.timeoutMs = timeout?.inMilliseconds ?? 0;
+    options.topFeedDots = topFeedDots;
+    options.bottomFeedDots = bottomFeedDots;
+    // Inverted in the ABI so that an all-zeroes struct still prints the evidence.
+    options.suppressVerificationId = printsVerificationId ? 0 : 1;
+  }
+}
+
+/// Everything optional about a deliberate duplicate — a mirror of
+/// `pd_reprint_options`.
+final class ReprintOptions {
+  const ReprintOptions({
+    this.job = const JobOptions(),
+    this.banner = true,
+  });
+
+  /// The submission options the duplicate is printed with.
+  final JobOptions job;
+
+  /// Print `*** REPRINT / POSSIBLE DUPLICATE ***` and the attempt counter. On by
+  /// default.
+  ///
+  /// Turning it off is a per-call, deliberate act for a receipt where the banner is
+  /// inappropriate — a customer-facing copy. A kitchen ticket should never turn it off:
+  /// the banner is what lets staff bin the duplicate instead of cooking it twice.
+  final bool banner;
+
+  /// Writes this into a zeroed `pd_reprint_options`.
+  void fillNative(Arena arena, Pointer<PdReprintOptions> out) {
+    job.fillStruct(arena, out.ref.job);
+    out.ref.suppressBanner = banner ? 0 : 1;
   }
 }
 

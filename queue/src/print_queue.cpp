@@ -338,6 +338,11 @@ void PrintQueue::applyInboxLocked() {
       case DeviceEvent::CutterError:
       case DeviceEvent::RecoverableError:
       case DeviceEvent::UnrecoverableError:
+      // Another writer is on this printer (docs/api.md §14). It says nothing about
+      // whether the device can take the next job, so it changes no lane state; the
+      // event is for the operator, and holding tickets over it would turn a topology
+      // warning into an outage.
+      case DeviceEvent::ForeignWriterDetected:
         break;
     }
   }

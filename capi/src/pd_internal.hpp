@@ -29,6 +29,13 @@ struct pd_job {
   std::shared_ptr<pd::PrintJob> job;
   std::string id;
   std::string key;
+  // Storage for the strings pd.h promises are owned by the handle: the evidence method
+  // handed back through pd_job_result, and the two verification identifiers. The
+  // tokens are read lazily, because a job is interned the moment it is submitted and
+  // may not have reached its worker yet. Guarded by pd_driver::mutex.
+  std::string method = "none";
+  std::string print_token;
+  std::string cut_token;
 };
 
 struct pd_driver {

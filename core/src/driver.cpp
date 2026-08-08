@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <random>
@@ -17,6 +18,8 @@ namespace pd {
 
 const char kReprintBannerLine[] = "*** REPRINT / POSSIBLE DUPLICATE ***";
 const char kReprintAttemptPrefix[] = "PRINT ATTEMPT: ";
+const char kOrderPrefix[] = "ORDER: ";
+const char kVerificationPrefix[] = "V:";
 
 namespace {
 
@@ -60,12 +63,65 @@ CutVariant effectiveCut(CutSetting setting, const CapabilityProfile& profile) no
   return CutVariant::None;
 }
 
-std::string threeDigits(uint32_t value) {
-  std::string out = std::to_string(value % 1000u);
-  while (out.size() < 3) {
-    out.insert(out.begin(), '0');
+// The verification identifier alphabet (docs/api.md §14): the 94 printable ASCII
+// characters excluding the space, so a token is one unambiguous word on paper, survives
+// a journal field and satisfies escpos::isValidProcessIdToken.
+constexpr char kTokenAlphabetFirst = '!';  // 0x21
+constexpr uint32_t kTokenAlphabetSize = 94u;
+constexpr uint32_t kTokenSequenceSpace = kTokenAlphabetSize * kTokenAlphabetSize;  // 8836
+
+std::string encodeBase94(uint32_t value) {
+  const uint32_t wrapped = value % kTokenSequenceSpace;
+  std::string out(2, kTokenAlphabetFirst);
+  out[0] = static_cast<char>(kTokenAlphabetFirst + (wrapped / kTokenAlphabetSize));
+  out[1] = static_cast<char>(kTokenAlphabetFirst + (wrapped % kTokenAlphabetSize));
+  return out;
+}
+
+bool isTokenAlphabet(char c) noexcept {
+  return c >= kTokenAlphabetFirst &&
+         c < static_cast<char>(kTokenAlphabetFirst + kTokenAlphabetSize);
+}
+
+std::string randomNonce() {
+  static std::mutex mutex;
+  static std::mt19937_64 engine(std::random_device{}());
+  std::lock_guard<std::mutex> lock(mutex);
+  std::string out(2, kTokenAlphabetFirst);
+  for (char& c : out) {
+    c = static_cast<char>(kTokenAlphabetFirst + (engine() % kTokenAlphabetSize));
   }
   return out;
+}
+
+// The nonce is what makes a token name *this* driver instance rather than this run, so
+// it outlives the process: yesterday's receipt has to keep resolving after a restart.
+std::string loadOrCreateNonce(const std::string& directory) {
+  if (directory.empty()) {
+    return randomNonce();  // in-memory driver: nowhere to keep it
+  }
+  std::string path = directory;
+  if (path.back() != '/') {
+    path += '/';
+  }
+  path += "instance.nonce";
+  {
+    std::ifstream input(path);
+    std::string stored;
+    if (input && std::getline(input, stored) && stored.size() == 2 &&
+        isTokenAlphabet(stored[0]) && isTokenAlphabet(stored[1])) {
+      return stored;
+    }
+  }
+  const std::string nonce = randomNonce();
+  std::ofstream output(path, std::ios::trunc);
+  if (output) {
+    output << nonce << "\n";
+  }
+  // A directory that cannot be written still gets a working driver: the tokens simply
+  // stop being resolvable across a restart, which is a diagnostic loss and not a
+  // printing one.
+  return nonce;
 }
 
 }  // namespace
@@ -121,6 +177,22 @@ PrintJob::PrintJob(std::string id, std::string key, std::string printer_id,
 std::vector<JobEvent> PrintJob::history() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return history_;
+}
+
+std::string PrintJob::printToken() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return print_token_;
+}
+
+std::string PrintJob::cutToken() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return cut_token_;
+}
+
+void PrintJob::setTokens(const std::string& print_token, const std::string& cut_token) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  print_token_ = print_token;
+  cut_token_ = cut_token;
 }
 
 void PrintJob::subscribe(EventCallback callback) {
@@ -181,25 +253,59 @@ std::optional<JobResult> PrintJob::result(std::chrono::milliseconds timeout) con
 
 namespace detail {
 
-// Four printable characters mapped to a job id (docs/techspec.md §5.2). The suffix is
-// shared by a job's P and C tokens so a captured stream reads as one receipt, and it
-// is held until the job ends so no outstanding marker can be answered by a later job.
+// Verification identifiers (docs/api.md §14, docs/techspec.md §5.2). Four printable
+// characters: `[2-char per-instance nonce][2-char job sequence]`. The nonce says which
+// driver instance owns the echo — that is what makes a foreign writer identifiable on
+// the paper and on the wire — and the sequence says which job.
+//
+// A job takes two adjacent sequence values, an even one for its print fence and the odd
+// successor for its cut fence, so P and C stay distinguishable inside the fixed
+// four-character layout without spending a character on a discriminator. Both are held
+// from the moment the job record is minted until the job is terminal, so no outstanding
+// marker can ever be answered by a later job. 8 836 sequences ⇒ 4 418 jobs per wrap.
 class MarkerAllocator {
  public:
-  std::string acquire() {
+  struct Pair {
+    std::string print_token;
+    std::string cut_token;
+  };
+
+  explicit MarkerAllocator(std::string nonce) : nonce_(std::move(nonce)) {}
+
+  const std::string& nonce() const noexcept { return nonce_; }
+
+  Pair acquire() {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (uint32_t i = 0; i < 1000; ++i) {
-      std::string suffix = threeDigits(next_++);
-      if (in_use_.insert(suffix).second) {
-        return suffix;
+    for (uint32_t i = 0; i < kTokenSequenceSpace / 2u; ++i) {
+      const uint32_t slot = next_++;
+      Pair pair{nonce_ + encodeBase94(slot * 2u), nonce_ + encodeBase94(slot * 2u + 1u)};
+      if (in_use_.count(pair.print_token) != 0 || in_use_.count(pair.cut_token) != 0) {
+        continue;
       }
+      in_use_.insert(pair.print_token);
+      in_use_.insert(pair.cut_token);
+      return pair;
     }
     throw std::runtime_error("no free completion marker tokens");
   }
 
-  void release(const std::string& suffix) {
+  void release(const Pair& pair) {
     std::lock_guard<std::mutex> lock(mutex_);
-    in_use_.erase(suffix);
+    in_use_.erase(pair.print_token);
+    in_use_.erase(pair.cut_token);
+  }
+
+  bool isOutstanding(const std::string& token) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return in_use_.count(token) != 0;
+  }
+
+  // Whether an echoed token could have come from this driver at all. Deliberately the
+  // nonce rather than the outstanding set: a printer that answers a marker after the
+  // job it belonged to has already timed out is late, not foreign, and reporting a
+  // multi-writer violation there would cry wolf on the one case Unknown exists for.
+  bool isOurs(const std::string& token) const noexcept {
+    return token.size() == 4 && token.compare(0, 2, nonce_) == 0;
   }
 
   size_t outstanding() const {
@@ -209,8 +315,27 @@ class MarkerAllocator {
 
  private:
   mutable std::mutex mutex_;
+  std::string nonce_;
   uint32_t next_ = 0;
   std::set<std::string> in_use_;
+};
+
+// Holds a job's token pair for exactly as long as the work that will print it exists.
+// Both the run and the cancel closure capture one, so a job that is dequeued and a job
+// that is thrown away at shutdown release identically, with no explicit call anywhere.
+struct MarkerLease {
+  std::shared_ptr<MarkerAllocator> allocator;
+  MarkerAllocator::Pair pair;
+
+  MarkerLease(std::shared_ptr<MarkerAllocator> owner, MarkerAllocator::Pair tokens)
+      : allocator(std::move(owner)), pair(std::move(tokens)) {}
+  MarkerLease(const MarkerLease&) = delete;
+  MarkerLease& operator=(const MarkerLease&) = delete;
+  ~MarkerLease() {
+    if (allocator) {
+      allocator->release(pair);
+    }
+  }
 };
 
 struct DriverEventHub {
@@ -240,6 +365,19 @@ struct JobEntry {
 struct JobIndex {
   mutable std::mutex mutex;
   std::unordered_map<std::string, JobEntry> by_key;
+  // Paper → job (docs/api.md §14). Both of a job's tokens land here, oldest first, and
+  // a lookup answers with the newest holder: after a sequence wrap the receipt in an
+  // operator's hand is far more likely to be the recent one, and the journal timestamp
+  // settles the rest. Strong references, because an older attempt's job is no longer
+  // reachable through by_key but its printed token must still resolve.
+  std::unordered_map<std::string, std::vector<std::shared_ptr<PrintJob>>> by_token;
+
+  void registerToken(const std::string& token, const std::shared_ptr<PrintJob>& job) {
+    if (token.empty() || !job) {
+      return;
+    }
+    by_token[token].push_back(job);
+  }
 };
 
 enum class WaitOutcome { Signalled, LinkDown, Timeout, Aborted };
@@ -308,9 +446,9 @@ class PrinterRuntime {
   uint32_t widthDots() const noexcept { return config_.width_dots; }
 
   // A null payload is only valid for a reprint, where the original submission's
-  // payload is reused.
+  // payload is reused. `banner` is only ever true on a reprint that asked for one.
   std::shared_ptr<PrintJob> submit(std::shared_ptr<Payload> payload, JobOptions options,
-                                   bool reprint);
+                                   bool reprint, bool banner);
 
   // Addon hooks (docs/sdk-spec.md §12); see the comments on Printer::reserveJob.
   std::shared_ptr<PrintJob> reserve(const std::string& key, PayloadKind kind,
@@ -346,6 +484,12 @@ class PrinterRuntime {
   void runJob(const std::shared_ptr<PrintJob>& job, const Payload& payload,
               const JobOptions& options, uint32_t attempt, bool banner);
 
+  // Mints this attempt's verification identifiers and makes them durable and
+  // resolvable before a byte carrying them can leave. Returns an empty lease when the
+  // profile has no GS ( H fence, and therefore no wire token to promote.
+  std::unique_ptr<MarkerLease> leaseTokens(const std::shared_ptr<PrintJob>& job,
+                                           const CapabilityProfile& profile);
+
   void beginJobIo();
   WaitOutcome awaitToken(const std::string& token, std::chrono::milliseconds timeout);
   WaitOutcome awaitQueued(std::chrono::milliseconds timeout);
@@ -368,9 +512,10 @@ class PrinterRuntime {
 
   escpos::Bytes buildPayload(const CapabilityProfile& profile, const Payload& payload,
                              const JobOptions& options, uint32_t attempt,
-                             const std::string& key, bool banner) const;
-  escpos::Bytes buildCut(const CapabilityProfile& profile, CutVariant variant,
-                         const std::string& marker_token) const;
+                             const std::string& key, bool banner,
+                             const std::string& print_token) const;
+  escpos::Bytes buildCut(const CapabilityProfile& profile, const JobOptions& options,
+                         CutVariant variant, const std::string& marker_token) const;
   TransportResult sendPaced(const CapabilityProfile& profile,
                             const escpos::Bytes& bytes);
 
@@ -601,6 +746,16 @@ void PrinterRuntime::onBytes(const uint8_t* data, size_t size) {
     for (escpos::ParsedEvent& event : parser_.feed(data, size)) {
       switch (event.kind) {
         case escpos::ParsedEventKind::GsHAck:
+          // A structurally valid frame whose token carries somebody else's instance
+          // nonce is somebody else's receipt (docs/api.md §14, docs/sdk-spec.md §14).
+          // It is reported and dropped: attributing it would let a second writer's
+          // printer finish one of our jobs, which is the failure the one-owner rule
+          // exists to prevent. Nothing waiting is consumed either way — this branch
+          // never touches a queued or realtime expectation.
+          if (markers_ && !markers_->isOurs(event.token)) {
+            events.push_back(DeviceEvent::ForeignWriterDetected);
+            break;
+          }
           gsh_tokens_.push_back(event.token);
           break;
         case escpos::ParsedEventKind::QueuedStatus:
@@ -775,7 +930,8 @@ void PrinterRuntime::terminate(const std::shared_ptr<PrintJob>& job, JobState st
 escpos::Bytes PrinterRuntime::buildPayload(const CapabilityProfile& profile,
                                            const Payload& payload,
                                            const JobOptions& options, uint32_t attempt,
-                                           const std::string& key, bool banner) const {
+                                           const std::string& key, bool banner,
+                                           const std::string& print_token) const {
   const escpos::CodePage code_page =
       std::holds_alternative<DocumentPayload>(payload.content)
           ? std::get<DocumentPayload>(payload.content).code_page
@@ -786,6 +942,13 @@ escpos::Bytes PrinterRuntime::buildPayload(const CapabilityProfile& profile,
   // also what makes a raw payload's trailing fence attributable (docs/api.md §3).
   encoder.initialize();
   encoder.selectCodePage(code_page);
+
+  // Top margin (docs/receipt-dsl.md "Margins"): blank paper before the first content
+  // line, ahead of even the reprint banner, because it is tear-off clearance for the
+  // whole ticket rather than spacing for part of it.
+  if (options.top_feed_dots > 0) {
+    encoder.feedDots(options.top_feed_dots);
+  }
 
   // The banner marks a deliberate duplicate, so it belongs to forceReprint and not to
   // the attempt counter: a fresh attempt after a FailedKnown printed nothing, and
@@ -816,6 +979,24 @@ escpos::Bytes PrinterRuntime::buildPayload(const CapabilityProfile& profile,
     encoder.raw(std::get<RawPayload>(payload.content).bytes);
   }
 
+  // The verification trailer (docs/api.md §14): the printed half of the receipt
+  // verification identifier. It is the last content on the ticket, so an operator
+  // holding the paper reads the code next to the order it belongs to, and the same
+  // string goes into the QR so a scanner produces exactly what the eye can check.
+  // Nothing is printed when the profile has no wire token to promote.
+  if (options.print_verification_id && !print_token.empty()) {
+    std::string line;
+    if (!key.empty()) {
+      line = std::string(kOrderPrefix) + key + "  ";
+    }
+    line += std::string(kVerificationPrefix) + print_token;
+    encoder.feed()
+        .align(escpos::Alignment::Center)
+        .line(line)
+        .qr(line)
+        .align(escpos::Alignment::Left);
+  }
+
   if (options.open_drawer) {
     encoder.kickCashDrawer();
   }
@@ -825,14 +1006,19 @@ escpos::Bytes PrinterRuntime::buildPayload(const CapabilityProfile& profile,
 }
 
 escpos::Bytes PrinterRuntime::buildCut(const CapabilityProfile& profile,
-                                       CutVariant variant,
+                                       const JobOptions& options, CutVariant variant,
                                        const std::string& marker_token) const {
   escpos::Encoder encoder;
   // The print head sits ahead of the blade, so the guarantee is: at cut time, at
   // least head_to_cutter_feed_dots of feed has occurred since the last printed
   // content. This rides on top of final_feed_lines rather than replacing it, right
   // before the cut command and the fence that follows it (docs/testing-plan.md).
-  encoder.feedDots(profile.media.head_to_cutter_feed_dots);
+  //
+  // A caller's bottom margin (docs/receipt-dsl.md "Margins") can only widen that gap:
+  // max, never min, so asking for whitespace is always granted and asking for less
+  // than the blade clearance is silently refused rather than clipping the ticket.
+  encoder.feedDots(std::max(profile.media.head_to_cutter_feed_dots,
+                            options.bottom_feed_dots));
   encoder.useCutWithFeed(profile.quirks.extra_feed_before_cut > 0,
                          profile.quirks.extra_feed_before_cut);
   encoder.cut(variant == CutVariant::Full ? escpos::CutMode::Full
@@ -882,6 +1068,27 @@ TransportResult PrinterRuntime::sendPaced(const CapabilityProfile& profile,
     }
   }
   return TransportResult::success(offset);
+}
+
+std::unique_ptr<MarkerLease> PrinterRuntime::leaseTokens(
+    const std::shared_ptr<PrintJob>& job, const CapabilityProfile& profile) {
+  if (!markers_ || profile.completion != CompletionMechanism::GsParenH) {
+    return nullptr;
+  }
+  auto lease = std::unique_ptr<MarkerLease>(new MarkerLease(markers_, markers_->acquire()));
+  job->setTokens(lease->pair.print_token, lease->pair.cut_token);
+  // Durable before the wire, for the same reason SendStarted is: a receipt whose `V:`
+  // code is not in the journal is a piece of paper nobody can resolve (docs/api.md
+  // §14). Journaled here rather than at submission because the effective profile — and
+  // with it whether there is a wire token at all — is only settled once a worker has
+  // taken the job and a promoting probe has finished.
+  store_->recordTokens(job->id(), lease->pair.print_token, lease->pair.cut_token);
+  {
+    std::lock_guard<std::mutex> index_lock(index_->mutex);
+    index_->registerToken(lease->pair.print_token, job);
+    index_->registerToken(lease->pair.cut_token, job);
+  }
+  return lease;
 }
 
 void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload& payload,
@@ -992,22 +1199,14 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     // and the completion fence below is where the truth comes out.
   }
 
+  // Held for the rest of the job: a token stays outstanding until the receipt it
+  // fences is finished, so no later job can be handed an echo meant for this one.
+  const std::unique_ptr<MarkerLease> lease = leaseTokens(job, profile);
+  const std::string print_token = lease ? lease->pair.print_token : std::string();
+  const std::string cut_token = lease ? lease->pair.cut_token : std::string();
+
   const escpos::Bytes wire =
-      buildPayload(profile, payload, options, attempt, job->key(), banner);
-  const std::string marker_suffix =
-      profile.completion == CompletionMechanism::GsParenH ? markers_->acquire()
-                                                          : std::string();
-  const std::string print_token = marker_suffix.empty() ? "" : "P" + marker_suffix;
-  const std::string cut_token = marker_suffix.empty() ? "" : "C" + marker_suffix;
-  struct MarkerGuard {
-    MarkerAllocator* allocator;
-    std::string suffix;
-    ~MarkerGuard() {
-      if (allocator && !suffix.empty()) {
-        allocator->release(suffix);
-      }
-    }
-  } marker_guard{markers_.get(), marker_suffix};
+      buildPayload(profile, payload, options, attempt, job->key(), banner, print_token);
 
   // --- The ordering rule (docs/techspec.md §5.1) ----------------------------------
   // SendStarted is durable before the socket sees byte one. Everything after this
@@ -1049,7 +1248,7 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
       // than after an acknowledgement that is never coming. The non-ESC/POS
       // mechanisms never reach here: the job was refused as Unsupported above.
       if (cut != CutVariant::None) {
-        fence = buildCut(profile, cut, print_token);
+        fence = buildCut(profile, options, cut, print_token);
       }
       break;
   }
@@ -1100,7 +1299,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     std::lock_guard<std::mutex> lock(io_mutex_);
     parser_.expectQueued();
   }
-  const TransportResult cut_sent = sendPaced(profile, buildCut(profile, cut, cut_token));
+  const TransportResult cut_sent =
+      sendPaced(profile, buildCut(profile, options, cut, cut_token));
   if (!cut_sent.ok) {
     terminate(job, JobState::Unknown,
               JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
@@ -1172,10 +1372,10 @@ size_t payloadInputBytes(const Payload& payload) {
 }
 
 std::shared_ptr<PrintJob> PrinterRuntime::submit(std::shared_ptr<Payload> payload,
-                                                 JobOptions options, bool reprint) {
+                                                 JobOptions options, bool reprint,
+                                                 bool banner) {
   std::string key = options.key;
   uint32_t attempt = 1;
-  bool banner = reprint;
 
   std::lock_guard<std::mutex> index_lock(index_->mutex);
   if (!key.empty()) {
@@ -1239,7 +1439,8 @@ std::shared_ptr<PrintJob> PrinterRuntime::submit(std::shared_ptr<Payload> payloa
     runJob(job, *shared_payload, options, attempt, banner);
   };
   task.cancel = [this, job] {
-    // Never dequeued, so provably zero bytes on the wire.
+    // Never dequeued, so provably zero bytes on the wire, and no token was ever minted
+    // for it: the identifiers belong to a print, not to a submission.
     terminate(job, JobState::FailedKnown,
               JobResult::failed(FailureReason::Unknown, ConfidenceLevel::TransportAccepted));
   };
@@ -1391,21 +1592,22 @@ CapabilityProfile Printer::profile() const { return rt_->profile(); }
 std::optional<CapabilityFindings> Printer::findings() const { return rt_->findings(); }
 
 std::shared_ptr<PrintJob> Printer::print(Payload payload, const JobOptions& options) {
-  return rt_->submit(std::make_shared<Payload>(std::move(payload)), options, false);
+  return rt_->submit(std::make_shared<Payload>(std::move(payload)), options, false, false);
 }
 
 std::shared_ptr<PrintJob> Printer::forceReprint(const std::string& key,
-                                                const JobOptions& options) {
-  JobOptions effective = options;
+                                                const ReprintOptions& options) {
+  JobOptions effective = options.job;
   effective.key = key;
-  return rt_->submit(nullptr, effective, true);
+  return rt_->submit(nullptr, effective, true, options.banner);
 }
 
 std::shared_ptr<PrintJob> Printer::forceReprint(const std::string& key, Payload payload,
-                                                const JobOptions& options) {
-  JobOptions effective = options;
+                                                const ReprintOptions& options) {
+  JobOptions effective = options.job;
   effective.key = key;
-  return rt_->submit(std::make_shared<Payload>(std::move(payload)), effective, true);
+  return rt_->submit(std::make_shared<Payload>(std::move(payload)), effective, true,
+                     options.banner);
 }
 
 DeviceStatus Printer::status() const { return rt_->status(); }
@@ -1437,7 +1639,9 @@ void Printer::submitReserved(const std::shared_ptr<PrintJob>& job, Payload paylo
 PrinterDriver::PrinterDriver(StorageConfig storage)
     : store_(std::make_shared<JobStore>(storage)),
       capabilities_(std::make_shared<FindingsStore>(storage.directory)),
-      markers_(std::make_shared<detail::MarkerAllocator>()) {
+      // After the store, which is what creates the directory the nonce lives in.
+      markers_(std::make_shared<detail::MarkerAllocator>(
+          loadOrCreateNonce(storage.directory))) {
   hub_ = std::make_shared<detail::DriverEventHub>();
   index_ = std::make_shared<detail::JobIndex>();
   // Jobs from a previous run come back as terminal handles so findJob(key) works
@@ -1463,6 +1667,7 @@ PrinterDriver::PrinterDriver(StorageConfig storage)
     // persisted rather than the struct's E_TransportOnly default — including through
     // a same-key dedupe return, which hands back this very JobResult.
     outcome.with(JobEvidence{record.grade, record.authority, record.method.c_str()});
+    job->setTokens(record.print_token, record.cut_token);
     job->emit(record.state, record.confidence,
               record.reason == FailureReason::None
                   ? std::optional<FailureReason>()
@@ -1473,7 +1678,16 @@ PrinterDriver::PrinterDriver(StorageConfig storage)
     entry.printer_id = record.printer_id;
     entry.attempt = record.attempt;
     index_->by_key[record.key] = entry;
+    // Paper outlives the process: a receipt printed yesterday still has to resolve to
+    // the job that printed it (docs/api.md §14). Journal order is creation order, so
+    // registering here keeps most-recent-first correct across the restart too.
+    index_->registerToken(record.print_token, job);
+    index_->registerToken(record.cut_token, job);
   }
+}
+
+const std::string& PrinterDriver::instanceNonce() const noexcept {
+  return markers_->nonce();
 }
 
 PrinterDriver::~PrinterDriver() { shutdown(); }
@@ -1528,8 +1742,17 @@ std::shared_ptr<PrintJob> PrinterDriver::findJob(const std::string& key) const {
   return it == index_->by_key.end() ? nullptr : it->second.job;
 }
 
+std::shared_ptr<PrintJob> PrinterDriver::jobByToken(const std::string& token) const {
+  std::lock_guard<std::mutex> lock(index_->mutex);
+  const auto it = index_->by_token.find(token);
+  if (it == index_->by_token.end() || it->second.empty()) {
+    return nullptr;
+  }
+  return it->second.back();
+}
+
 std::shared_ptr<PrintJob> PrinterDriver::forceReprint(const std::string& key,
-                                                      const JobOptions& options) {
+                                                      const ReprintOptions& options) {
   std::string printer_id;
   {
     std::lock_guard<std::mutex> lock(index_->mutex);
@@ -1551,7 +1774,7 @@ std::shared_ptr<PrintJob> PrinterDriver::forceReprint(const std::string& key,
 
 std::shared_ptr<PrintJob> PrinterDriver::forceReprint(const std::string& key,
                                                       Payload payload,
-                                                      const JobOptions& options) {
+                                                      const ReprintOptions& options) {
   std::string printer_id;
   {
     std::lock_guard<std::mutex> lock(index_->mutex);

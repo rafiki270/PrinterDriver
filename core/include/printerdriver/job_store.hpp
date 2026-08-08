@@ -57,6 +57,13 @@ struct JobRecord {
   PayloadKind payload_kind = PayloadKind::Raw;
   uint64_t payload_bytes = 0;
 
+  // The receipt verification identifiers this job printed and cut under (docs/api.md
+  // §14): the two GS ( H fence tokens, `[2-char instance nonce][2-char sequence]`.
+  // Empty on a profile whose completion mechanism is not GS ( H — there is no wire
+  // token to promote — and on journal lines written before format version 3.
+  std::string print_token;
+  std::string cut_token;
+
   JobState state = JobState::Queued;
   ConfidenceLevel confidence = ConfidenceLevel::TransportAccepted;
   FailureReason reason = FailureReason::None;
@@ -78,9 +85,9 @@ struct JobRecord {
 // One parsed journal line. Exposed because reading the raw journal is the only way to
 // prove the ordering rule from outside the store, which the engine tests do.
 struct JournalEntry {
-  enum class Kind { Job, State } kind = Kind::Job;
+  enum class Kind { Job, State, Tokens } kind = Kind::Job;
   // Kind::Job: creation fields. Kind::State: id/state/confidence/reason/grade/
-  // authority/method.
+  // authority/method. Kind::Tokens: id/print_token/cut_token.
   JobRecord record;
 };
 
@@ -103,6 +110,13 @@ class JobStore {
   // has something to report passes it explicitly.
   void recordState(const std::string& job_id, JobState state, ConfidenceLevel confidence,
                    FailureReason reason, const JobEvidence& evidence = {});
+
+  // Attaches the job's verification identifiers (docs/api.md §14) and fsyncs. Used by
+  // the path that mints a job's record before its tokens exist — a queue-addon
+  // reservation, which is held first and printed later. The caller must not put a byte
+  // carrying these tokens on the wire until this has returned.
+  void recordTokens(const std::string& job_id, const std::string& print_token,
+                    const std::string& cut_token);
 
   std::optional<JobRecord> findByKey(const std::string& key) const;
   std::optional<JobRecord> findById(const std::string& id) const;

@@ -54,7 +54,9 @@ typedef enum pd_test_enum {
   PD_TEST_ENUM_ALIGNMENT = 10,
   PD_TEST_ENUM_CODE_PAGE = 11,
   PD_TEST_ENUM_BINARIZATION = 12,
-  PD_TEST_ENUM_TOTAL = 13
+  PD_TEST_ENUM_CONFIDENCE_GRADE = 13,
+  PD_TEST_ENUM_COMPLETION_AUTHORITY = 14,
+  PD_TEST_ENUM_TOTAL = 15
 } pd_test_enum;
 
 /* Number of members the C++ enum has, straight from the core's kAll* arrays or from a

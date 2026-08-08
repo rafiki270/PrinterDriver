@@ -53,6 +53,12 @@ enum class DeviceEvent {
   UnrecoverableError,
   ConnectionLost,
   ConnectionRestored,
+  // A structurally valid GS ( H echo arrived carrying a token this driver instance
+  // never issued: something else is writing to the same printer (docs/api.md §14,
+  // docs/sdk-spec.md §14). The echo is not attributed to any job and satisfies no
+  // outstanding fence — it is reported so a violated one-owner topology is loud
+  // instead of silently misrouting acknowledgements.
+  ForeignWriterDetected,
 };
 
 enum class FailureReason {
@@ -115,13 +121,14 @@ constexpr std::array<ConfidenceLevel, 6> kAllConfidenceLevels{
     ConfidenceLevel::CutFaultFree,      ConfidenceLevel::PhysicallyVerified,
 };
 
-constexpr std::array<DeviceEvent, 12> kAllDeviceEvents{
+constexpr std::array<DeviceEvent, 13> kAllDeviceEvents{
     DeviceEvent::Online,       DeviceEvent::Offline,
     DeviceEvent::CoverOpen,    DeviceEvent::CoverClosed,
     DeviceEvent::PaperOut,     DeviceEvent::PaperNearEnd,
     DeviceEvent::PaperOk,      DeviceEvent::CutterError,
     DeviceEvent::RecoverableError, DeviceEvent::UnrecoverableError,
     DeviceEvent::ConnectionLost,   DeviceEvent::ConnectionRestored,
+    DeviceEvent::ForeignWriterDetected,
 };
 
 constexpr std::array<FailureReason, 11> kAllFailureReasons{

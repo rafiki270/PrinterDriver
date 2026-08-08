@@ -40,19 +40,25 @@ data class JobEvent(
  * since that is the documented, intentional shape of the real ABI it binds -- not an
  * oversight to flatten away.
  *
- * Note on scope: a `grade`/`authority`/`method` triple appears in
- * docs/device-database.md's "Confidence grades for every route" as a description of
- * the confidence *model* generally (its A-E grades are the same idea [ConfidenceLevel]
- * already encodes as one closed enum), not as literal fields of pd_job_result -- the
- * actual struct in pd.h, and pd::JobResult in core/include/printerdriver/types.hpp,
- * both carry exactly (outcome, confidence, reason). This wrapper mirrors that struct;
- * it does not invent grade/authority/method fields the C ABI does not provide.
+ * pd_job_result also carries the evidence triple of docs/device-database.md
+ * "Confidence grades for every route": [ConfidenceGrade], [CompletionAuthority] and the
+ * command that produced the claim. It is surfaced on [Done], where a claim is actually
+ * being made -- never a bare success.
  */
 sealed class JobResult {
     /** Reached DoneSoftware (or PhysicallyVerified later). [confidence] says what that
      *  claim rests on -- e.g. CUT_FAULT_FREE on a GS(H) printer vs TRANSPORT_ACCEPTED
-     *  on a write-only one. Never inflated by the SDK. */
-    data class Done(val confidence: ConfidenceLevel) : JobResult()
+     *  on a write-only one. Never inflated by the SDK.
+     *
+     *  [grade] says what class of evidence it is, [authority] who made the claim, and
+     *  [method] which command produced it ("GS(H) fn48") -- the string a support
+     *  engineer needs six months later; "none" when nothing was confirmed. */
+    data class Done(
+        val confidence: ConfidenceLevel,
+        val grade: ConfidenceGrade,
+        val authority: CompletionAuthority,
+        val method: String
+    ) : JobResult()
 
     /** FailedKnown: nothing printed, or the failure was confirmed (preflight refusal,
      *  transport unreachable, cutter fault...). Safe to resubmit the same key. */
@@ -65,10 +71,17 @@ sealed class JobResult {
 
     internal companion object {
         // Raw pd_job_outcome values (pd.h): DONE=0, FAILED=1, UNKNOWN=2.
-        fun fromRaw(outcome: Int, confidence: Int, reason: Int): JobResult {
+        fun fromRaw(
+            outcome: Int,
+            confidence: Int,
+            reason: Int,
+            grade: Int,
+            authority: Int,
+            method: String
+        ): JobResult {
             val level = ConfidenceLevel.fromRaw(confidence)
             return when (outcome) {
-                0 -> Done(level)
+                0 -> Done(level, ConfidenceGrade.fromRaw(grade), CompletionAuthority.fromRaw(authority), method)
                 1 -> Failed(FailureReason.fromRaw(reason), level)
                 2 -> Unknown(level)
                 else -> {
@@ -100,5 +113,31 @@ data class JobOptions(
     val openDrawer: Boolean = false,
     val preflight: Preflight = Preflight.STRICT,
     /** Per-phase completion-wait budget in ms. 0 -> the printer's profile default. */
-    val timeoutMs: Int = 0
+    val timeoutMs: Int = 0,
+    /** Blank paper fed before the first content line -- tear-off clearance,
+     *  presentation space (docs/receipt-dsl.md "Margins"). */
+    val topFeedDots: Int = 0,
+    /** The *total* whitespace between the last content and the cut. The core feeds
+     *  max(the profile's blade clearance, this), so this can only ever add paper: a
+     *  value below the hardware minimum is ignored rather than allowed to slice through
+     *  a trailing QR. */
+    val bottomFeedDots: Int = 0,
+    /** Print the receipt verification identifier in the ticket trailer -- the ORDER
+     *  line and the trailer QR (docs/api.md §14). On by default. Turning it off
+     *  suppresses the ink, not the evidence: the token is still journaled and
+     *  [PrinterDriver.jobByToken] still resolves it. */
+    val printVerificationId: Boolean = true
+)
+
+/**
+ * Options for a deliberate duplicate (pd_reprint_options).
+ *
+ * [banner] prints `*** REPRINT / POSSIBLE DUPLICATE ***` and the attempt counter, and is
+ * on by default. Turning it off is a per-call, deliberate act for a receipt where the
+ * banner is inappropriate -- a customer-facing copy. A kitchen ticket should never turn
+ * it off: the banner is what lets staff bin the duplicate instead of cooking it twice.
+ */
+data class ReprintOptions(
+    val job: JobOptions = JobOptions(),
+    val banner: Boolean = true
 )

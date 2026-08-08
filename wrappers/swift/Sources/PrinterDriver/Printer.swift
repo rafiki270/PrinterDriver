@@ -57,7 +57,7 @@ public final class Printer: @unchecked Sendable {
         return job
       }
     }
-    return core.internJob(handle, authority: completionMechanism)
+    return core.internJob(handle, mechanism: completionMechanism)
   }
 
   /// Submits a job and reports it through closures — the callback form of
@@ -91,21 +91,34 @@ public final class Printer: @unchecked Sendable {
   /// Reuses the original payload and prepends the reprint banner and attempt counter, so
   /// the paper says what it is. This is the only way to print a key twice.
   ///
+  /// - Parameter options: pass ``ReprintOptions/banner`` `false` only for a receipt
+  ///   where the banner is inappropriate; the attempt counter still increments either
+  ///   way, so the journal records the duplicate whatever the paper says.
   /// - Throws: ``PrinterDriverError`` when the key is unknown, or when its job was
   ///   reconstructed from the journal — those records carry what happened to a job, never
   ///   what it contained.
-  public func forceReprint(key: String, options: JobOptions = JobOptions()) throws -> PrintJob {
+  public func forceReprint(key: String, options: ReprintOptions = ReprintOptions())
+    throws -> PrintJob
+  {
+    var effective = options
+    effective.job.key = key
     let handle = try key.withCString { keyPointer in
-      try options.withABI { optionsPointer -> OpaquePointer in
+      try effective.withABI { optionsPointer -> OpaquePointer in
         guard
-          let job = pd_force_reprint(core.handle, self.handle, keyPointer, optionsPointer)
+          let job = pd_force_reprint_opts(
+            core.handle, self.handle, keyPointer, optionsPointer)
         else {
           throw core.lastError()
         }
         return job
       }
     }
-    return core.internJob(handle, authority: completionMechanism)
+    return core.internJob(handle, mechanism: completionMechanism)
+  }
+
+  /// Prints a deliberate duplicate with the plain submission options, banner on.
+  public func forceReprint(key: String, options: JobOptions) throws -> PrintJob {
+    try forceReprint(key: key, options: ReprintOptions(options))
   }
 
   // MARK: - Device state
