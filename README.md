@@ -11,21 +11,32 @@ fences (`GS ( H` process-ID markers, `GS r 1`) and an honest tri-state job outco
 
 ## Status
 
-Milestone 7. On top of the durable job store, TCP transport and print engine there is now
-printer identification, a compositional capability profile, the device database from
-[docs/device-database.md](docs/device-database.md), and probe-then-promote: a device is
-interrogated non-destructively once, the findings override the shipped profile defaults,
-and they are cached by identity so nothing is re-probed on every boot. Every job result
-carries a confidence grade, a completion authority and the method that produced it.
+Built and tested: the full C++ core (encoder, interleaved response parser, durable job
+store, TCP transport, fenced print engine), printer identification with compositional
+capability profiles and probe-then-promote, the device database from
+[docs/device-database.md](docs/device-database.md), the C ABI (`pd.h`), the print-queue
+addon, and three wrappers — Swift (iOS 16+/macOS 13+, verified), Dart (pub-ready,
+verified), Kotlin/Android (scaffold, CI-pending). Every job result carries a confidence
+grade, a completion authority and the method that produced it.
 
 Identity is untrusted by default. `GS I` is a string the firmware chooses, and at least
 one printer family ships answering as somebody else's model
 ([docs/capability-profiles.md](docs/capability-profiles.md)), so identification combines
 MAC OUI, the reported strings and observed command behaviour.
 
-Not built yet: the C ABI and platform wrappers, Bluetooth/USB/serial transports, the ePOS
-and StarPRNT transports (their profiles are data only), network discovery, and the
-print-queue addon.
+**Hardware-verified**, not just unit-tested: the reference Xprinter XP-S260M was probed
+(`GS ( H` confirmed), then soak-tested with 100 real receipts — during which the paper
+ran out mid-run and the engine classified every outcome honestly (86 confirmed, one
+`unknown`, two preflight refusals with zero bytes sent, circuit-breaker stop, zero
+duplicates after resume). Two real defects found by that hardware testing — the cutter
+slicing trailing content, and journal-reloaded jobs losing their evidence grade — are
+fixed with regression tests.
+
+Not built yet: Bluetooth/USB/serial transports, the ePOS and StarPRNT transports (their
+profiles are data only — Star printers refuse honestly instead of printing unfenced),
+network discovery in the core, the receipt-DSL renderer
+([docs/receipt-dsl.md](docs/receipt-dsl.md) is specified), and the Windows port
+([docs/platforms.md](docs/platforms.md)).
 
 ## Build and test
 
@@ -56,6 +67,64 @@ swift test       # runs on macOS
 
 See [wrappers/swift/README.md](wrappers/swift/README.md) for the API, the threading
 contract and the platform matrix.
+
+```swift
+import PrinterDriver
+
+let driver  = PrinterDriver(storage: .default)
+let kitchen = driver.printer(.tcp(host: "192.168.1.101"), width: .dots576,
+                             profile: "xprinter_s_series")
+let job = try kitchen.print(.text(["Order 7F3A", "2x Pilsner"]),
+                            options: .init(key: "order-7F3A#kitchen-1"))
+
+switch try await job.result {                 // tri-state — there is no isSuccess
+case .done(let confidence, let authority):    // e.g. .cutFaultFree from the printer itself
+  markPrinted(confidence, authority)
+case .failed(let reason, _):                  // known failure, zero or safe bytes sent
+  showFailure(reason)
+case .unknown:                                // sent, unacknowledged — operator decides
+  askOperator(job)
+}
+```
+
+## Dart package
+
+[wrappers/dart/](wrappers/dart/) is a pub-ready pure-Dart package (`printerdriver`) with
+hand-written FFI bindings over the same C ABI, a sealed tri-state `JobResult`, and strict
+separation between the shipped native library and the test-only scripted-device build.
+
+```sh
+cmake -S . -B build-dart -DPD_BUILD_SHARED_CAPI=ON
+cmake --build build-dart -j --target printerdriver_capi_testing
+cd wrappers/dart && dart test
+```
+
+## Android package
+
+[wrappers/android/](wrappers/android/) is a Maven-publishable AAR scaffold
+(`com.printerdriver:printerdriver`) — Gradle + externalNativeBuild over the same core,
+JNI glue syntax-checked against `pd.h`, honest README stating exactly what a CI run on a
+JVM host must still confirm.
+
+## Example app
+
+[examples/ios/ReceiptStudio](examples/ios/ReceiptStudio) (branch `example-ios`) is a
+SwiftUI app that scans the network for port-9100 candidates, remembers printers, runs
+`Identify`, offers a block-based receipt designer that serializes to the
+[receipt-dsl](docs/receipt-dsl.md) JSON, and prints through the full fenced engine with
+the honest tri-state status sheet.
+
+## Evidence, not success
+
+Every result names what backs it ([docs/device-database.md](docs/device-database.md)):
+
+| Grade | Meaning | Example |
+|---|---|---|
+| A | job-level confirmation from the mechanism | `GS ( H` echo, ePOS JobID |
+| B | ordered device response, weaker semantics | `GS r 1` |
+| C | device status around transmission | DLE EOT, ASB |
+| D | a spooler said completed | CUPS, Windows spooler |
+| E | transport only | TCP write succeeded |
 
 ## pdctl
 
@@ -107,6 +176,8 @@ capi/tests/                   the C ABI test, the scripted-device factory, the e
 queue/                        the print-queue addon (separate library on purpose)
 Package.swift                 SwiftPM manifest for the whole repository
 wrappers/swift/               the Swift wrapper: Sources, Tests, README
+wrappers/dart/                the Dart FFI package (pub-ready)
+wrappers/android/             the Kotlin/Android AAR scaffold (CI-pending)
 tools/pdctl.cpp               command-line diagnostics
 docs/                         specifications — these are authoritative, not the code
 scripts/printer_probe.py      standalone hardware capability probe
@@ -134,3 +205,11 @@ back into the driver.
   the compositional profile hierarchy, and why `GS I` cannot be trusted on its own.
 - [docs/device-database.md](docs/device-database.md) — the printer/media/transport matrix,
   print-server semantics, and the confidence grades every result carries.
+- [docs/receipt-dsl.md](docs/receipt-dsl.md) — the serializable receipt document model:
+  blocks, styles, templates with bound parameter models, formatters, cut control.
+- [docs/platforms.md](docs/platforms.md) — platform matrix, the Windows path, and why the
+  SDK bypasses OS print spoolers on purpose.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
