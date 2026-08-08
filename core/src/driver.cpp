@@ -352,8 +352,11 @@ class PrinterRuntime {
   void mergeStatus(const escpos::StatusFlags& flags, std::vector<DeviceEvent>* out);
   void dispatchDeviceEvents(const std::vector<DeviceEvent>& events);
 
+  // `evidence` defaults to none: most transitions are mid-flight and have not earned
+  // any yet. terminate() is the one caller that has something to pass.
   void advance(const std::shared_ptr<PrintJob>& job, JobState state,
-               ConfidenceLevel confidence, FailureReason reason);
+               ConfidenceLevel confidence, FailureReason reason,
+               const JobEvidence& evidence = {});
   void terminate(const std::shared_ptr<PrintJob>& job, JobState state,
                  const JobResult& outcome);
 
@@ -743,10 +746,11 @@ WaitOutcome PrinterRuntime::awaitRealtime(size_t count, std::chrono::millisecond
 }
 
 void PrinterRuntime::advance(const std::shared_ptr<PrintJob>& job, JobState state,
-                             ConfidenceLevel confidence, FailureReason reason) {
+                             ConfidenceLevel confidence, FailureReason reason,
+                             const JobEvidence& evidence) {
   // Persist first, then publish: an observer must never learn of a transition the
   // journal has not committed (docs/techspec.md §5.1).
-  store_->recordState(job->id(), state, confidence, reason);
+  store_->recordState(job->id(), state, confidence, reason, evidence);
   job->emit(state, confidence,
             reason == FailureReason::None ? std::optional<FailureReason>()
                                           : std::optional<FailureReason>(reason));
@@ -754,7 +758,11 @@ void PrinterRuntime::advance(const std::shared_ptr<PrintJob>& job, JobState stat
 
 void PrinterRuntime::terminate(const std::shared_ptr<PrintJob>& job, JobState state,
                                const JobResult& outcome) {
-  advance(job, state, outcome.confidence, outcome.reason);
+  // The evidence rides with the same transition that carries the outcome, so a
+  // reload never has to guess what a completed job actually earned (docs/techspec.md
+  // §5.1, docs/device-database.md "Confidence grades for every route").
+  advance(job, state, outcome.confidence, outcome.reason,
+         JobEvidence{outcome.grade, outcome.authority, outcome.method.c_str()});
   job->finish(outcome);
 }
 
@@ -814,6 +822,11 @@ escpos::Bytes PrinterRuntime::buildCut(const CapabilityProfile& profile,
                                        CutVariant variant,
                                        const std::string& marker_token) const {
   escpos::Encoder encoder;
+  // The print head sits ahead of the blade, so the guarantee is: at cut time, at
+  // least head_to_cutter_feed_dots of feed has occurred since the last printed
+  // content. This rides on top of final_feed_lines rather than replacing it, right
+  // before the cut command and the fence that follows it (docs/testing-plan.md).
+  encoder.feedDots(profile.media.head_to_cutter_feed_dots);
   encoder.useCutWithFeed(profile.quirks.extra_feed_before_cut > 0,
                          profile.quirks.extra_feed_before_cut);
   encoder.cut(variant == CutVariant::Full ? escpos::CutMode::Full
@@ -1355,6 +1368,11 @@ PrinterDriver::PrinterDriver(StorageConfig storage)
         outcome = JobResult{JobOutcome::Unknown, record.confidence, record.reason};
         break;
     }
+    // The journal is the only source of truth once a job outlives the process that
+    // ran it, so a reloaded job reports whatever grade/authority/method it actually
+    // persisted rather than the struct's E_TransportOnly default — including through
+    // a same-key dedupe return, which hands back this very JobResult.
+    outcome.with(JobEvidence{record.grade, record.authority, record.method.c_str()});
     job->emit(record.state, record.confidence,
               record.reason == FailureReason::None
                   ? std::optional<FailureReason>()

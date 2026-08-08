@@ -251,6 +251,17 @@ Encoder& Encoder::feedLines(uint8_t lines) {
   return *this;
 }
 
+Encoder& Encoder::feedDots(uint16_t dots) {
+  // ESC J n: n is a single byte, so a request above 255 is chunked across several
+  // commands rather than truncated.
+  while (dots > 0) {
+    const uint8_t chunk = dots > 0xFF ? 0xFF : static_cast<uint8_t>(dots);
+    put({kEsc, 0x4A, chunk});
+    dots = static_cast<uint16_t>(dots - chunk);
+  }
+  return *this;
+}
+
 Encoder& Encoder::useCutWithFeed(bool enabled, uint8_t feed_units) {
   cut_with_feed_ = enabled;
   cut_feed_units_ = feed_units;

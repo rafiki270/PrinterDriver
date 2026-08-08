@@ -84,6 +84,9 @@ CapabilityProfile xp_s260m() {
   profile.status.asb = true;
   profile.status.cutter_error = true;
   profile.media.black_mark_sensor = true;
+  // Hardware-calibrated on this unit today (docs/testing-plan.md): the cutter sliced
+  // the last ~15% of a trailing QR before this was measured and fed.
+  profile.media.head_to_cutter_feed_dots = 120;
   // 128 KB input buffer and a LAN module that kept up with unpaced writes during the
   // probe: chunking would only add latency.
   profile.chunk_bytes = 0;

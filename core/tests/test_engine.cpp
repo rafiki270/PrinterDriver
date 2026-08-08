@@ -18,6 +18,27 @@ escpos::Bytes textPayload(const std::string& text) {
   return encoder.take();
 }
 
+// First offset of `needle` in `hay` at or after `from`, or npos. Written by hand
+// rather than pulling in <algorithm> for one std::search call.
+size_t findSubsequence(const std::vector<uint8_t>& hay, const std::vector<uint8_t>& needle,
+                       size_t from = 0) {
+  if (needle.empty() || hay.size() < needle.size()) {
+    return std::string::npos;
+  }
+  for (size_t i = from; i + needle.size() <= hay.size(); ++i) {
+    size_t j = 0;
+    for (; j < needle.size(); ++j) {
+      if (hay[i + j] != needle[j]) {
+        break;
+      }
+    }
+    if (j == needle.size()) {
+      return i;
+    }
+  }
+  return std::string::npos;
+}
+
 struct Rig {
   pdfake::MockLink link;
   std::unique_ptr<PrinterDriver> driver;
@@ -477,6 +498,59 @@ PD_TEST(engine_reloaded_job_blocks_a_resubmission_of_the_same_key) {
   CHECK_EQ(link.stats->connects.load(), static_cast<size_t>(0));
 }
 
+PD_TEST(engine_reloaded_dedupe_return_carries_the_original_grade) {
+  // Regression for the hardware soak's other finding: a journal-reloaded job that
+  // earned grade A reported E_TransportOnly/TransportOnly/"none" on a same-key
+  // dedupe return, which is internally inconsistent with a CutFaultFree confidence.
+  pdfake::TempDir dir("engine-recovery-grade");
+  {
+    PrinterDriver driver(StorageConfig::at(dir.path()));
+    pdfake::MockLink link;
+    PrinterConfig config;
+    config.id = "printer-under-test";
+    config.transport = link.factory();
+    config.profile = pdfake::fastProfile(CompletionMechanism::GsParenH);
+    auto printer = driver.addPrinter(config);
+    JobOptions options;
+    options.key = "order-graded-a";
+    const JobResult first =
+        printer->print(Payload::raw(textPayload("GRADED ORIGINAL")), options)->result();
+    CHECK_EQ(first.outcome, JobOutcome::Done);
+    CHECK_EQ(first.confidence, ConfidenceLevel::CutFaultFree);
+    CHECK_EQ(first.grade, ConfidenceGrade::A_JobLevelConfirmation);
+  }
+
+  // Fresh process: the job is reconstructed from the journal, not replayed in memory.
+  PrinterDriver driver(StorageConfig::at(dir.path()));
+  pdfake::MockLink link;
+  PrinterConfig config;
+  config.id = "printer-under-test";
+  config.transport = link.factory();
+  config.profile = pdfake::fastProfile(CompletionMechanism::GsParenH);
+  auto printer = driver.addPrinter(config);
+  JobOptions options;
+  options.key = "order-graded-a";
+
+  const auto reloaded = driver.findJob(options.key);
+  CHECK(reloaded != nullptr);
+  CHECK_EQ(reloaded->result().grade, ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK_EQ(reloaded->result().authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(reloaded->result().method, std::string("GS(H) fn48"));
+
+  // Resubmitting the same key returns that reconstructed job untouched, and it must
+  // still carry the original evidence rather than a fresh TransportOnly default.
+  const auto deduped = printer->print(Payload::raw(textPayload("GRADED ORIGINAL")), options);
+  CHECK(deduped.get() == reloaded.get());
+  const JobResult result = deduped->result();
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.confidence, ConfidenceLevel::CutFaultFree);
+  CHECK_EQ(result.grade, ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK_EQ(result.authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(result.method, std::string("GS(H) fn48"));
+  // Nothing reached the wire on this run: the dedupe returned before touching it.
+  CHECK_EQ(link.device->received().size(), static_cast<size_t>(0));
+}
+
 // --- l. The ordering rule ----------------------------------------------------------
 
 PD_TEST(engine_journals_send_started_before_the_first_payload_byte) {
@@ -515,6 +589,50 @@ PD_TEST(engine_journals_send_started_before_the_first_payload_byte) {
   // Read straight off disk, from the writing thread, before the device saw the byte.
   CHECK(send_started_was_durable);
   CHECK_EQ(print_bytes_at_check, static_cast<size_t>(0));
+}
+
+// --- m. Pre-cut head-to-cutter feed -----------------------------------------------
+
+PD_TEST(engine_feeds_head_to_cutter_dots_immediately_before_every_cut) {
+  for (const CompletionMechanism mechanism :
+       {CompletionMechanism::GsParenH, CompletionMechanism::GsR1}) {
+    Rig rig(mechanism);
+    rig.profile.media.head_to_cutter_feed_dots = 120;
+    rig.build();
+    const JobResult result = runOne(rig, "TRAILING QR AT THE VERY END");
+    CHECK_EQ(result.outcome, JobOutcome::Done);
+
+    const std::vector<uint8_t> received = rig.link.device->received();
+    const std::vector<uint8_t> payload_text{'T', 'R', 'A', 'I', 'L', 'I', 'N', 'G'};
+    const std::vector<uint8_t> feed_bytes{0x1B, 0x4A, 0x78};  // ESC J 120 (0x78)
+    const std::vector<uint8_t> cut_bytes{0x1D, 0x56, 0x01};   // GS V 1 (partial cut)
+
+    const size_t payload_pos = findSubsequence(received, payload_text);
+    const size_t feed_pos = findSubsequence(received, feed_bytes);
+    const size_t cut_pos = findSubsequence(received, cut_bytes);
+    CHECK(payload_pos != std::string::npos);
+    CHECK(feed_pos != std::string::npos);
+    CHECK(cut_pos != std::string::npos);
+    CHECK(feed_pos > payload_pos);
+    // Nothing rides between the feed and the cut it guarantees: the configured dots
+    // land immediately before GS V, on the wire, for both fence mechanisms.
+    CHECK_EQ(feed_pos + feed_bytes.size(), cut_pos);
+  }
+}
+
+PD_TEST(engine_head_to_cutter_feed_is_chunked_above_255_dots_on_the_wire) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.profile.media.head_to_cutter_feed_dots = 300;
+  rig.build();
+  const JobResult result = runOne(rig, "WIDE GAP PROFILE");
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+
+  const std::vector<uint8_t> received = rig.link.device->received();
+  const std::vector<uint8_t> feed_bytes{0x1B, 0x4A, 0xFF, 0x1B, 0x4A, 0x2D};  // 255 + 45
+  const std::vector<uint8_t> cut_bytes{0x1D, 0x56, 0x01};
+  const size_t feed_pos = findSubsequence(received, feed_bytes);
+  CHECK(feed_pos != std::string::npos);
+  CHECK_EQ(feed_pos + feed_bytes.size(), findSubsequence(received, cut_bytes));
 }
 
 // --- Profiles ----------------------------------------------------------------------

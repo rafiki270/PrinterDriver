@@ -18,6 +18,9 @@ CapabilityProfile thermal80() {
   profile.media.cutter = true;
   profile.media.partial_cut = true;
   profile.media.full_cut = true;
+  // Conservative until a probe or a hardware soak calibrates it per model
+  // (docs/testing-plan.md).
+  profile.media.head_to_cutter_feed_dots = 120;
   profile.chunk_bytes = 0;
   profile.inter_chunk_delay_ms = 0;
   profile.completion_timeout_ms = 15000;
@@ -50,6 +53,9 @@ CapabilityProfile epsonBase() {
   profile.transport.usb = true;
   profile.transport.serial = true;
   profile.final_feed_lines = 3;
+  // Mid-range of the TM family's documented 10-15 mm head-to-cutter gap at 203 dpi;
+  // tighten per model once a unit is actually probed.
+  profile.media.head_to_cutter_feed_dots = 100;
   return profile;
 }
 

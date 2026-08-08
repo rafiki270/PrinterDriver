@@ -135,6 +135,14 @@ struct MediaProfile {
   bool cutter = true;
   bool full_cut = true;
   bool partial_cut = true;
+
+  // Distance from the print head to the cutter blade, in dots at this profile's dpi:
+  // the head sits ahead of the blade, so content printed right up to the cut can be
+  // sliced by the mechanism that is supposed to free it (docs/testing-plan.md — an
+  // XP-S260M soak found the last ~15% of a trailing QR cut off). The engine always
+  // feeds this many dots immediately before every cut, on top of final_feed_lines.
+  // 120 is the conservative default for anything not individually calibrated.
+  uint16_t head_to_cutter_feed_dots = 120;
 };
 
 struct CapabilityProfile {

@@ -217,7 +217,7 @@ class FakePrinter {
       switch (second) {
         case 0x40: return 2;                        // ESC @
         case 0x74: case 0x61: case 0x45:            // ESC t / ESC a / ESC E
-        case 0x2D: case 0x64: return 3;             // ESC - / ESC d
+        case 0x2D: case 0x64: case 0x4A: return 3;  // ESC - / ESC d / ESC J
         case 0x70: return 5;                        // ESC p
         default: return 0;
       }
