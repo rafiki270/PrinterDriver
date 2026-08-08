@@ -81,35 +81,109 @@ public struct JobOptions: Hashable, Sendable {
   ///   never in a failure.
   public var timeoutMilliseconds: UInt32
 
+  /// Blank paper fed before the first content line — tear-off clearance, presentation
+  /// space (docs/receipt-dsl.md "Margins").
+  public var topFeedDots: UInt32
+
+  /// The *total* whitespace between the last content and the cut.
+  ///
+  /// The core feeds `max(the profile's blade clearance, this)`, so it can only ever add
+  /// paper: a value below the hardware minimum is silently ignored rather than allowed
+  /// to slice through a trailing QR.
+  public var bottomFeedDots: UInt32
+
+  /// Print the receipt verification identifier in the ticket trailer — the `ORDER:` line
+  /// and the trailer QR (docs/api.md §14). On by default.
+  ///
+  /// Turning it off suppresses the ink, not the evidence: the token is still journaled
+  /// and ``PrinterDriver/job(token:)`` still resolves it.
+  public var printsVerificationID: Bool
+
   public init(
     key: String? = nil,
     cut: Cut = .profile,
     openDrawer: Bool = false,
     preflight: Preflight = .strict,
-    timeoutMilliseconds: UInt32 = 0
+    timeoutMilliseconds: UInt32 = 0,
+    topFeedDots: UInt32 = 0,
+    bottomFeedDots: UInt32 = 0,
+    printsVerificationID: Bool = true
   ) {
     self.key = key
     self.cut = cut
     self.openDrawer = openDrawer
     self.preflight = preflight
     self.timeoutMilliseconds = timeoutMilliseconds
+    self.topFeedDots = topFeedDots
+    self.bottomFeedDots = bottomFeedDots
+    self.printsVerificationID = printsVerificationID
   }
 
   /// Runs `body` with a C view of these options. The `key` buffer is valid only for the
   /// duration of the call, which is all the ABI needs: it copies every string it is given.
   func withABI<R>(_ body: (UnsafePointer<pd_job_options>) throws -> R) rethrows -> R {
     func build(_ keyPointer: UnsafePointer<CChar>?) throws -> R {
-      var options = pd_job_options(
-        key: keyPointer,
-        cut: pd_cut(cut.rawValue),
-        open_drawer: openDrawer ? 1 : 0,
-        preflight: pd_preflight(preflight.rawValue),
-        timeout_ms: timeoutMilliseconds
-      )
+      var options = cValue(key: keyPointer)
       return try withUnsafePointer(to: &options) { try body($0) }
     }
 
     if let key {
+      return try key.withCString { try build($0) }
+    }
+    return try build(nil)
+  }
+
+  /// The C struct for these options, borrowing `key`. Split out so ``ReprintOptions``
+  /// can nest it without duplicating the field mapping.
+  func cValue(key keyPointer: UnsafePointer<CChar>?) -> pd_job_options {
+    pd_job_options(
+      key: keyPointer,
+      cut: pd_cut(cut.rawValue),
+      open_drawer: openDrawer ? 1 : 0,
+      preflight: pd_preflight(preflight.rawValue),
+      timeout_ms: timeoutMilliseconds,
+      top_feed_dots: topFeedDots,
+      bottom_feed_dots: bottomFeedDots,
+      // Inverted in the ABI so that an all-zeroes struct still prints the evidence.
+      suppress_verification_id: printsVerificationID ? 0 : 1
+    )
+  }
+}
+
+// MARK: - Reprint options
+
+/// Everything optional about a deliberate duplicate — a 1:1 mirror of
+/// `pd_reprint_options`.
+public struct ReprintOptions: Hashable, Sendable {
+  /// The submission options the duplicate is printed with.
+  public var job: JobOptions
+
+  /// Print `*** REPRINT / POSSIBLE DUPLICATE ***` and the attempt counter. On by
+  /// default.
+  ///
+  /// Turning it off is a per-call, deliberate act for a receipt where the banner is
+  /// inappropriate — a customer-facing copy. A kitchen ticket should never turn it off:
+  /// the banner is what lets staff bin the duplicate instead of cooking it twice.
+  public var banner: Bool
+
+  public init(job: JobOptions = JobOptions(), banner: Bool = true) {
+    self.job = job
+    self.banner = banner
+  }
+
+  /// Convenience for the common case of "the same options, minus the banner".
+  public init(_ job: JobOptions, banner: Bool = true) {
+    self.init(job: job, banner: banner)
+  }
+
+  func withABI<R>(_ body: (UnsafePointer<pd_reprint_options>) throws -> R) rethrows -> R {
+    func build(_ keyPointer: UnsafePointer<CChar>?) throws -> R {
+      var options = pd_reprint_options(
+        job: job.cValue(key: keyPointer), suppress_banner: banner ? 0 : 1)
+      return try withUnsafePointer(to: &options) { try body($0) }
+    }
+
+    if let key = job.key {
       return try key.withCString { try build($0) }
     }
     return try build(nil)
@@ -159,9 +233,13 @@ public enum JobResult: Hashable, Sendable {
   /// - Parameters:
   ///   - confidence: what that claim rests on — `cutFaultFree` on a `GS ( H` printer,
   ///     `transportAccepted` on a write-only one. Never inflated.
-  ///   - authority: the printer's completion mechanism, i.e. which ordered fence was
-  ///     available to prove it.
-  case done(confidence: ConfidenceLevel, authority: CompletionAuthority)
+  ///   - grade: what *class* of evidence it is, straight from the core.
+  ///   - authority: who made the claim — the printer itself, a spooler, or nobody.
+  ///   - method: the command behind it, e.g. `GS(H) fn48`. The string a support
+  ///     engineer needs six months later; `"none"` when nothing was confirmed.
+  case done(
+    confidence: ConfidenceLevel, grade: ConfidenceGrade, authority: CompletionAuthority,
+    method: String)
 
   /// Nothing printed, or the failure is confirmed: preflight refusal, transport
   /// unreachable, cutter fault. Safe to resubmit under the same key.
@@ -174,11 +252,15 @@ public enum JobResult: Hashable, Sendable {
   /// or a manual confirmation. The SDK never retries out of this state on its own.
   case unknown(confidence: ConfidenceLevel)
 
-  init(_ result: pd_job_result, authority: CompletionAuthority) {
+  init(_ result: pd_job_result) {
     let confidence = ConfidenceLevel(bridging: result.confidence.rawValue)
     switch JobOutcome(bridging: result.outcome.rawValue) {
     case .done:
-      self = .done(confidence: confidence, authority: authority)
+      self = .done(
+        confidence: confidence,
+        grade: ConfidenceGrade(bridging: result.grade.rawValue),
+        authority: CompletionAuthority(bridging: result.authority.rawValue),
+        method: result.method.map(String.init(cString:)) ?? "none")
     case .failed:
       self = .failed(
         reason: FailureReason(bridging: result.reason.rawValue), confidence: confidence)
@@ -199,7 +281,7 @@ public enum JobResult: Hashable, Sendable {
   /// How far up the evidence ladder the job got, whichever way it ended.
   public var confidence: ConfidenceLevel {
     switch self {
-    case .done(let confidence, _): return confidence
+    case .done(let confidence, _, _, _): return confidence
     case .failed(_, let confidence): return confidence
     case .unknown(let confidence): return confidence
     }

@@ -120,6 +120,8 @@ static PDDeviceEvent PDDeviceEventFrom(pd::DeviceEvent event) {
         case pd::DeviceEvent::UnrecoverableError:  return PDDeviceEventUnrecoverableError;
         case pd::DeviceEvent::ConnectionLost:      return PDDeviceEventConnectionLost;
         case pd::DeviceEvent::ConnectionRestored:  return PDDeviceEventConnectionRestored;
+        case pd::DeviceEvent::ForeignWriterDetected:
+            return PDDeviceEventForeignWriterDetected;
     }
     return PDDeviceEventOffline;
 }

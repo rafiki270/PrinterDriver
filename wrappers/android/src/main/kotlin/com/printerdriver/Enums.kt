@@ -82,6 +82,12 @@ enum class DeviceEvent(internal val raw: Int) {
     UNRECOVERABLE_ERROR(9),
     CONNECTION_LOST(10),
     CONNECTION_RESTORED(11),
+
+    /** A GS(H) echo arrived carrying a token this driver never issued: something else
+     *  is writing to the same printer (docs/api.md §14, docs/sdk-spec.md §14). The echo
+     *  is attributed to no job and satisfies no fence. One printer has exactly one
+     *  connection owner; this is what a violation of that looks like from the inside. */
+    FOREIGN_WRITER_DETECTED(12),
     UNRECOGNIZED(-1);
 
     companion object {
@@ -247,6 +253,65 @@ enum class CutVariant(internal val raw: Int) {
     companion object {
         internal fun fromRaw(raw: Int): CutVariant = entries.firstOrNull { it.raw == raw } ?: run {
             PdLog.w("Unrecognized pd_cut_variant raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}
+
+/**
+ * pd::ConfidenceGrade -- what *class* of evidence a claim rests on
+ * (docs/device-database.md "Confidence grades for every route").
+ *
+ * Orthogonal to [ConfidenceLevel]: the level says how far up the evidence ladder a job
+ * climbed, the grade says what the claim is made of. Done at CUT_PROCESSED on grade A
+ * and Done at CUT_PROCESSED on grade D are not the same claim.
+ */
+enum class ConfidenceGrade(internal val raw: Int, val letter: String) {
+    /** GS(H), an ePOS JobID result, a Star checked block. */
+    A_JOB_LEVEL_CONFIRMATION(0, "A"),
+
+    /** GS r, a vendor idle query. */
+    B_ORDERED_DEVICE_RESPONSE(1, "B"),
+
+    /** DLE EOT, ASB or SNMP taken around the transmission. */
+    C_DEVICE_STATUS_AROUND(2, "C"),
+
+    /** A spooler or IPP gateway said completed. */
+    D_SPOOLER_COMPLETED(3, "D"),
+
+    /** The write succeeded and nothing else is known. */
+    E_TRANSPORT_ONLY(4, "E"),
+    UNRECOGNIZED(-1, "?");
+
+    companion object {
+        internal fun fromRaw(raw: Int): ConfidenceGrade = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_confidence_grade raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}
+
+/**
+ * pd::CompletionAuthority -- who is actually making the claim a [JobResult] carries.
+ *
+ * Recorded separately from [ConfidenceGrade] because "completed" from a print server and
+ * "completed" from the mechanism that moved the paper are different facts
+ * (docs/device-database.md §D).
+ */
+enum class CompletionAuthority(internal val raw: Int) {
+    /** The device that moved the paper said so itself. */
+    PHYSICAL_PRINTER(0),
+    VENDOR_SPOOLER(1),
+    PD_AGENT(2),
+    PRINT_SERVER(3),
+
+    /** Nobody said anything; the write succeeded. */
+    TRANSPORT_ONLY(4),
+    UNRECOGNIZED(-1);
+
+    companion object {
+        internal fun fromRaw(raw: Int): CompletionAuthority = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_completion_authority raw value: $raw")
             UNRECOGNIZED
         }
     }

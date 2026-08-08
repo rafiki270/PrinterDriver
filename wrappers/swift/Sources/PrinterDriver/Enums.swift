@@ -110,11 +110,41 @@ public enum ConfidenceLevel: UInt32, ABIMirroredEnum {
   }
 }
 
-/// Alias for callers who think of ``ConfidenceLevel`` as the grade attached to a result.
+// MARK: - ConfidenceGrade
+
+/// What *class* of evidence a claim rests on — `pd_confidence_grade`.
 ///
-/// - Note: The ABI has one evidence type, not two: `pd_job_result.confidence` is both
-///   "how far up the ladder the job got" and "what the terminal claim rests on".
-public typealias ConfidenceGrade = ConfidenceLevel
+/// Orthogonal to ``ConfidenceLevel``: the level says how far up the evidence ladder a
+/// job climbed, the grade says what the claim is made of. A job that is done at
+/// ``ConfidenceLevel/cutProcessed`` on grade A and one that is done at
+/// ``ConfidenceLevel/cutProcessed`` on grade D are not making the same claim.
+public enum ConfidenceGrade: UInt32, ABIMirroredEnum {
+  /// `GS ( H`, an ePOS JobID result, a Star checked block.
+  case aJobLevelConfirmation = 0
+  /// `GS r`, a vendor idle query.
+  case bOrderedDeviceResponse = 1
+  /// `DLE EOT`, ASB or SNMP taken around the transmission.
+  case cDeviceStatusAround = 2
+  /// A spooler or IPP gateway said completed.
+  case dSpoolerCompleted = 3
+  /// The write succeeded and nothing else is known.
+  case eTransportOnly = 4
+
+  public static let abiTypeName = "ConfidenceGrade"
+  /// The weakest grade there is. An unrecognized one must never read as stronger
+  /// evidence than the wrapper can account for.
+  public static let unrecognizedFallback = ConfidenceGrade.eTransportOnly
+
+  /// The core's own spelling, from `pd_confidence_grade_name`.
+  public var abiName: String {
+    String(cString: pd_confidence_grade_name(pd_confidence_grade(rawValue)))
+  }
+
+  /// "A"..."E" — the letter a report tabulates, from `pd_confidence_grade_letter`.
+  public var letter: String {
+    String(cString: pd_confidence_grade_letter(pd_confidence_grade(rawValue)))
+  }
+}
 
 // MARK: - DeviceEvent
 
@@ -132,6 +162,11 @@ public enum DeviceEvent: UInt32, ABIMirroredEnum {
   case unrecoverableError = 9
   case connectionLost = 10
   case connectionRestored = 11
+  /// A `GS ( H` echo arrived carrying a token this driver never issued: something else
+  /// is writing to the same printer (docs/api.md §14). The echo is attributed to no job,
+  /// so no fence is satisfied by it — one printer has exactly one connection owner, and
+  /// this is what a violation of that looks like from the inside.
+  case foreignWriterDetected = 12
 
   public static let abiTypeName = "DeviceEvent"
   /// This enum has no "unknown" member, so the fallback is chosen for least harm: an
@@ -264,9 +299,30 @@ public enum CompletionMechanism: UInt32, ABIMirroredEnum {
   }
 }
 
-/// Alias for callers who read the completion mechanism as "who is authorised to say this
-/// job finished".
-public typealias CompletionAuthority = CompletionMechanism
+// MARK: - CompletionAuthority
+
+/// Who is actually making the claim a ``JobResult`` carries — `pd_completion_authority`.
+///
+/// Recorded separately from ``ConfidenceGrade`` because "completed" from a print server
+/// and "completed" from the mechanism that moved the paper are different facts.
+public enum CompletionAuthority: UInt32, ABIMirroredEnum {
+  /// The device that moved the paper said so itself.
+  case physicalPrinter = 0
+  case vendorSpooler = 1
+  case pdAgent = 2
+  case printServer = 3
+  /// Nobody said anything; the write succeeded.
+  case transportOnly = 4
+
+  public static let abiTypeName = "CompletionAuthority"
+  /// Claims the least. An unrecognized authority must not be read as the printer.
+  public static let unrecognizedFallback = CompletionAuthority.transportOnly
+
+  /// The core's own spelling, from `pd_completion_authority_name`.
+  public var abiName: String {
+    String(cString: pd_completion_authority_name(pd_completion_authority(rawValue)))
+  }
+}
 
 // MARK: - CutVariant
 

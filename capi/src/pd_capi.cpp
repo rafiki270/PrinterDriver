@@ -71,7 +71,31 @@ static_assert(PD_DEVICE_UNRECOVERABLE_ERROR ==
 static_assert(PD_DEVICE_CONNECTION_LOST == value_of(pd::DeviceEvent::ConnectionLost));
 static_assert(PD_DEVICE_CONNECTION_RESTORED ==
               value_of(pd::DeviceEvent::ConnectionRestored));
+static_assert(PD_DEVICE_FOREIGN_WRITER_DETECTED ==
+              value_of(pd::DeviceEvent::ForeignWriterDetected));
 static_assert(PD_DEVICE_EVENT_COUNT == static_cast<int>(pd::kAllDeviceEvents.size()));
+
+static_assert(PD_GRADE_A_JOB_LEVEL_CONFIRMATION ==
+              value_of(pd::ConfidenceGrade::A_JobLevelConfirmation));
+static_assert(PD_GRADE_B_ORDERED_DEVICE_RESPONSE ==
+              value_of(pd::ConfidenceGrade::B_OrderedDeviceResponse));
+static_assert(PD_GRADE_C_DEVICE_STATUS_AROUND ==
+              value_of(pd::ConfidenceGrade::C_DeviceStatusAround));
+static_assert(PD_GRADE_D_SPOOLER_COMPLETED ==
+              value_of(pd::ConfidenceGrade::D_SpoolerCompleted));
+static_assert(PD_GRADE_E_TRANSPORT_ONLY == value_of(pd::ConfidenceGrade::E_TransportOnly));
+static_assert(PD_GRADE_COUNT == static_cast<int>(pd::kAllConfidenceGrades.size()));
+
+static_assert(PD_AUTHORITY_PHYSICAL_PRINTER ==
+              value_of(pd::CompletionAuthority::PhysicalPrinter));
+static_assert(PD_AUTHORITY_VENDOR_SPOOLER ==
+              value_of(pd::CompletionAuthority::VendorSpooler));
+static_assert(PD_AUTHORITY_PD_AGENT == value_of(pd::CompletionAuthority::PdAgent));
+static_assert(PD_AUTHORITY_PRINT_SERVER == value_of(pd::CompletionAuthority::PrintServer));
+static_assert(PD_AUTHORITY_TRANSPORT_ONLY ==
+              value_of(pd::CompletionAuthority::TransportOnly));
+static_assert(PD_AUTHORITY_COUNT ==
+              static_cast<int>(pd::kAllCompletionAuthorities.size()));
 
 static_assert(PD_REASON_NONE == value_of(pd::FailureReason::None));
 static_assert(PD_REASON_TRANSPORT_UNREACHABLE ==
@@ -155,7 +179,17 @@ const char* const kConfidenceNames[PD_CONFIDENCE_COUNT] = {
 const char* const kDeviceEventNames[PD_DEVICE_EVENT_COUNT] = {
     "Online",       "Offline",           "CoverOpen",      "CoverClosed",
     "PaperOut",     "PaperNearEnd",      "PaperOk",        "CutterError",
-    "RecoverableError", "UnrecoverableError", "ConnectionLost", "ConnectionRestored"};
+    "RecoverableError", "UnrecoverableError", "ConnectionLost", "ConnectionRestored",
+    "ForeignWriterDetected"};
+
+const char* const kConfidenceGradeNames[PD_GRADE_COUNT] = {
+    "A_JobLevelConfirmation", "B_OrderedDeviceResponse", "C_DeviceStatusAround",
+    "D_SpoolerCompleted",     "E_TransportOnly"};
+
+const char* const kConfidenceGradeLetters[PD_GRADE_COUNT] = {"A", "B", "C", "D", "E"};
+
+const char* const kCompletionAuthorityNames[PD_AUTHORITY_COUNT] = {
+    "PhysicalPrinter", "VendorSpooler", "PdAgent", "PrintServer", "TransportOnly"};
 
 const char* const kFailureReasonNames[PD_REASON_COUNT] = {
     "None",
@@ -289,6 +323,15 @@ pd::JobOptions toOptions(const pd_job_options* options) {
   out.open_drawer = options->open_drawer != 0;
   out.preflight = static_cast<pd::PreflightMode>(options->preflight);
   out.timeout_ms = options->timeout_ms;
+  // Clamped rather than rejected: a margin wider than the encoder's ESC J chunking can
+  // express is a caller asking for more paper than a roll has, and refusing the ticket
+  // over presentation whitespace would be the wrong trade.
+  const uint32_t kMaxFeedDots = 65535u;
+  out.top_feed_dots = static_cast<uint16_t>(
+      options->top_feed_dots > kMaxFeedDots ? kMaxFeedDots : options->top_feed_dots);
+  out.bottom_feed_dots = static_cast<uint16_t>(
+      options->bottom_feed_dots > kMaxFeedDots ? kMaxFeedDots : options->bottom_feed_dots);
+  out.print_verification_id = options->suppress_verification_id == 0;
   return out;
 }
 
@@ -604,6 +647,17 @@ extern "C" pd_job* pd_print(pd_driver* driver, pd_printer* printer,
 
 extern "C" pd_job* pd_force_reprint(pd_driver* driver, pd_printer* printer,
                                     const char* key, const pd_job_options* options) {
+  pd_reprint_options reprint;
+  std::memset(&reprint, 0, sizeof(reprint));
+  if (options != nullptr) {
+    reprint.job = *options;
+  }
+  return pd_force_reprint_opts(driver, printer, key, &reprint);
+}
+
+extern "C" pd_job* pd_force_reprint_opts(pd_driver* driver, pd_printer* printer,
+                                         const char* key,
+                                         const pd_reprint_options* options) {
   if (!checkHandles(driver, printer)) {
     return nullptr;
   }
@@ -611,9 +665,13 @@ extern "C" pd_job* pd_force_reprint(pd_driver* driver, pd_printer* printer,
     setError(driver, "force reprint needs the original idempotency key");
     return nullptr;
   }
-  pd::JobOptions job_options = toOptions(options);
-  job_options.key = key;
-  std::shared_ptr<pd::PrintJob> job = printer->printer->forceReprint(key, job_options);
+  pd::ReprintOptions reprint;
+  if (options != nullptr) {
+    reprint.job = toOptions(&options->job);
+    reprint.banner = options->suppress_banner == 0;
+  }
+  reprint.job.key = key;
+  std::shared_ptr<pd::PrintJob> job = printer->printer->forceReprint(key, reprint);
   if (!job) {
     setError(driver,
              "no reprintable job for key " + std::string(key) +
@@ -641,12 +699,65 @@ extern "C" pd_job* pd_find_job(pd_driver* driver, const char* key) {
   return pd::capi::internJob(driver, job);
 }
 
+extern "C" pd_job* pd_job_by_token(pd_driver* driver, const char* token) {
+  if (driver == nullptr) {
+    return nullptr;
+  }
+  if (token == nullptr || token[0] == '\0') {
+    setError(driver, "job lookup needs a verification token");
+    return nullptr;
+  }
+  clearError(driver);
+  std::shared_ptr<pd::PrintJob> job = driver->driver->jobByToken(token);
+  if (!job) {
+    setError(driver, "no job for verification token " + std::string(token));
+    return nullptr;
+  }
+  return pd::capi::internJob(driver, job);
+}
+
 extern "C" const char* pd_job_id(pd_job* job) {
   return job != nullptr ? job->id.c_str() : "";
 }
 
 extern "C" const char* pd_job_key(pd_job* job) {
   return job != nullptr ? job->key.c_str() : "";
+}
+
+namespace {
+
+// The tokens are minted on the submitting thread but a handle can be interned before
+// they are set, so they are cached on first read rather than at intern time. Under the
+// driver lock: the string a previous call returned must not be reallocated underneath
+// a caller still holding the pointer, which is why it is only ever written once.
+const char* cachedToken(pd_job* job, std::string pd_job::*slot,
+                        std::string (pd::PrintJob::*read)() const) {
+  if (job == nullptr || !job->job || job->owner == nullptr) {
+    return "";
+  }
+  std::lock_guard<std::mutex> lock(job->owner->mutex);
+  std::string& cached = job->*slot;
+  if (cached.empty()) {
+    cached = ((*job->job).*read)();
+  }
+  return cached.c_str();
+}
+
+}  // namespace
+
+extern "C" const char* pd_job_print_token(pd_job* job) {
+  return cachedToken(job, &pd_job::print_token, &pd::PrintJob::printToken);
+}
+
+extern "C" const char* pd_job_cut_token(pd_job* job) {
+  return cachedToken(job, &pd_job::cut_token, &pd::PrintJob::cutToken);
+}
+
+extern "C" const char* pd_instance_nonce(pd_driver* driver) {
+  if (driver == nullptr || !driver->driver) {
+    return "";
+  }
+  return driver->driver->instanceNonce().c_str();
 }
 
 extern "C" uint32_t pd_job_attempt(pd_job* job) {
@@ -676,10 +787,11 @@ extern "C" void pd_subscribe_job(pd_driver* driver, pd_job* job, pd_job_event_cb
   if (!checkJob(driver, job) || cb == nullptr) {
     return;
   }
-  job->job->subscribe([job, cb, ctx](const pd::JobEvent& event) {
-    const pd_job_event lowered = toEvent(event);
-    cb(job, &lowered, ctx);
-  });
+  // By value: the callback may outlive this frame (pd.h, pd_job_event_cb), which is
+  // what lets an async FFI consumer see transitions live instead of replaying them
+  // after the job settles.
+  job->job->subscribe(
+      [job, cb, ctx](const pd::JobEvent& event) { cb(job, toEvent(event), ctx); });
 }
 
 extern "C" int32_t pd_job_await(pd_driver* driver, pd_job* job, uint32_t timeout_ms,
@@ -702,6 +814,16 @@ extern "C" int32_t pd_job_await(pd_driver* driver, pd_job* job, uint32_t timeout
     out->outcome = static_cast<pd_job_outcome>(result.outcome);
     out->confidence = static_cast<pd_confidence_level>(result.confidence);
     out->reason = static_cast<pd_failure_reason>(result.reason);
+    out->grade = static_cast<pd_confidence_grade>(result.grade);
+    out->authority = static_cast<pd_completion_authority>(result.authority);
+    // The method string belongs to the handle, not to this frame: a caller keeping the
+    // pd_job_result must still be able to read it. A terminal job's result never
+    // changes, so writing it once per await is idempotent.
+    {
+      std::lock_guard<std::mutex> lock(driver->mutex);
+      job->method = result.method;
+      out->method = job->method.c_str();
+    }
   }
   return 1;
 }
@@ -731,6 +853,15 @@ extern "C" const char* pd_failure_reason_name(pd_failure_reason value) {
 }
 extern "C" const char* pd_job_outcome_name(pd_job_outcome value) {
   return nameAt(kJobOutcomeNames, value);
+}
+extern "C" const char* pd_confidence_grade_name(pd_confidence_grade value) {
+  return nameAt(kConfidenceGradeNames, value);
+}
+extern "C" const char* pd_completion_authority_name(pd_completion_authority value) {
+  return nameAt(kCompletionAuthorityNames, value);
+}
+extern "C" const char* pd_confidence_grade_letter(pd_confidence_grade value) {
+  return nameAt(kConfidenceGradeLetters, value);
 }
 extern "C" const char* pd_payload_kind_name(pd_payload_kind value) {
   return nameAt(kPayloadKindNames, value);

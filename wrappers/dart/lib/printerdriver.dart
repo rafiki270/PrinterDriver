@@ -189,6 +189,33 @@ final class PrinterDriver {
     return handle == nullptr ? null : _internJob(handle);
   }
 
+  /// Paper to job: resolves the four-character `V:` code printed on a receipt
+  /// (docs/api.md §14).
+  ///
+  /// Accepts either of a job's identifiers, the print fence's or the cut fence's, and
+  /// answers most-recent-first — the sequence wraps, and the receipt somebody is
+  /// holding is far more likely to be the recent one. Includes jobs reconstructed from
+  /// the journal, so a receipt printed before the last restart still resolves. Null
+  /// when no job on this driver ever carried that token.
+  PrintJob? jobByToken(String token) {
+    _checkAlive();
+    final handle = Arena.using(
+      (arena) => _bindings.jobByToken(_handle, arena.string(token)),
+    );
+    return handle == nullptr ? null : _internJob(handle);
+  }
+
+  /// The two characters every identifier this driver issues starts with: which driver
+  /// instance owns an echo, and therefore which instance printed a given receipt.
+  ///
+  /// Persisted in the storage directory, so it survives a restart. A token that does
+  /// not start with this came from somewhere else — the case
+  /// [DeviceEvent.foreignWriterDetected] reports.
+  String get instanceNonce {
+    _checkAlive();
+    return readNativeString(_bindings.instanceNonce(_handle));
+  }
+
   /// Test support: attaches a printer whose transport is an in-process scripted device.
   ///
   /// Only works against a library built from the `printerdriver_capi_testing` target;
@@ -428,13 +455,18 @@ final class Printer {
   /// Reuses the original payload and prepends the reprint banner and attempt counter.
   /// Throws when the key is unknown, or when its job was reconstructed from the journal
   /// — those records carry what happened to a job, never what it contained.
-  PrintJob forceReprint(String key, {JobOptions options = const JobOptions()}) {
+  ///
+  /// Pass `ReprintOptions(banner: false)` only for a receipt where the banner is
+  /// inappropriate; the attempt counter still increments either way, so the journal
+  /// records the duplicate whatever the paper says.
+  PrintJob forceReprint(String key,
+      {ReprintOptions options = const ReprintOptions()}) {
     _driver._checkAlive();
     final handle = Arena.using((arena) {
       final nativeOptions =
-          arena.allocate<PdJobOptions>(sizeOf<PdJobOptions>());
+          arena.allocate<PdReprintOptions>(sizeOf<PdReprintOptions>());
       options.fillNative(arena, nativeOptions);
-      return _bindings.forceReprint(
+      return _bindings.forceReprintOpts(
         _driver._handle,
         _handle,
         arena.string(key),
@@ -500,25 +532,19 @@ final class ScriptedDevice {
 ///
 /// ## How the events reach Dart
 ///
-/// pd.h delivers job events through a C callback that receives a `const pd_job_event*`
-/// pointing at a temporary of the emitting worker thread's stack frame: valid for the
-/// duration of the call and not one instruction longer. A `NativeCallable.listener` —
-/// the only kind of callback a foreign thread may invoke — runs its Dart function after
-/// that call has returned, so it must never read through that pointer, and this wrapper
-/// does not: the listener registered here carries no data at all. It is a wake-up.
+/// pd.h hands a job event to its callback **by value**, so the copy outlives the native
+/// call that produced it. That is what makes a `NativeCallable.listener` — the only
+/// kind of callback a foreign thread may invoke, and one that runs its Dart function
+/// after the native call has already returned — able to read the event at all.
 ///
-/// The event data comes from the other half of the same ABI call instead.
-/// `pd_subscribe_job` replays every event recorded so far *synchronously, on the calling
-/// thread*, before it returns. Once the job is terminal — and pd.h guarantees the last
-/// event a job emits is a terminal one — a second subscription therefore replays the
-/// complete, ordered history on the isolate's own thread, where the pointer is alive and
-/// an `isolateLocal` callback is legal. That is what [events] yields.
+/// So [events] is live: every transition reaches Dart as the core records it, not as a
+/// batch once the job settles. A late subscriber still gets the whole story, because
+/// the events recorded so far are replayed to it before the live ones, and the stream
+/// closes after the terminal event.
 ///
-/// The consequence to know about: [events] delivers the whole history when the job
-/// settles rather than event by event as it happens. Nothing is lost or reordered, and
-/// [currentState] is a live read for a progress indicator that needs one, but a UI that
-/// wants per-transition updates needs the ABI to hand out an event that outlives its
-/// callback. [Printer.events] has no such limitation and is live.
+/// Ordering is the core's guarantee, not this wrapper's: `pd_subscribe_job` replays the
+/// recorded history and then streams, and the last event a job emits is always a
+/// terminal one.
 final class PrintJob {
   PrintJob._(this._driver, this._handle)
       : id = readNativeString(_driver._bindings.jobId(_handle)),
@@ -534,6 +560,26 @@ final class PrintJob {
     _pump();
   }
 
+  /// The receipt verification identifier this attempt printed under — the four
+  /// characters the ticket carries as `V:` (docs/api.md §14).
+  ///
+  /// Null until the job reaches a worker, and null for good on a printer whose fence is
+  /// not `GS ( H`: the identifier *is* the wire token, so a printer with no wire token
+  /// has none to print. Resolve one with [PrinterDriver.jobByToken].
+  String? get printToken {
+    _driver._checkAlive();
+    final value = readNativeString(_bindings.jobPrintToken(_handle));
+    return value.isEmpty ? null : value;
+  }
+
+  /// The identifier the job's cut fence carried. Same rules as [printToken]; it
+  /// resolves through [PrinterDriver.jobByToken] too.
+  String? get cutToken {
+    _driver._checkAlive();
+    final value = readNativeString(_bindings.jobCutToken(_handle));
+    return value.isEmpty ? null : value;
+  }
+
   final PrinterDriver _driver;
   final Pointer<PdJob> _handle;
 
@@ -544,16 +590,22 @@ final class PrintJob {
   final String key;
 
   late final NativeCallable<PdJobEventCbNative> _tick;
-  final Completer<List<JobEvent>> _history = Completer<List<JobEvent>>();
+  // Every event seen so far, so a subscriber that attaches late is not told a shorter
+  // story than one that was there from the start.
+  final List<JobEvent> _recorded = <JobEvent>[];
+  final List<StreamController<JobEvent>> _listeners =
+      <StreamController<JobEvent>>[];
   final Completer<JobResult> _result = Completer<JobResult>();
   Timer? _recheck;
   int _recheckAttempt = 0;
   bool _settled = false;
+  Object? _abandoned;
 
-  // The core emits the terminal event and only then publishes the result
-  // (PrinterRuntime::terminate), so the tick for that event can arrive while
-  // pd_job_is_terminal still says 0 — and no further tick is coming. These are the
-  // re-checks that close that microsecond-wide window without polling a live job.
+  // Belt and braces. A job settles on its terminal *event*, because pd.h guarantees the
+  // last event a job emits is a terminal one and closing the stream on anything earlier
+  // would truncate it. These re-checks exist only for the case that contract is somehow
+  // not met — a job the core reports terminal with no terminal event behind it — so
+  // that a caller waits milliseconds rather than forever.
   static const List<int> _recheckDelaysMs = <int>[1, 2, 4, 8, 16, 32];
 
   PrinterDriverBindings get _bindings => _driver._bindings;
@@ -583,12 +635,35 @@ final class PrintJob {
     return _bindings.jobIsTerminal(_handle) != 0;
   }
 
-  /// Every event the job recorded, in order, ending with a terminal one.
+  /// Every event the job records, in order, ending with a terminal one.
   ///
-  /// See the class comment for when they arrive. Can be listened to more than once and
-  /// after the job has finished; the history is replayed each time.
-  Stream<JobEvent> get events async* {
-    yield* Stream<JobEvent>.fromIterable(await _history.future);
+  /// Live: each transition arrives as the core records it. Can be listened to more than
+  /// once and after the job has finished — a new subscription replays what has happened
+  /// so far and then follows the rest, so attaching late loses nothing. The stream
+  /// closes after the terminal event; it is a completion signal, not a result, so read
+  /// [result] for the tri-state answer.
+  Stream<JobEvent> get events {
+    late final StreamController<JobEvent> controller;
+    controller = StreamController<JobEvent>(
+      onListen: () {
+        for (final event in _recorded) {
+          controller.add(event);
+        }
+        final abandoned = _abandoned;
+        if (abandoned != null) {
+          controller.addError(abandoned);
+          controller.close();
+        } else if (_settled) {
+          controller.close();
+        } else {
+          _listeners.add(controller);
+        }
+      },
+      onCancel: () {
+        _listeners.remove(controller);
+      },
+    );
+    return controller.stream;
   }
 
   /// The terminal answer: [JobDone], [JobFailed] or [JobUnknown]. Never a boolean.
@@ -597,16 +672,30 @@ final class PrintJob {
   /// handle was obtained through [PrinterDriver.findJob] after a restart.
   Future<JobResult> get result => _result.future;
 
-  /// The wake-up. Deliberately ignores both pointers: see the class comment.
-  void _onNativeEvent(
-      Pointer<PdJob> job, Pointer<PdJobEvent> event, Pointer<Void> ctx) {
+  /// One transition, by value, from whichever core thread produced it.
+  void _onNativeEvent(Pointer<PdJob> job, PdJobEvent event, Pointer<Void> ctx) {
+    if (_settled || _abandoned != null) return;
+    final value = JobEvent.fromNative(event);
+    _recorded.add(value);
+    // A copy: a handler may cancel its subscription, which mutates _listeners.
+    for (final listener in List<StreamController<JobEvent>>.of(_listeners)) {
+      listener.add(value);
+    }
     _recheckAttempt = 0;
     _pump();
   }
 
+  /// Mirrors the core's own definition (`JobRecord::isTerminal`). `heldOffline` is a
+  /// queue-addon state a job comes back out of, so it is deliberately not in here.
+  static bool _isTerminalState(JobState state) =>
+      state == JobState.doneSoftware ||
+      state == JobState.physicallyVerified ||
+      state == JobState.failedKnown ||
+      state == JobState.unknown;
+
   void _pump() {
     if (_settled || _driver.isDisposed) return;
-    if (_bindings.jobIsTerminal(_handle) != 0) {
+    if (_recorded.isNotEmpty && _isTerminalState(_recorded.last.state)) {
       _settle();
       return;
     }
@@ -616,6 +705,13 @@ final class PrintJob {
         Duration(milliseconds: _recheckDelaysMs[_recheckAttempt++]),
         _pump,
       );
+      return;
+    }
+    // The re-check budget is spent and no terminal event arrived. Settling on the
+    // core's own answer is better than hanging; the result is still read from the ABI,
+    // so nothing here invents an outcome.
+    if (_bindings.jobIsTerminal(_handle) != 0) {
+      _settle();
     }
   }
 
@@ -624,33 +720,17 @@ final class PrintJob {
     _recheck?.cancel();
     _recheck = null;
 
-    final history = _replayHistory();
     final result = _readResult();
 
     // The job is terminal, so pd.h's "the last event a job ever emits is a terminal
     // one" means nothing will call this again.
     _tick.close();
 
-    _history.complete(history);
-    _result.complete(result);
-  }
-
-  /// Replays the recorded history synchronously. Only ever called on a terminal job,
-  /// which is what makes both the pointer and the isolateLocal callback safe.
-  List<JobEvent> _replayHistory() {
-    final events = <JobEvent>[];
-    final callback = NativeCallable<PdJobEventCbNative>.isolateLocal(
-      (Pointer<PdJob> job, Pointer<PdJobEvent> event, Pointer<Void> ctx) {
-        events.add(JobEvent.fromNative(event.ref));
-      },
-    );
-    try {
-      _bindings.subscribeJob(
-          _driver._handle, _handle, callback.nativeFunction, nullptr);
-    } finally {
-      callback.close();
+    for (final listener in List<StreamController<JobEvent>>.of(_listeners)) {
+      listener.close();
     }
-    return events;
+    _listeners.clear();
+    _result.complete(result);
   }
 
   JobResult _readResult() => Arena.using((arena) {
@@ -677,12 +757,14 @@ final class PrintJob {
       'the PrinterDriver was disposed before job $id (key $key) reached a terminal '
       'state, so its outcome can no longer be read',
     );
+    _abandoned = error;
     // ignore() after each: a caller that disposed the driver without awaiting its jobs
     // asked for exactly this, and it must not also arrive as an unhandled async error.
-    if (!_history.isCompleted) {
-      _history.completeError(error);
-      _history.future.ignore();
+    for (final listener in List<StreamController<JobEvent>>.of(_listeners)) {
+      listener.addError(error);
+      listener.close();
     }
+    _listeners.clear();
     if (!_result.isCompleted) {
       _result.completeError(error);
       _result.future.ignore();

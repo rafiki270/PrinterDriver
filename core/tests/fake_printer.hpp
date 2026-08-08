@@ -55,6 +55,12 @@ struct Script {
   // Stop answering process-ID markers after this many have been echoed; 0 = never.
   size_t process_id_answer_limit = 0;
 
+  // Emitted once, as an extra well-formed GS ( H frame, the first time this device is
+  // asked for a process-ID echo. This is the multi-writer case of docs/sdk-spec.md §14:
+  // a second instance's receipt finishing on the same socket. Must be four printable
+  // bytes; the driver decides whose it is from the token's instance nonce.
+  std::string foreign_process_id;
+
   // GS I identification. The defaults are Rongta's documented Epson impersonation
   // (docs/capability-profiles.md §5), because that is the case the identification
   // path has to survive.
@@ -273,6 +279,10 @@ class FakePrinter {
             const std::string token(pending_.begin() + static_cast<long>(offset) + 7,
                                     pending_.begin() + static_cast<long>(offset) + 11);
             markers_.push_back(MarkerRecord{token, print_data_.size()});
+            if (!script_.foreign_process_id.empty() && !foreign_emitted_) {
+              foreign_emitted_ = true;
+              emitProcessIdAck(out, script_.foreign_process_id);
+            }
             const bool exhausted =
                 script_.process_id_answer_limit != 0 &&
                 process_ids_answered_ >= script_.process_id_answer_limit;
@@ -388,6 +398,7 @@ class FakePrinter {
   size_t drawer_kicks_ = 0;
   size_t raster_blocks_ = 0;
   size_t process_ids_answered_ = 0;
+  bool foreign_emitted_ = false;
   std::atomic<int> in_flight_{0};
   std::atomic<bool> concurrent_writes_{false};
 };

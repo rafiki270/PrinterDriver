@@ -32,11 +32,16 @@ final class PrintJobTests: XCTestCase {
 
     runAsync(in: self) {
       switch await job.result {
-      case .done(let confidence, let authority):
+      case .done(let confidence, let grade, let authority, let method):
         // A GS ( H printer can prove the cut went through fault-free; the wrapper reports
         // exactly that and no more.
         XCTAssertEqual(confidence, .cutFaultFree)
-        XCTAssertEqual(authority, .gsParenH)
+        // The grade, the authority and the command come from the core, not from the
+        // wrapper reading the printer's capability sheet.
+        XCTAssertEqual(grade, .aJobLevelConfirmation)
+        XCTAssertEqual(grade.letter, "A")
+        XCTAssertEqual(authority, .physicalPrinter)
+        XCTAssertEqual(method, "GS(H) fn48")
       case .failed(let reason, _):
         XCTFail("expected done, got failed(\(reason))")
       case .unknown:
@@ -57,13 +62,16 @@ final class PrintJobTests: XCTestCase {
     let job = try printer.print(receipt, options: JobOptions(key: "gsr1-1"))
 
     runAsync(in: self) {
-      guard case .done(let confidence, let authority) = await job.result else {
+      guard case .done(let confidence, let grade, let authority, let method) = await job.result
+      else {
         return XCTFail("expected done")
       }
       // An ordered GS r 1 after the cut proves ordering, not a clean cutter — so the
-      // ladder stops one rung below the GS ( H printer's.
+      // ladder stops one rung below the GS ( H printer's, and so does the grade.
       XCTAssertEqual(confidence, .cutProcessed)
-      XCTAssertEqual(authority, .gsR1)
+      XCTAssertEqual(grade, .bOrderedDeviceResponse)
+      XCTAssertEqual(authority, .physicalPrinter)
+      XCTAssertEqual(method, "GS r 1")
     }
   }
 
@@ -161,9 +169,95 @@ final class PrintJobTests: XCTestCase {
     XCTAssertTrue(kitchen.scriptedReceivedContains("PRINT ATTEMPT: 2"))
   }
 
+  func testReprintBannerCanBeSuppressedPerCall() throws {
+    let driver = try makeDriver()
+    let counter = try driver.scriptedPrinter(id: "counter", .healthy)
+    let key = "customer-copy-1"
+
+    _ = try counter.print(receipt, options: JobOptions(key: key))
+    counter.drain()
+
+    let quiet = try counter.forceReprint(key: key, options: ReprintOptions(banner: false))
+    counter.drain()
+    XCTAssertEqual(quiet.attempt, 2, "the attempt counter still records the duplicate")
+    XCTAssertFalse(counter.scriptedReceivedContains("REPRINT / POSSIBLE DUPLICATE"))
+
+    // The default is unchanged: banner on unless a caller deliberately asks otherwise.
+    _ = try counter.forceReprint(key: key)
+    counter.drain()
+    XCTAssertTrue(counter.scriptedReceivedContains("REPRINT / POSSIBLE DUPLICATE"))
+    XCTAssertTrue(counter.scriptedReceivedContains("PRINT ATTEMPT: 3"))
+  }
+
+  // MARK: - Verification identifiers
+
+  func testTheReceiptCarriesItsVerificationIDAndResolvesBackToTheJob() throws {
+    let driver = try makeDriver()
+    let kitchen = try driver.scriptedPrinter(id: "kitchen", .healthy)
+    let job = try kitchen.print(receipt, options: JobOptions(key: "rvi-1"))
+    runAsync(in: self) { _ = await job.result }
+
+    guard let printToken = job.printToken, let cutToken = job.cutToken else {
+      return XCTFail("a GS ( H printer must issue verification identifiers")
+    }
+    XCTAssertEqual(printToken.count, 4)
+    XCTAssertNotEqual(printToken, cutToken)
+    XCTAssertTrue(printToken.hasPrefix(driver.instanceNonce))
+    XCTAssertTrue(cutToken.hasPrefix(driver.instanceNonce))
+
+    // Printed next to the order id, and resolvable from that paper back to the job.
+    XCTAssertTrue(kitchen.scriptedReceivedContains("ORDER: rvi-1  V:\(printToken)"))
+    XCTAssertTrue(driver.job(token: printToken) === job)
+    XCTAssertTrue(driver.job(token: cutToken) === job)
+    XCTAssertNil(driver.job(token: "!!!!"))
+  }
+
+  func testSuppressingTheVerificationIDRemovesTheInkAndNotTheEvidence() throws {
+    let driver = try makeDriver()
+    let kitchen = try driver.scriptedPrinter(id: "kitchen", .healthy)
+    let job = try kitchen.print(
+      receipt, options: JobOptions(key: "rvi-quiet", printsVerificationID: false))
+    runAsync(in: self) { _ = await job.result }
+
+    guard let printToken = job.printToken else { return XCTFail("expected a token") }
+    XCTAssertFalse(kitchen.scriptedReceivedContains("V:\(printToken)"))
+    XCTAssertFalse(kitchen.scriptedReceivedContains("ORDER: rvi-quiet"))
+    XCTAssertTrue(driver.job(token: printToken) === job)
+  }
+
+  func testAPrinterWithoutAProcessIDFenceHasNoIdentifierToPrint() throws {
+    let driver = try makeDriver()
+    let printer = try driver.scriptedPrinter(id: "gsr1", .queuedFenceOnly)
+    let job = try printer.print(receipt, options: JobOptions(key: "rvi-none"))
+    runAsync(in: self) { _ = await job.result }
+    // The identifier *is* the wire token, so a printer with no wire token has none.
+    XCTAssertNil(job.printToken)
+    XCTAssertNil(job.cutToken)
+    XCTAssertFalse(printer.scriptedReceivedContains("V:"))
+  }
+
+  func testMarginsWidenTheClearanceButNeverNarrowIt() throws {
+    let driver = try makeDriver()
+    let kitchen = try driver.scriptedPrinter(id: "kitchen", .healthy)
+    let job = try kitchen.print(
+      receipt,
+      options: JobOptions(key: "margins-1", topFeedDots: 40, bottomFeedDots: 8))
+    runAsync(in: self) {
+      let outcome = await job.result.outcome
+      XCTAssertEqual(outcome, .done)
+    }
+
+    // ESC J 40 for the top margin; the profile's 120-dot blade clearance survives a
+    // bottom margin that asked for less than it.
+    XCTAssertTrue(kitchen.scriptedReceivedContains("\u{1B}J\u{28}"))
+    XCTAssertTrue(kitchen.scriptedReceivedContains("\u{1B}J\u{78}"))
+  }
+
   func testAnUnknownKeyIsNotAnError() throws {
     let driver = try makeDriver()
     XCTAssertNil(driver.job(key: "never-submitted"))
+    XCTAssertNil(driver.job(token: "ZZZZ"))
+    XCTAssertEqual(driver.instanceNonce.count, 2)
   }
 
   // MARK: - Closure form

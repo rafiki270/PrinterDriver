@@ -62,6 +62,18 @@ final class PdJobResult extends Struct {
 
   @Int32()
   external int reason;
+
+  /// What class of evidence the claim rests on — `pd_confidence_grade`.
+  @Int32()
+  external int grade;
+
+  /// Who made the claim — `pd_completion_authority`.
+  @Int32()
+  external int authority;
+
+  /// The command behind it, e.g. `GS(H) fn48`. Owned by the `pd_job`, valid until
+  /// `pd_destroy`; never NULL, and `"none"` when nothing was confirmed.
+  external Pointer<Char> method;
 }
 
 /// `pd_device_status` — last known device state, never a live query.
@@ -223,6 +235,27 @@ final class PdJobOptions extends Struct {
   /// 0 means the profile's completion timeout.
   @Uint32()
   external int timeoutMs;
+
+  /// Fed before the first content byte.
+  @Uint32()
+  external int topFeedDots;
+
+  /// The *total* clearance before the cut: the core feeds max(blade clearance, this).
+  @Uint32()
+  external int bottomFeedDots;
+
+  /// Inverted, so an all-zeroes struct still prints the verification identifier.
+  @Int32()
+  external int suppressVerificationId;
+}
+
+/// `pd_reprint_options`
+final class PdReprintOptions extends Struct {
+  external PdJobOptions job;
+
+  /// Inverted, so an all-zeroes struct still prints the reprint banner.
+  @Int32()
+  external int suppressBanner;
 }
 
 // --- Callbacks ----------------------------------------------------------------------
@@ -233,17 +266,15 @@ final class PdJobOptions extends Struct {
 // arrive on whichever thread decoded the status. A callback must not block and must not
 // call back into the same driver.
 //
-// For Dart that has one consequence worth stating in the bindings themselves: the
-// `const pd_job_event*` handed to a job callback points at a temporary that dies when
-// the call returns, so a NativeCallable.listener — which runs the Dart function after
-// the native call has already returned — must never dereference it. See
-// PrintJob in ../printerdriver.dart for how the event data is obtained instead.
-// Device events carry their payload by value and have no such constraint.
+// Both callbacks carry their payload **by value**, which is what makes them usable from
+// a NativeCallable.listener: the listener runs the Dart function after the native call
+// has already returned, so anything reached through a pointer into the emitting
+// worker's frame would be gone by then. A copy has no such lifetime.
 
 /// `pd_job_event_cb`
 typedef PdJobEventCbNative = Void Function(
   Pointer<PdJob> job,
-  Pointer<PdJobEvent> event,
+  PdJobEvent event,
   Pointer<Void> ctx,
 );
 
@@ -287,8 +318,13 @@ typedef _PdPrintNative = Pointer<PdJob> Function(Pointer<PdDriver>,
     Pointer<PdPrinter>, Pointer<PdPayload>, Pointer<PdJobOptions>);
 typedef _PdForceReprintNative = Pointer<PdJob> Function(Pointer<PdDriver>,
     Pointer<PdPrinter>, Pointer<Char>, Pointer<PdJobOptions>);
+typedef _PdForceReprintOptsNative = Pointer<PdJob> Function(Pointer<PdDriver>,
+    Pointer<PdPrinter>, Pointer<Char>, Pointer<PdReprintOptions>);
 typedef _PdFindJobNative = Pointer<PdJob> Function(
     Pointer<PdDriver>, Pointer<Char>);
+typedef _PdJobByTokenNative = Pointer<PdJob> Function(
+    Pointer<PdDriver>, Pointer<Char>);
+typedef _PdInstanceNonceNative = Pointer<Char> Function(Pointer<PdDriver>);
 typedef _PdJobIdNative = Pointer<Char> Function(Pointer<PdJob>);
 typedef _PdJobAttemptNative = Uint32 Function(Pointer<PdJob>);
 typedef _PdJobCurrentStateNative = Int32 Function(Pointer<PdJob>);
@@ -330,14 +366,16 @@ enum PdTestEnum {
   cutVariant(9),
   alignment(10),
   codePage(11),
-  binarization(12);
+  binarization(12),
+  confidenceGrade(13),
+  completionAuthority(14);
 
   const PdTestEnum(this.nativeValue);
 
   final int nativeValue;
 
   /// `PD_TEST_ENUM_TOTAL`: the sentinel, not a member.
-  static const int total = 13;
+  static const int total = 15;
 }
 
 /// Every `pd_*` entry point of pd.h, resolved from one [DynamicLibrary].
@@ -396,10 +434,27 @@ final class PrinterDriverBindings {
             _PdForceReprintNative,
             Pointer<PdJob> Function(Pointer<PdDriver>, Pointer<PdPrinter>,
                 Pointer<Char>, Pointer<PdJobOptions>)>('pd_force_reprint'),
+        forceReprintOpts = library.lookupFunction<
+            _PdForceReprintOptsNative,
+            Pointer<PdJob> Function(
+                Pointer<PdDriver>,
+                Pointer<PdPrinter>,
+                Pointer<Char>,
+                Pointer<PdReprintOptions>)>('pd_force_reprint_opts'),
         findJob = library.lookupFunction<
             _PdFindJobNative,
             Pointer<PdJob> Function(
                 Pointer<PdDriver>, Pointer<Char>)>('pd_find_job'),
+        jobByToken = library.lookupFunction<
+            _PdJobByTokenNative,
+            Pointer<PdJob> Function(
+                Pointer<PdDriver>, Pointer<Char>)>('pd_job_by_token'),
+        instanceNonce = library.lookupFunction<_PdInstanceNonceNative,
+            Pointer<Char> Function(Pointer<PdDriver>)>('pd_instance_nonce'),
+        jobPrintToken = library.lookupFunction<_PdJobIdNative,
+            Pointer<Char> Function(Pointer<PdJob>)>('pd_job_print_token'),
+        jobCutToken = library.lookupFunction<_PdJobIdNative,
+            Pointer<Char> Function(Pointer<PdJob>)>('pd_job_cut_token'),
         jobId = library.lookupFunction<_PdJobIdNative,
             Pointer<Char> Function(Pointer<PdJob>)>('pd_job_id'),
         jobKey = library.lookupFunction<_PdJobIdNative,
@@ -434,6 +489,12 @@ final class PrinterDriverBindings {
             Pointer<Char> Function(int)>('pd_job_outcome_name'),
         payloadKindName = library.lookupFunction<_PdEnumNameNative,
             Pointer<Char> Function(int)>('pd_payload_kind_name'),
+        confidenceGradeName = library.lookupFunction<_PdEnumNameNative,
+            Pointer<Char> Function(int)>('pd_confidence_grade_name'),
+        completionAuthorityName = library.lookupFunction<_PdEnumNameNative,
+            Pointer<Char> Function(int)>('pd_completion_authority_name'),
+        confidenceGradeLetter = library.lookupFunction<_PdEnumNameNative,
+            Pointer<Char> Function(int)>('pd_confidence_grade_letter'),
         completionMechanismName = library.lookupFunction<_PdEnumNameNative,
             Pointer<Char> Function(int)>('pd_completion_mechanism_name'),
         cutVariantName = library.lookupFunction<_PdEnumNameNative,
@@ -473,7 +534,13 @@ final class PrinterDriverBindings {
       Pointer<PdPayload>, Pointer<PdJobOptions>) print;
   final Pointer<PdJob> Function(Pointer<PdDriver>, Pointer<PdPrinter>,
       Pointer<Char>, Pointer<PdJobOptions>) forceReprint;
+  final Pointer<PdJob> Function(Pointer<PdDriver>, Pointer<PdPrinter>,
+      Pointer<Char>, Pointer<PdReprintOptions>) forceReprintOpts;
   final Pointer<PdJob> Function(Pointer<PdDriver>, Pointer<Char>) findJob;
+  final Pointer<PdJob> Function(Pointer<PdDriver>, Pointer<Char>) jobByToken;
+  final Pointer<Char> Function(Pointer<PdDriver>) instanceNonce;
+  final Pointer<Char> Function(Pointer<PdJob>) jobPrintToken;
+  final Pointer<Char> Function(Pointer<PdJob>) jobCutToken;
   final Pointer<Char> Function(Pointer<PdJob>) jobId;
   final Pointer<Char> Function(Pointer<PdJob>) jobKey;
   final int Function(Pointer<PdJob>) jobAttempt;
@@ -492,6 +559,9 @@ final class PrinterDriverBindings {
   final Pointer<Char> Function(int) failureReasonName;
   final Pointer<Char> Function(int) jobOutcomeName;
   final Pointer<Char> Function(int) payloadKindName;
+  final Pointer<Char> Function(int) confidenceGradeName;
+  final Pointer<Char> Function(int) completionAuthorityName;
+  final Pointer<Char> Function(int) confidenceGradeLetter;
   final Pointer<Char> Function(int) completionMechanismName;
   final Pointer<Char> Function(int) cutVariantName;
   final int Function(int) codePageAt;

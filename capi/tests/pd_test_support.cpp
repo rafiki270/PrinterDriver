@@ -119,9 +119,10 @@ extern "C" int pd_test_received_contains(pd_printer* printer, const char* needle
 
 // --- Enum bridge ---------------------------------------------------------------------
 //
-// JobState, ConfidenceLevel, DeviceEvent, FailureReason and JobOutcome are counted from
-// the core's own kAll* arrays (types.hpp): if a member is added there and pd.h is not
-// updated to match, this count moves and pd.h's _COUNT does not. The other eight enums
+// JobState, ConfidenceLevel, DeviceEvent, FailureReason, JobOutcome, ConfidenceGrade
+// and CompletionAuthority are counted from the core's own kAll* arrays (types.hpp): if
+// a member is added there and pd.h is not updated to match, this count moves and pd.h's
+// _COUNT does not. The other eight enums
 // expose no kAll* array to this translation unit — CutSetting and PreflightMode have
 // neither an array nor a to_string; PayloadKind, CompletionMechanism and CutVariant have
 // a to_string but no public array; Alignment, CodePage and Binarization have neither —
@@ -144,6 +145,10 @@ extern "C" int pd_test_cpp_enum_count(pd_test_enum which) {
     case PD_TEST_ENUM_ALIGNMENT: return 3;        // escpos::Alignment: Left, Center, Right
     case PD_TEST_ENUM_CODE_PAGE: return 5;        // escpos::CodePage, non-contiguous values
     case PD_TEST_ENUM_BINARIZATION: return 2;     // escpos::Binarization
+    case PD_TEST_ENUM_CONFIDENCE_GRADE:
+      return static_cast<int>(pd::kAllConfidenceGrades.size());
+    case PD_TEST_ENUM_COMPLETION_AUTHORITY:
+      return static_cast<int>(pd::kAllCompletionAuthorities.size());
     case PD_TEST_ENUM_TOTAL: break;
   }
   return -1;
@@ -211,6 +216,10 @@ extern "C" int pd_test_cpp_enum_value(pd_test_enum which, int index) {
           pd::escpos::Binarization::FixedThreshold, pd::escpos::Binarization::FloydSteinberg};
       return static_cast<int>(kValues[index]);
     }
+    case PD_TEST_ENUM_CONFIDENCE_GRADE:
+      return static_cast<int>(pd::kAllConfidenceGrades[static_cast<size_t>(index)]);
+    case PD_TEST_ENUM_COMPLETION_AUTHORITY:
+      return static_cast<int>(pd::kAllCompletionAuthorities[static_cast<size_t>(index)]);
     case PD_TEST_ENUM_TOTAL: break;
   }
   return -1;
@@ -238,6 +247,10 @@ extern "C" const char* pd_test_cpp_enum_name(pd_test_enum which, int index) {
       return pd::to_string(static_cast<pd::CompletionMechanism>(value));
     case PD_TEST_ENUM_CUT_VARIANT:
       return pd::to_string(static_cast<pd::CutVariant>(value));
+    case PD_TEST_ENUM_CONFIDENCE_GRADE:
+      return pd::to_string(static_cast<pd::ConfidenceGrade>(value));
+    case PD_TEST_ENUM_COMPLETION_AUTHORITY:
+      return pd::to_string(static_cast<pd::CompletionAuthority>(value));
     case PD_TEST_ENUM_CUT:
     case PD_TEST_ENUM_PREFLIGHT:
     case PD_TEST_ENUM_ALIGNMENT:
@@ -264,6 +277,8 @@ extern "C" const char* pd_test_enum_label(pd_test_enum which) {
     case PD_TEST_ENUM_ALIGNMENT: return "Alignment";
     case PD_TEST_ENUM_CODE_PAGE: return "CodePage";
     case PD_TEST_ENUM_BINARIZATION: return "Binarization";
+    case PD_TEST_ENUM_CONFIDENCE_GRADE: return "ConfidenceGrade";
+    case PD_TEST_ENUM_COMPLETION_AUTHORITY: return "CompletionAuthority";
     case PD_TEST_ENUM_TOTAL: break;
   }
   return "UnknownEnum";

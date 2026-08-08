@@ -62,7 +62,28 @@ class EnumMappingTest {
         assertEquals(DeviceEvent.UNRECOVERABLE_ERROR, DeviceEvent.fromRaw(9))
         assertEquals(DeviceEvent.CONNECTION_LOST, DeviceEvent.fromRaw(10))
         assertEquals(DeviceEvent.CONNECTION_RESTORED, DeviceEvent.fromRaw(11))
-        assertEquals(DeviceEvent.UNRECOGNIZED, DeviceEvent.fromRaw(12))
+        assertEquals(DeviceEvent.FOREIGN_WRITER_DETECTED, DeviceEvent.fromRaw(12))
+        assertEquals(DeviceEvent.UNRECOGNIZED, DeviceEvent.fromRaw(13))
+    }
+
+    @Test
+    fun `ConfidenceGrade fromRaw matches pd_confidence_grade`() {
+        assertEquals(ConfidenceGrade.A_JOB_LEVEL_CONFIRMATION, ConfidenceGrade.fromRaw(0))
+        assertEquals(ConfidenceGrade.B_ORDERED_DEVICE_RESPONSE, ConfidenceGrade.fromRaw(1))
+        assertEquals(ConfidenceGrade.C_DEVICE_STATUS_AROUND, ConfidenceGrade.fromRaw(2))
+        assertEquals(ConfidenceGrade.D_SPOOLER_COMPLETED, ConfidenceGrade.fromRaw(3))
+        assertEquals(ConfidenceGrade.E_TRANSPORT_ONLY, ConfidenceGrade.fromRaw(4))
+        assertEquals(ConfidenceGrade.UNRECOGNIZED, ConfidenceGrade.fromRaw(5))
+    }
+
+    @Test
+    fun `CompletionAuthority fromRaw matches pd_completion_authority`() {
+        assertEquals(CompletionAuthority.PHYSICAL_PRINTER, CompletionAuthority.fromRaw(0))
+        assertEquals(CompletionAuthority.VENDOR_SPOOLER, CompletionAuthority.fromRaw(1))
+        assertEquals(CompletionAuthority.PD_AGENT, CompletionAuthority.fromRaw(2))
+        assertEquals(CompletionAuthority.PRINT_SERVER, CompletionAuthority.fromRaw(3))
+        assertEquals(CompletionAuthority.TRANSPORT_ONLY, CompletionAuthority.fromRaw(4))
+        assertEquals(CompletionAuthority.UNRECOGNIZED, CompletionAuthority.fromRaw(5))
     }
 
     @Test

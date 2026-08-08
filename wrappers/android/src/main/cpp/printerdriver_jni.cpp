@@ -174,7 +174,9 @@ JNIEnv* AttachOrGetEnv(JavaVM* jvm, bool* didAttach) {
 // this file allocated in subscribeJob/subscribeDevice/driverCreate. None of them call
 // back into any pd_* function -- see the file header "Threading contract".
 
-void JobEventTrampoline(pd_job* /*job*/, const pd_job_event* event, void* ctx) {
+// The event arrives by value (pd.h), so this trampoline owns its copy: nothing here
+// depends on the emitting worker's frame still existing.
+void JobEventTrampoline(pd_job* /*job*/, pd_job_event event, void* ctx) {
   auto* callbackCtx = static_cast<JobCallbackContext*>(ctx);
   bool didAttach = false;
   JNIEnv* env = AttachOrGetEnv(callbackCtx->jvm, &didAttach);
@@ -188,10 +190,10 @@ void JobEventTrampoline(pd_job* /*job*/, const pd_job_event* event, void* ctx) {
   jmethodID onEvent = env->GetMethodID(callbackClass, "onEvent", "(IIZIJ)V");
   if (onEvent != nullptr) {
     env->CallVoidMethod(callbackCtx->callbackGlobalRef, onEvent,
-                        static_cast<jint>(event->state), static_cast<jint>(event->confidence),
-                        static_cast<jboolean>(event->has_reason != 0 ? JNI_TRUE : JNI_FALSE),
-                        static_cast<jint>(event->reason),
-                        static_cast<jlong>(event->monotonic_ms));
+                        static_cast<jint>(event.state), static_cast<jint>(event.confidence),
+                        static_cast<jboolean>(event.has_reason != 0 ? JNI_TRUE : JNI_FALSE),
+                        static_cast<jint>(event.reason),
+                        static_cast<jlong>(event.monotonic_ms));
     if (env->ExceptionCheck()) {
       env->ExceptionDescribe();
       env->ExceptionClear();
@@ -302,7 +304,9 @@ jintArray PackDeviceStatus(JNIEnv* env, const pd_device_status& status) {
 // pd_force_reprint call that uses them) sidesteps the question entirely rather than
 // relying on an optimization staying in effect.
 void BuildJobOptions(JNIEnv* env, jstring key, jint cut, jboolean openDrawer, jint preflight,
-                     jint timeoutMs, std::string* outKeyStorage, pd_job_options* outOptions) {
+                     jint timeoutMs, jint topFeedDots, jint bottomFeedDots,
+                     jboolean suppressVerificationId, std::string* outKeyStorage,
+                     pd_job_options* outOptions) {
   *outKeyStorage = JStringToStd(env, key);
   *outOptions = pd_job_options{};
   outOptions->key = key != nullptr ? outKeyStorage->c_str() : nullptr;
@@ -310,6 +314,12 @@ void BuildJobOptions(JNIEnv* env, jstring key, jint cut, jboolean openDrawer, ji
   outOptions->open_drawer = openDrawer != JNI_FALSE ? 1 : 0;
   outOptions->preflight = static_cast<pd_preflight>(preflight);
   outOptions->timeout_ms = static_cast<uint32_t>(timeoutMs);
+  // Kotlin's Int is signed and a margin cannot be: a negative dot count is a caller
+  // mistake, and clamping to zero prints the ticket rather than losing it.
+  outOptions->top_feed_dots = topFeedDots > 0 ? static_cast<uint32_t>(topFeedDots) : 0u;
+  outOptions->bottom_feed_dots =
+      bottomFeedDots > 0 ? static_cast<uint32_t>(bottomFeedDots) : 0u;
+  outOptions->suppress_verification_id = suppressVerificationId != JNI_FALSE ? 1 : 0;
 }
 
 } // namespace
@@ -505,7 +515,8 @@ JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_subscribeDev
 JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printRaster(
     JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jbyteArray pixels, jint width,
     jint height, jint strideBytes, jint binarization, jint threshold, jint maxRowsPerBand,
-    jstring key, jint cut, jboolean openDrawer, jint preflight, jint timeoutMs) {
+    jstring key, jint cut, jboolean openDrawer, jint preflight, jint timeoutMs, jint topFeedDots, jint bottomFeedDots,
+    jboolean suppressVerificationId) {
   JniDriverHandle* handle = AsDriverHandle(driverHandle);
   pd_printer* printer = AsPrinter(printerHandle);
   if (handle == nullptr || printer == nullptr) {
@@ -529,7 +540,8 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printRaster
 
   std::string keyStorage;
   pd_job_options options{};
-  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, &keyStorage, &options);
+  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, topFeedDots, bottomFeedDots,
+                  suppressVerificationId, &keyStorage, &options);
   pd_job* job = pd_print(handle->driver, printer, &payload, &options);
 
   if (pixelElems != nullptr) {
@@ -543,7 +555,8 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printRaster
 JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printDocument(
     JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jintArray opKinds,
     jobjectArray opTexts, jintArray opValues, jint codePage, jstring key, jint cut,
-    jboolean openDrawer, jint preflight, jint timeoutMs) {
+    jboolean openDrawer, jint preflight, jint timeoutMs, jint topFeedDots, jint bottomFeedDots,
+    jboolean suppressVerificationId) {
   JniDriverHandle* handle = AsDriverHandle(driverHandle);
   pd_printer* printer = AsPrinter(printerHandle);
   if (handle == nullptr || printer == nullptr) {
@@ -592,7 +605,8 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printDocume
 
   std::string keyStorage;
   pd_job_options options{};
-  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, &keyStorage, &options);
+  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, topFeedDots, bottomFeedDots,
+                  suppressVerificationId, &keyStorage, &options);
   pd_job* job = pd_print(handle->driver, printer, &payload, &options);
 
   if (kindElems != nullptr) {
@@ -607,7 +621,8 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printDocume
 
 JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printRaw(
     JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jbyteArray bytes, jstring key,
-    jint cut, jboolean openDrawer, jint preflight, jint timeoutMs) {
+    jint cut, jboolean openDrawer, jint preflight, jint timeoutMs, jint topFeedDots, jint bottomFeedDots,
+    jboolean suppressVerificationId) {
   JniDriverHandle* handle = AsDriverHandle(driverHandle);
   pd_printer* printer = AsPrinter(printerHandle);
   if (handle == nullptr || printer == nullptr) {
@@ -627,7 +642,8 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printRaw(
 
   std::string keyStorage;
   pd_job_options options{};
-  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, &keyStorage, &options);
+  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, topFeedDots, bottomFeedDots,
+                  suppressVerificationId, &keyStorage, &options);
   pd_job* job = pd_print(handle->driver, printer, &payload, &options);
 
   if (byteElems != nullptr) {
@@ -639,7 +655,8 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printRaw(
 
 JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_forceReprint(
     JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jstring key, jint cut,
-    jboolean openDrawer, jint preflight, jint timeoutMs) {
+    jboolean openDrawer, jint preflight, jint timeoutMs, jint topFeedDots, jint bottomFeedDots,
+    jboolean suppressVerificationId, jboolean suppressBanner) {
   JniDriverHandle* handle = AsDriverHandle(driverHandle);
   pd_printer* printer = AsPrinter(printerHandle);
   if (handle == nullptr || printer == nullptr || key == nullptr) {
@@ -648,12 +665,34 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_forceReprin
 
   std::string keyStorage;
   pd_job_options options{};
-  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, &keyStorage, &options);
-  // pd_force_reprint takes the key both as its own argument and inside options (the
-  // core uses the standalone argument to look the job up, and copies it into the
+  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, topFeedDots, bottomFeedDots,
+                  suppressVerificationId, &keyStorage, &options);
+  pd_reprint_options reprint{};
+  reprint.job = options;
+  reprint.suppress_banner = suppressBanner != JNI_FALSE ? 1 : 0;
+  // pd_force_reprint_opts takes the key both as its own argument and inside options
+  // (the core uses the standalone argument to look the job up, and copies it into the
   // returned job's options); keyStorage is already exactly that string.
-  pd_job* job = pd_force_reprint(handle->driver, printer, keyStorage.c_str(), &options);
+  pd_job* job =
+      pd_force_reprint_opts(handle->driver, printer, keyStorage.c_str(), &reprint);
   return job != nullptr ? reinterpret_cast<jlong>(job) : 0;
+}
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_jobByToken(
+    JNIEnv* env, jclass, jlong driverHandle, jstring token) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr || token == nullptr) {
+    return 0;
+  }
+  const std::string tokenStorage = JStringToStd(env, token);
+  pd_job* job = pd_job_by_token(handle->driver, tokenStorage.c_str());
+  return job != nullptr ? reinterpret_cast<jlong>(job) : 0;
+}
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_instanceNonce(
+    JNIEnv* env, jclass, jlong driverHandle) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  return StdToJString(env, handle != nullptr ? pd_instance_nonce(handle->driver) : "");
 }
 
 JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_findJob(
@@ -677,6 +716,16 @@ JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_jobId(
 JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_jobKey(
     JNIEnv* env, jclass, jlong jobHandle) {
   return StdToJString(env, pd_job_key(AsJob(jobHandle)));
+}
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_jobPrintToken(
+    JNIEnv* env, jclass, jlong jobHandle) {
+  return StdToJString(env, pd_job_print_token(AsJob(jobHandle)));
+}
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_jobCutToken(
+    JNIEnv* env, jclass, jlong jobHandle) {
+  return StdToJString(env, pd_job_cut_token(AsJob(jobHandle)));
 }
 
 JNIEXPORT jint JNICALL Java_com_printerdriver_internal_NativeBridge_jobAttempt(
@@ -737,13 +786,31 @@ JNIEXPORT jintArray JNICALL Java_com_printerdriver_internal_NativeBridge_jobAwai
     return nullptr; // timeout; `result` was left untouched by pd_job_await.
   }
 
-  const jint values[3] = {static_cast<jint>(result.outcome), static_cast<jint>(result.confidence),
-                          static_cast<jint>(result.reason)};
-  jintArray packed = env->NewIntArray(3);
+  const jint values[5] = {static_cast<jint>(result.outcome), static_cast<jint>(result.confidence),
+                          static_cast<jint>(result.reason), static_cast<jint>(result.grade),
+                          static_cast<jint>(result.authority)};
+  jintArray packed = env->NewIntArray(5);
   if (packed != nullptr) {
-    env->SetIntArrayRegion(packed, 0, 3, values);
+    env->SetIntArrayRegion(packed, 0, 5, values);
   }
   return packed;
+}
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_jobMethod(
+    JNIEnv* env, jclass, jlong driverHandle, jlong jobHandle) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_job* job = AsJob(jobHandle);
+  if (handle == nullptr || job == nullptr) {
+    return StdToJString(env, "");
+  }
+  // Only ever called for a job jobAwait has already settled, so this returns at once;
+  // the 1 ms budget is there so a caller who got the sequence wrong waits a moment
+  // rather than forever (0 is pd.h's "wait indefinitely").
+  pd_job_result result{};
+  if (pd_job_await(handle->driver, job, 1, &result) == 0 || result.method == nullptr) {
+    return StdToJString(env, "");
+  }
+  return StdToJString(env, result.method);
 }
 
 } // extern "C"

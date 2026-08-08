@@ -217,6 +217,67 @@ PD_TEST(store_derives_conservative_evidence_for_legacy_journal_lines) {
   CHECK_EQ(weak->method, std::string("none"));
 }
 
+PD_TEST(store_roundtrips_verification_tokens_through_compaction) {
+  pdfake::TempDir dir("store-tokens");
+  const std::string path = dir.path() + "/jobs.journal";
+  {
+    JobStore store(StorageConfig::at(dir.path()));
+    JobRecord created = makeRecord("job-1", "order-A");
+    created.print_token = "aZ!\"";  // the alphabet includes quotes and backslashes
+    created.cut_token = "aZ!#";
+    store.createJob(created);
+    // The other path: a record minted before its tokens existed, told about them later.
+    store.createJob(makeRecord("job-2", "order-B"));
+    store.recordTokens("job-2", "aZ!$", "aZ!%");
+    store.recordState("job-2", JobState::DoneSoftware, ConfidenceLevel::CutFaultFree,
+                      FailureReason::None);
+  }
+
+  // The T record is a first-class journal entry, not a comment.
+  bool saw_token_record = false;
+  for (const JournalEntry& entry : readJournal(path)) {
+    if (entry.kind == JournalEntry::Kind::Tokens && entry.record.id == "job-2") {
+      saw_token_record = true;
+      CHECK_EQ(entry.record.print_token, std::string("aZ!$"));
+      CHECK_EQ(entry.record.cut_token, std::string("aZ!%"));
+    }
+  }
+  CHECK(saw_token_record);
+
+  // Reopening compacts, which folds the T record into the J line; reopening again
+  // proves the folded line reads back the same.
+  for (int pass = 0; pass < 2; ++pass) {
+    JobStore reloaded(StorageConfig::at(dir.path()));
+    CHECK_EQ(reloaded.findByKey("order-A")->print_token, std::string("aZ!\""));
+    CHECK_EQ(reloaded.findByKey("order-A")->cut_token, std::string("aZ!#"));
+    CHECK_EQ(reloaded.findByKey("order-B")->print_token, std::string("aZ!$"));
+    CHECK_EQ(reloaded.findByKey("order-B")->cut_token, std::string("aZ!%"));
+  }
+}
+
+PD_TEST(store_loads_a_version_two_journal_without_tokens) {
+  // Format version 3 added the two trailing J fields (docs/api.md §14). An older
+  // journal is still a journal: its jobs load, they simply have no identifier to
+  // resolve, which is indistinguishable from a job printed without a GS ( H fence.
+  pdfake::TempDir dir("store-v2");
+  const std::string path = dir.path() + "/jobs.journal";
+  { JobStore bootstrap(StorageConfig::at(dir.path())); }
+  {
+    std::ofstream out(path, std::ios::trunc);
+    out << "#PDJOURNAL\t2\n";
+    out << "J\tjob-old\torder-old\tprinter-1\t1000\t1\tRaw\t10\n";
+    out << "S\tjob-old\tDoneSoftware\tCutFaultFree\tNone\t1000\tA_JobLevelConfirmation"
+           "\tPhysicalPrinter\tGS(H) fn48\n";
+  }
+  JobStore store(StorageConfig::at(dir.path()));
+  const auto record = store.findByKey("order-old");
+  CHECK(record.has_value());
+  CHECK_EQ(record->state, JobState::DoneSoftware);
+  CHECK_EQ(record->grade, ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK(record->print_token.empty());
+  CHECK(record->cut_token.empty());
+}
+
 PD_TEST(store_compacts_history_on_load) {
   pdfake::TempDir dir("store-compact");
   const std::string path = dir.path() + "/jobs.journal";

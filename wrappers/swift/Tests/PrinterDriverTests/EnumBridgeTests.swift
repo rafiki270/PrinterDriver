@@ -29,6 +29,8 @@ final class EnumBridgeTests: XCTestCase {
     assertCount(Alignment.self, PD_ALIGN_COUNT.rawValue)
     assertCount(CodePage.self, PD_CODE_PAGE_COUNT.rawValue)
     assertCount(Binarization.self, PD_BINARIZATION_COUNT.rawValue)
+    assertCount(ConfidenceGrade.self, PD_GRADE_COUNT.rawValue)
+    assertCount(CompletionAuthority.self, PD_AUTHORITY_COUNT.rawValue)
   }
 
   func testEveryMirroredEnumMatchesTheCoreMemberForMember() {
@@ -42,6 +44,8 @@ final class EnumBridgeTests: XCTestCase {
     assertMatchesCore(PayloadKind.self, PD_TEST_ENUM_PAYLOAD_KIND)
     assertMatchesCore(CompletionMechanism.self, PD_TEST_ENUM_COMPLETION)
     assertMatchesCore(CutVariant.self, PD_TEST_ENUM_CUT_VARIANT)
+    assertMatchesCore(ConfidenceGrade.self, PD_TEST_ENUM_CONFIDENCE_GRADE)
+    assertMatchesCore(CompletionAuthority.self, PD_TEST_ENUM_COMPLETION_AUTHORITY)
     assertMatchesCore(Alignment.self, PD_TEST_ENUM_ALIGNMENT)
     assertMatchesCore(CodePage.self, PD_TEST_ENUM_CODE_PAGE)
     assertMatchesCore(Binarization.self, PD_TEST_ENUM_BINARIZATION)
@@ -87,6 +91,9 @@ final class EnumBridgeTests: XCTestCase {
     XCTAssertEqual(DeviceEvent.connectionLost.rawValue, PD_DEVICE_CONNECTION_LOST.rawValue)
     XCTAssertEqual(
       DeviceEvent.connectionRestored.rawValue, PD_DEVICE_CONNECTION_RESTORED.rawValue)
+    XCTAssertEqual(
+      DeviceEvent.foreignWriterDetected.rawValue,
+      PD_DEVICE_FOREIGN_WRITER_DETECTED.rawValue)
 
     XCTAssertEqual(FailureReason.none.rawValue, PD_REASON_NONE.rawValue)
     XCTAssertEqual(
@@ -162,6 +169,12 @@ final class EnumBridgeTests: XCTestCase {
     assertSpellings(PayloadKind.allCases.map(\.abiName), PD_TEST_ENUM_PAYLOAD_KIND)
     assertSpellings(CompletionMechanism.allCases.map(\.abiName), PD_TEST_ENUM_COMPLETION)
     assertSpellings(CutVariant.allCases.map(\.abiName), PD_TEST_ENUM_CUT_VARIANT)
+    assertSpellings(
+      ConfidenceGrade.allCases.map(\.abiName), PD_TEST_ENUM_CONFIDENCE_GRADE)
+    assertSpellings(
+      CompletionAuthority.allCases.map(\.abiName), PD_TEST_ENUM_COMPLETION_AUTHORITY)
+    // "A".."E", the letter a report tabulates, straight from the ABI.
+    XCTAssertEqual(ConfidenceGrade.allCases.map(\.letter), ["A", "B", "C", "D", "E"])
   }
 
   // MARK: - The awkward corners
@@ -199,6 +212,8 @@ final class EnumBridgeTests: XCTestCase {
     assertBridgesEveryMember(Alignment.self)
     assertBridgesEveryMember(CodePage.self)
     assertBridgesEveryMember(Binarization.self)
+    assertBridgesEveryMember(ConfidenceGrade.self)
+    assertBridgesEveryMember(CompletionAuthority.self)
   }
 
   func testUnrecognizedFallbacksNeverClaimMoreThanIsKnown() {
@@ -214,6 +229,8 @@ final class EnumBridgeTests: XCTestCase {
     XCTAssertEqual(DeviceEvent.unrecognizedFallback, .recoverableError)
     XCTAssertEqual(Cut.unrecognizedFallback, .profile)
     XCTAssertEqual(Preflight.unrecognizedFallback, .strict)
+    XCTAssertEqual(ConfidenceGrade.unrecognizedFallback, .eTransportOnly)
+    XCTAssertEqual(CompletionAuthority.unrecognizedFallback, .transportOnly)
   }
 
   // MARK: - Helpers

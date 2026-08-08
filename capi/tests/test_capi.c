@@ -84,10 +84,141 @@ static void test_submit_reaches_terminal_done(void) {
   CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
   CHECK_EQ(result.confidence, PD_CONFIDENCE_CUT_FAULT_FREE);
   CHECK_EQ(result.reason, PD_REASON_NONE);
+  /* Never a bare {success:true}: the claim says what class of evidence it rests on,
+   * who made it and which command produced it. */
+  CHECK_EQ(result.grade, PD_GRADE_A_JOB_LEVEL_CONFIRMATION);
+  CHECK_EQ(result.authority, PD_AUTHORITY_PHYSICAL_PRINTER);
+  CHECK_STREQ(result.method, "GS(H) fn48");
+  CHECK_STREQ(pd_confidence_grade_letter(result.grade), "A");
   CHECK_EQ(pd_job_is_terminal(job), 1);
   CHECK_EQ(pd_job_current_state(job), PD_JOB_STATE_DONE_SOFTWARE);
   CHECK(pd_test_received_contains(printer, text));
   CHECK_EQ(pd_test_cuts(printer), 1);
+
+  pd_destroy(driver);
+}
+
+/* --- a2. Verification identifiers: printed, resolvable, suppressible --------------- */
+
+static void test_verification_identifier_round_trip(void) {
+  pd_driver* driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+
+  pd_printer* printer = pd_add_printer_scripted(driver, "capi-rvi", "ok");
+  CHECK(printer != NULL);
+
+  const char text[] = "VERIFY ME";
+  pd_payload payload;
+  memset(&payload, 0, sizeof(payload));
+  payload.kind = PD_PAYLOAD_RAW;
+  payload.as.raw.bytes = (const uint8_t*)text;
+  payload.as.raw.size = sizeof(text) - 1;
+
+  pd_job_options options;
+  memset(&options, 0, sizeof(options));
+  options.key = "capi-rvi-1";
+
+  pd_job* job = pd_print(driver, printer, &payload, &options);
+  CHECK(job != NULL);
+
+  pd_job_result result;
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_job_await(driver, job, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+
+  const char* print_token = pd_job_print_token(job);
+  const char* cut_token = pd_job_cut_token(job);
+  CHECK_EQ(strlen(print_token), 4u);
+  CHECK_EQ(strlen(cut_token), 4u);
+  /* [2-char instance nonce][2-char sequence]: both tokens name this driver. */
+  CHECK_EQ(strlen(pd_instance_nonce(driver)), 2u);
+  CHECK_EQ(strncmp(print_token, pd_instance_nonce(driver), 2), 0);
+  CHECK_EQ(strncmp(cut_token, pd_instance_nonce(driver), 2), 0);
+  CHECK(strcmp(print_token, cut_token) != 0);
+
+  /* Printed next to the order id, and resolvable from that paper back to the job. */
+  char printed[32];
+  snprintf(printed, sizeof(printed), "V:%s", print_token);
+  CHECK(pd_test_received_contains(printer, printed));
+  CHECK(pd_test_received_contains(printer, "ORDER: capi-rvi-1"));
+  CHECK(pd_job_by_token(driver, print_token) == job);
+  CHECK(pd_job_by_token(driver, cut_token) == job);
+  CHECK(pd_job_by_token(driver, "!!!!") == NULL);
+
+  /* Suppressed per job: the token is still minted and still resolves, but no ink. */
+  pd_job_options quiet;
+  memset(&quiet, 0, sizeof(quiet));
+  quiet.key = "capi-rvi-2";
+  quiet.suppress_verification_id = 1;
+  pd_job* silent = pd_print(driver, printer, &payload, &quiet);
+  CHECK(silent != NULL);
+  CHECK_EQ(pd_job_await(driver, silent, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+  char quiet_printed[32];
+  snprintf(quiet_printed, sizeof(quiet_printed), "V:%s", pd_job_print_token(silent));
+  CHECK(!pd_test_received_contains(printer, quiet_printed));
+  CHECK(pd_job_by_token(driver, pd_job_print_token(silent)) == silent);
+
+  pd_destroy(driver);
+}
+
+/* --- a3. Reprint banner toggle and margins ----------------------------------------- */
+
+static void test_reprint_banner_toggle_and_margins(void) {
+  pd_driver* driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+
+  pd_printer* printer = pd_add_printer_scripted(driver, "capi-reprint", "ok");
+  CHECK(printer != NULL);
+
+  const char text[] = "BANNERLESS COPY";
+  pd_payload payload;
+  memset(&payload, 0, sizeof(payload));
+  payload.kind = PD_PAYLOAD_RAW;
+  payload.as.raw.bytes = (const uint8_t*)text;
+  payload.as.raw.size = sizeof(text) - 1;
+
+  pd_job_options options;
+  memset(&options, 0, sizeof(options));
+  options.key = "capi-reprint-1";
+  /* ESC J 40 before the content; the bottom figure is below the profile's blade
+   * clearance, so the engine keeps its own floor. */
+  options.top_feed_dots = 40;
+  options.bottom_feed_dots = 10;
+
+  pd_job* first = pd_print(driver, printer, &payload, &options);
+  CHECK(first != NULL);
+  pd_job_result result;
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_job_await(driver, first, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+  CHECK(pd_test_received_contains(printer, "\x1B\x4A\x28"));  /* ESC J 40 */
+  CHECK(pd_test_received_contains(printer, "\x1B\x4A\x78"));  /* ESC J 120, the floor */
+
+  pd_reprint_options reprint;
+  memset(&reprint, 0, sizeof(reprint));
+  reprint.job = options;
+  reprint.suppress_banner = 1;
+  pd_job* copy = pd_force_reprint_opts(driver, printer, "capi-reprint-1", &reprint);
+  CHECK(copy != NULL);
+  CHECK(copy != first);
+  CHECK_EQ(pd_job_await(driver, copy, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+  CHECK_EQ(pd_job_attempt(copy), 2u);
+  CHECK(!pd_test_received_contains(printer, "*** REPRINT / POSSIBLE DUPLICATE ***"));
+
+  /* The default is still a banner: pd_force_reprint is the all-zeroes call. */
+  pd_job* loud = pd_force_reprint(driver, printer, "capi-reprint-1", &options);
+  CHECK(loud != NULL);
+  CHECK_EQ(pd_job_await(driver, loud, 5000, &result), 1);
+  CHECK(pd_test_received_contains(printer, "*** REPRINT / POSSIBLE DUPLICATE ***"));
+  CHECK(pd_test_received_contains(printer, "PRINT ATTEMPT: 3"));
 
   pd_destroy(driver);
 }
@@ -152,11 +283,12 @@ typedef struct {
   size_t count;
 } StateLog;
 
-static void recordState(pd_job* job, const pd_job_event* event, void* ctx) {
+/* By value, which is what lets a consumer keep the event past the call (pd.h). */
+static void recordState(pd_job* job, pd_job_event event, void* ctx) {
   (void)job;
   StateLog* log = (StateLog*)ctx;
   if (log->count < sizeof(log->states) / sizeof(log->states[0])) {
-    log->states[log->count] = event->state;
+    log->states[log->count] = event.state;
   }
   log->count++;
 }
@@ -235,6 +367,8 @@ static void test_enum_bridge_matches_pd_h(void) {
       {PD_TEST_ENUM_ALIGNMENT, PD_ALIGN_COUNT},
       {PD_TEST_ENUM_CODE_PAGE, PD_CODE_PAGE_COUNT},
       {PD_TEST_ENUM_BINARIZATION, PD_BINARIZATION_COUNT},
+      {PD_TEST_ENUM_CONFIDENCE_GRADE, PD_GRADE_COUNT},
+      {PD_TEST_ENUM_COMPLETION_AUTHORITY, PD_AUTHORITY_COUNT},
   };
   const size_t table_size = sizeof(table) / sizeof(table[0]);
 
@@ -268,7 +402,7 @@ static void test_enum_bridge_matches_pd_h(void) {
     }
   }
 
-  /* The eight enums with a spelling on both sides: compare name for name. */
+  /* The ten enums with a spelling on both sides: compare name for name. */
   for (int i = 0; i < PD_JOB_STATE_COUNT; ++i) {
     CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_JOB_STATE, i),
                 pd_job_state_name((pd_job_state)i));
@@ -301,6 +435,14 @@ static void test_enum_bridge_matches_pd_h(void) {
     CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_CUT_VARIANT, i),
                 pd_cut_variant_name((pd_cut_variant)i));
   }
+  for (int i = 0; i < PD_GRADE_COUNT; ++i) {
+    CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_CONFIDENCE_GRADE, i),
+                pd_confidence_grade_name((pd_confidence_grade)i));
+  }
+  for (int i = 0; i < PD_AUTHORITY_COUNT; ++i) {
+    CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_COMPLETION_AUTHORITY, i),
+                pd_completion_authority_name((pd_completion_authority)i));
+  }
 
   /* The remaining five have no C++ to_string, so the bridge must say so plainly rather
    * than inventing a spelling. */
@@ -314,6 +456,8 @@ static void test_enum_bridge_matches_pd_h(void) {
 
 int main(void) {
   test_submit_reaches_terminal_done();
+  test_verification_identifier_round_trip();
+  test_reprint_banner_toggle_and_margins();
   test_same_key_dedupe_returns_same_job();
   test_event_callback_receives_ordered_progression();
   test_enum_bridge_matches_pd_h();

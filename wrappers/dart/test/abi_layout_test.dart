@@ -17,7 +17,9 @@ void main() {
   group('ABI layout', () {
     test('every mirrored struct is the size pd.h compiles to', () {
       expect(sizeOf<PdJobEvent>(), 24);
-      expect(sizeOf<PdJobResult>(), 12);
+      // outcome, confidence, reason, grade, authority (5 x int32), then the method
+      // pointer on its own 8-byte boundary.
+      expect(sizeOf<PdJobResult>(), 32);
       expect(sizeOf<PdDeviceStatus>(), 36);
       expect(sizeOf<PdRasterRgba8>(), 32);
       expect(sizeOf<PdOp>(), 24);
@@ -26,7 +28,8 @@ void main() {
       expect(sizeOf<PdPayload>(), 40);
       expect(sizeOf<PdConfig>(), 32);
       expect(sizeOf<PdTcpConfig>(), 40);
-      expect(sizeOf<PdJobOptions>(), 24);
+      expect(sizeOf<PdJobOptions>(), 40);
+      expect(sizeOf<PdReprintOptions>(), 48);
     });
 
     test('the payload union is one storage area shared by the three tiers', () {

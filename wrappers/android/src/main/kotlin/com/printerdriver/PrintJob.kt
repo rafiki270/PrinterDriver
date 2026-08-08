@@ -28,6 +28,15 @@ class PrintJob internal constructor(
     val id: String get() { driver.checkOpen(); return NativeBridge.jobId(handle) }
     val key: String get() { driver.checkOpen(); return NativeBridge.jobKey(handle) }
 
+    /** The receipt verification identifier this attempt printed under -- the four
+     *  characters the ticket carries as `V:` (docs/api.md §14). `null` until the job
+     *  reaches a worker, and `null` for good on a printer whose fence is not GS(H):
+     *  the identifier *is* the wire token. Resolve one with [PrinterDriver.jobByToken]. */
+    val printToken: String? get() = NativeBridge.jobPrintToken(handle).ifEmpty { null }
+
+    /** The identifier the job's cut fence carried. Same rules as [printToken]. */
+    val cutToken: String? get() = NativeBridge.jobCutToken(handle).ifEmpty { null }
+
     /** 1 on first submission; incremented by each [Printer.forceReprint]. */
     val attempt: Int get() { driver.checkOpen(); return NativeBridge.jobAttempt(handle) }
 
@@ -85,7 +94,12 @@ class PrintJob internal constructor(
             driver.checkOpen()
             val raw = NativeBridge.jobAwait(driver.handle, handle, RESULT_POLL_INTERVAL_MS)
             if (raw != null) {
-                return@withContext JobResult.fromRaw(raw[0], raw[1], raw[2])
+                // The method string is fetched only once the result exists, so the
+                // extra call is on the settled path and never on the polling one.
+                return@withContext JobResult.fromRaw(
+                    raw[0], raw[1], raw[2], raw[3], raw[4],
+                    NativeBridge.jobMethod(driver.handle, handle)
+                )
             }
         }
         throw CancellationException("PrintJob.result() was cancelled")

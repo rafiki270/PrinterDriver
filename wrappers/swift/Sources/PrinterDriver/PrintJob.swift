@@ -33,18 +33,39 @@ public final class PrintJob: @unchecked Sendable {
 
   /// Which ordered fence was available to prove this job finished. See
   /// ``Printer/completionMechanism``.
-  public let completionAuthority: CompletionAuthority
+  ///
+  /// This is the printer's capability, not a claim about this job. What the job itself
+  /// actually earned is in ``JobResult/done(confidence:grade:authority:method:)``.
+  public let completionMechanism: CompletionMechanism
 
-  init(core: DriverCore, handle: OpaquePointer, authority: CompletionAuthority) {
+  init(core: DriverCore, handle: OpaquePointer, mechanism: CompletionMechanism) {
     self.core = core
     self.handle = handle
-    completionAuthority = authority
+    completionMechanism = mechanism
     id = String(cString: pd_job_id(handle))
     key = String(cString: pd_job_key(handle))
     hub = JobEventHub(delivery: core.delivery)
     trampoline = JobEventTrampoline(hub: hub, delivery: core.delivery)
-    awaiter = JobResultAwaiter(core: core, handle: handle, authority: authority)
+    awaiter = JobResultAwaiter(core: core, handle: handle)
     core.retain(trampoline: trampoline)
+  }
+
+  /// The receipt verification identifier this attempt printed under — the four
+  /// characters the ticket carries as `V:` (docs/api.md §14).
+  ///
+  /// `nil` until the job reaches a worker, and `nil` for good on a printer whose fence
+  /// is not `GS ( H`: the identifier *is* the wire token, so a printer that has no wire
+  /// token has none to print. Look one up with ``PrinterDriver/job(token:)``.
+  public var printToken: String? {
+    let value = String(cString: pd_job_print_token(handle))
+    return value.isEmpty ? nil : value
+  }
+
+  /// The identifier the job's cut fence carried. Same lifetime rules as
+  /// ``printToken``; it resolves through ``PrinterDriver/job(token:)`` too.
+  public var cutToken: String? {
+    let value = String(cString: pd_job_cut_token(handle))
+    return value.isEmpty ? nil : value
   }
 
   // MARK: - Current state

@@ -91,7 +91,8 @@ class Printer internal constructor(
                 driver.handle, handle,
                 payload.pixels, payload.width, payload.height, payload.strideBytes,
                 payload.binarization.raw, payload.threshold, payload.maxRowsPerBand,
-                options.key, options.cut.raw, options.openDrawer, options.preflight.raw, options.timeoutMs
+                options.key, options.cut.raw, options.openDrawer, options.preflight.raw, options.timeoutMs,
+                options.topFeedDots, options.bottomFeedDots, !options.printVerificationId
             )
 
             is Payload.Document -> {
@@ -125,13 +126,15 @@ class Printer internal constructor(
                 }
                 NativeBridge.printDocument(
                     driver.handle, handle, kinds, texts, values, payload.codePage.raw,
-                    options.key, options.cut.raw, options.openDrawer, options.preflight.raw, options.timeoutMs
+                    options.key, options.cut.raw, options.openDrawer, options.preflight.raw, options.timeoutMs,
+                options.topFeedDots, options.bottomFeedDots, !options.printVerificationId
                 )
             }
 
             is Payload.Raw -> NativeBridge.printRaw(
                 driver.handle, handle, payload.bytes,
-                options.key, options.cut.raw, options.openDrawer, options.preflight.raw, options.timeoutMs
+                options.key, options.cut.raw, options.openDrawer, options.preflight.raw, options.timeoutMs,
+                options.topFeedDots, options.bottomFeedDots, !options.printVerificationId
             )
         }
         if (jobHandle == 0L) {
@@ -149,14 +152,22 @@ class Printer internal constructor(
      * programmer errors, which is why this returns `null` rather than throwing (unlike
      * [print]). Check [PrinterDriver.lastError] to tell the two apart if needed.
      */
-    suspend fun forceReprint(key: String, options: JobOptions = JobOptions()): PrintJob? = withContext(Dispatchers.IO) {
-        driver.checkOpen()
-        val jobHandle = NativeBridge.forceReprint(
-            driver.handle, handle, key,
-            options.cut.raw, options.openDrawer, options.preflight.raw, options.timeoutMs
-        )
-        if (jobHandle == 0L) null else PrintJob(driver, jobHandle)
-    }
+    suspend fun forceReprint(key: String, options: ReprintOptions = ReprintOptions()): PrintJob? =
+        withContext(Dispatchers.IO) {
+            driver.checkOpen()
+            val job = options.job
+            val jobHandle = NativeBridge.forceReprint(
+                driver.handle, handle, key,
+                job.cut.raw, job.openDrawer, job.preflight.raw, job.timeoutMs,
+                job.topFeedDots, job.bottomFeedDots, !job.printVerificationId,
+                !options.banner
+            )
+            if (jobHandle == 0L) null else PrintJob(driver, jobHandle)
+        }
+
+    /** [forceReprint] with the plain submission options, banner on. */
+    suspend fun forceReprint(key: String, options: JobOptions): PrintJob? =
+        forceReprint(key, ReprintOptions(job = options))
 
     /**
      * Closure-ergonomics sugar (docs/api.md §12): a trailing lambda for the terminal

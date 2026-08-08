@@ -76,13 +76,13 @@ final class DriverCore: @unchecked Sendable {
   }
 
   /// Returns the `PrintJob` already wrapping `pointer`, or wraps it now.
-  func internJob(_ pointer: OpaquePointer, authority: CompletionAuthority) -> PrintJob {
+  func internJob(_ pointer: OpaquePointer, mechanism: CompletionMechanism) -> PrintJob {
     jobLock.lock()
     defer { jobLock.unlock() }
     if let existing = jobs[pointer]?.job {
       return existing
     }
-    let job = PrintJob(core: self, handle: pointer, authority: authority)
+    let job = PrintJob(core: self, handle: pointer, mechanism: mechanism)
     jobs[pointer] = WeakJob(job: job)
     return job
   }
@@ -176,9 +176,11 @@ final class JobEventTrampoline: @unchecked Sendable {
   }
 }
 
+// The event arrives by value, so this thunk owns a copy for as long as it needs one —
+// no lifetime relationship with the worker frame that emitted it.
 let jobEventThunk: pd_job_event_cb = { _, event, context in
-  guard let context, let event else { return }
-  Unmanaged<JobEventTrampoline>.fromOpaque(context).takeUnretainedValue().deliver(event.pointee)
+  guard let context else { return }
+  Unmanaged<JobEventTrampoline>.fromOpaque(context).takeUnretainedValue().deliver(event)
 }
 
 /// Carries device events from whichever thread decoded a status frame onto the delivery
@@ -315,16 +317,14 @@ final class JobEventHub: @unchecked Sendable {
 final class JobResultAwaiter: @unchecked Sendable {
   private let core: DriverCore
   private let handle: OpaquePointer
-  private let authority: CompletionAuthority
   private let lock = NSLock()
   private var settled: JobResult?
   private var waiters: [(JobResult) -> Void] = []
   private var isRunning = false
 
-  init(core: DriverCore, handle: OpaquePointer, authority: CompletionAuthority) {
+  init(core: DriverCore, handle: OpaquePointer) {
     self.core = core
     self.handle = handle
-    self.authority = authority
   }
 
   /// Registers `handler`, to be called exactly once on the delivery queue.
@@ -348,7 +348,9 @@ final class JobResultAwaiter: @unchecked Sendable {
       // timeout 0 waits indefinitely, and the core guarantees every job reaches a
       // terminal state — pd_destroy itself waits for that before returning.
       _ = pd_job_await(core.handle, handle, 0, &raw)
-      let result = JobResult(raw, authority: authority)
+      // Read before leaving this frame: `method` points into storage owned by the job
+      // handle, and JobResult copies it into a Swift String here.
+      let result = JobResult(raw)
       core.delivery.async { [self] in
         lock.lock()
         settled = result

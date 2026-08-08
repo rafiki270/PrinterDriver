@@ -90,6 +90,37 @@ struct JobOptions {
   bool open_drawer = false;
   PreflightMode preflight = PreflightMode::Strict;
   uint32_t timeout_ms = 0;  // 0 → the profile's completion timeout
+
+  // Whitespace around the print (docs/receipt-dsl.md "Margins"). Top feed is emitted
+  // before the first content byte; the bottom figure is the *total* clearance the
+  // engine leaves between the last content and the cut, and it can only ever add to
+  // the profile's blade-clearance floor: the engine feeds
+  // max(profile.media.head_to_cutter_feed_dots, bottom_feed_dots), so no margin
+  // setting can reintroduce a clipped trailing QR.
+  uint16_t top_feed_dots = 0;
+  uint16_t bottom_feed_dots = 0;
+
+  // Print the receipt verification identifier in the ticket trailer — the ORDER line
+  // and the trailer QR (docs/api.md §14). On by default: the printed token is what
+  // turns a piece of paper into evidence of a specific journaled job. Turning it off
+  // suppresses both the line and the QR; the token is still journaled and still
+  // resolvable through PrinterDriver::jobByToken.
+  bool print_verification_id = true;
+};
+
+// forceReprint's own options (docs/api.md §3). Converts implicitly from JobOptions so
+// that every existing call site keeps the banner it already had.
+struct ReprintOptions {
+  JobOptions job;
+
+  // *** REPRINT / POSSIBLE DUPLICATE *** and the attempt counter. Enabled by default;
+  // disabling it is a per-call, deliberate act for a receipt where the banner is
+  // inappropriate (a customer-facing copy). A kitchen ticket should never disable it —
+  // the banner is what lets staff bin the duplicate instead of cooking it twice.
+  bool banner = true;
+
+  ReprintOptions() = default;
+  ReprintOptions(JobOptions options) : job(std::move(options)) {}  // NOLINT: implicit
 };
 
 struct DeviceStatus {
@@ -120,6 +151,14 @@ class PrintJob {
   const std::string& key() const noexcept { return key_; }
   const std::string& printerId() const noexcept { return printer_id_; }
   uint32_t attempt() const noexcept { return attempt_; }
+
+  // The receipt verification identifiers (docs/api.md §14): the GS ( H tokens this
+  // attempt printed and cut under. Empty until the job has been handed to a worker,
+  // and empty for good on a profile whose fence is not GS ( H — the RVI is the wire
+  // token, so a printer that has no wire token has no RVI to print. The print token is
+  // the one the ticket carries as `V:`.
+  std::string printToken() const;
+  std::string cutToken() const;
 
   JobState state() const noexcept { return state_.load(); }
   ConfidenceLevel confidence() const noexcept { return confidence_.load(); }
@@ -162,11 +201,14 @@ class PrintJob {
   void emit(JobState state, ConfidenceLevel confidence,
             std::optional<FailureReason> reason);
   void finish(const JobResult& outcome);
+  void setTokens(const std::string& print_token, const std::string& cut_token);
 
   std::string id_;
   std::string key_;
   std::string printer_id_;
   uint32_t attempt_ = 1;
+  std::string print_token_;
+  std::string cut_token_;
 
   std::atomic<JobState> state_{JobState::Queued};
   std::atomic<ConfidenceLevel> confidence_{ConfidenceLevel::TransportAccepted};
@@ -225,13 +267,14 @@ class Printer {
   std::shared_ptr<PrintJob> print(Payload payload, const JobOptions& options = {});
 
   // Deliberate duplicate. Prepends *** REPRINT / POSSIBLE DUPLICATE *** and the
-  // attempt counter (docs/sdk-spec.md §6). The no-payload overload reuses the
-  // original submission's payload and returns nullptr when the original job was
-  // loaded from the journal, whose records carry state but not bytes.
+  // attempt counter (docs/sdk-spec.md §6) unless ReprintOptions::banner says
+  // otherwise. The no-payload overload reuses the original submission's payload and
+  // returns nullptr when the original job was loaded from the journal, whose records
+  // carry state but not bytes.
   std::shared_ptr<PrintJob> forceReprint(const std::string& key,
-                                         const JobOptions& options = {});
+                                         const ReprintOptions& options = {});
   std::shared_ptr<PrintJob> forceReprint(const std::string& key, Payload payload,
-                                         const JobOptions& options = {});
+                                         const ReprintOptions& options = {});
 
   // Last known state; never a live query, so it cannot block behind a print.
   DeviceStatus status() const;
@@ -288,10 +331,18 @@ class PrinterDriver {
   // Any job this driver knows about, including ones reconstructed from the journal
   // after a restart (docs/api.md §4).
   std::shared_ptr<PrintJob> findJob(const std::string& key) const;
+
+  // Paper → job (docs/api.md §14). Resolves either of a job's verification
+  // identifiers, print or cut, most-recent-first: a sequence wraps after 4 418 jobs
+  // per instance nonce and the newest holder of a token is the one an operator holding
+  // a receipt is asking about. Includes jobs reconstructed from the journal, so a
+  // receipt printed before the last restart still resolves.
+  std::shared_ptr<PrintJob> jobByToken(const std::string& token) const;
+
   std::shared_ptr<PrintJob> forceReprint(const std::string& key,
-                                         const JobOptions& options = {});
+                                         const ReprintOptions& options = {});
   std::shared_ptr<PrintJob> forceReprint(const std::string& key, Payload payload,
-                                         const JobOptions& options = {});
+                                         const ReprintOptions& options = {});
 
   void subscribeDevices(DriverDeviceEventCallback callback);
 
@@ -302,6 +353,12 @@ class PrinterDriver {
   // driver so a device that moves address keeps what was learned about it.
   FindingsStore& capabilities() noexcept { return *capabilities_; }
   const FindingsStore& capabilities() const noexcept { return *capabilities_; }
+
+  // The two-character random prefix every verification identifier this driver issues
+  // carries (docs/api.md §14). Persisted in the storage directory at first start, so
+  // the tokens on yesterday's paper still name this instance; regenerated per process
+  // for an in-memory driver, which has nowhere to keep it.
+  const std::string& instanceNonce() const noexcept;
 
   void shutdown();
 
@@ -322,5 +379,9 @@ class PrinterDriver {
 // and wrappers assert on the same literal the wire carries.
 extern const char kReprintBannerLine[];
 extern const char kReprintAttemptPrefix[];
+// The ticket trailer: `ORDER: <key>  V:<print-token>`, plus the same string as the
+// trailer QR payload (docs/api.md §14).
+extern const char kOrderPrefix[];
+extern const char kVerificationPrefix[];
 
 }  // namespace pd

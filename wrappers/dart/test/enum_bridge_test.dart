@@ -77,6 +77,10 @@ void main() {
           CodePage.values.where((v) => v != CodePage.unrecognized);
       final binarizations =
           Binarization.values.where((v) => v != Binarization.unrecognized);
+      final grades =
+          ConfidenceGrade.values.where((v) => v != ConfidenceGrade.unrecognized);
+      final authorities = CompletionAuthority.values
+          .where((v) => v != CompletionAuthority.unrecognized);
 
       mirrors = <_Mirror>[
         _Mirror(PdTestEnum.jobState, JobState.nativeCount,
@@ -116,6 +120,20 @@ void main() {
             codePages.map((v) => v.nativeValue).toList()),
         _Mirror(PdTestEnum.binarization, Binarization.nativeCount,
             binarizations.map((v) => v.nativeValue).toList()),
+        // The core spells these A_JobLevelConfirmation..E_TransportOnly, which the
+        // Dart member names carry as aJobLevelConfirmation..eTransportOnly.
+        _Mirror(PdTestEnum.confidenceGrade, ConfidenceGrade.nativeCount,
+            grades.map((v) => v.nativeValue).toList(),
+            expectedNames: const <String>[
+              'A_JobLevelConfirmation',
+              'B_OrderedDeviceResponse',
+              'C_DeviceStatusAround',
+              'D_SpoolerCompleted',
+              'E_TransportOnly',
+            ]),
+        _Mirror(PdTestEnum.completionAuthority, CompletionAuthority.nativeCount,
+            authorities.map((v) => v.nativeValue).toList(),
+            expectedNames: _coreSpelling(authorities.map((v) => v.name))),
       ];
 
       namers = <PdTestEnum, Pointer<Char> Function(int)>{
@@ -127,6 +145,8 @@ void main() {
         PdTestEnum.payloadKind: bindings.payloadKindName,
         PdTestEnum.completion: bindings.completionMechanismName,
         PdTestEnum.cutVariant: bindings.cutVariantName,
+        PdTestEnum.confidenceGrade: bindings.confidenceGradeName,
+        PdTestEnum.completionAuthority: bindings.completionAuthorityName,
       };
     });
 
@@ -230,6 +250,11 @@ void main() {
         CompletionMechanism.fromNative(CompletionMechanism.nativeCount),
         CompletionMechanism.unrecognized,
       );
+      expect(ConfidenceGrade.fromNative(ConfidenceGrade.nativeCount),
+          ConfidenceGrade.unrecognized);
+      expect(ConfidenceGrade.unrecognized.letter, '?');
+      expect(CompletionAuthority.fromNative(-1),
+          CompletionAuthority.unrecognized);
 
       // And it cannot be handed back to the ABI as if it were a real member.
       final arena = Arena();

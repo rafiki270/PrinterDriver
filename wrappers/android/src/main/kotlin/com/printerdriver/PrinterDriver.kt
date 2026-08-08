@@ -65,6 +65,31 @@ class PrinterDriver private constructor(internal val handle: Long) : AutoCloseab
     /** Looks up any job this driver knows about, including ones reloaded from the
      *  journal after a restart (docs/api.md §2). `null` when [key] is unknown -- a
      *  routine, expected outcome, not an error. */
+    /**
+     * Paper to job (docs/api.md §14): resolves the four-character `V:` code printed on
+     * a receipt.
+     *
+     * Accepts either of a job's identifiers, the print fence's or the cut fence's, and
+     * answers most-recent-first -- the sequence wraps, and the receipt somebody is
+     * holding is far more likely to be the recent one. Includes jobs reconstructed from
+     * the journal, so a receipt printed before the last restart still resolves. `null`
+     * when no job on this driver ever carried that token.
+     */
+    fun jobByToken(token: String): PrintJob? {
+        checkOpen()
+        val jobHandle = NativeBridge.jobByToken(handle, token)
+        return if (jobHandle == 0L) null else PrintJob(this, jobHandle)
+    }
+
+    /**
+     * The two characters every identifier this driver issues starts with: which driver
+     * instance owns an echo, and therefore which instance printed a given receipt.
+     * Persisted in the storage directory, so it survives a restart. A token that does
+     * not start with this came from somewhere else -- the case
+     * [DeviceEvent.FOREIGN_WRITER_DETECTED] reports.
+     */
+    val instanceNonce: String get() = NativeBridge.instanceNonce(handle)
+
     fun findJob(key: String): PrintJob? {
         checkOpen()
         val jobHandle = NativeBridge.findJob(handle, key)

@@ -137,6 +137,14 @@ enum DeviceEvent {
   connectionLost(10),
   connectionRestored(11),
 
+  /// A `GS ( H` echo arrived carrying a token this driver never issued: something else
+  /// is writing to the same printer (docs/api.md §14, docs/sdk-spec.md §14).
+  ///
+  /// The echo is attributed to no job and satisfies no fence. One printer has exactly
+  /// one connection owner; this is what a violation of that looks like from the inside,
+  /// and it is reported rather than silently misrouted.
+  foreignWriterDetected(12),
+
   /// A `pd_device_event` this build does not know.
   unrecognized(-1);
 
@@ -145,7 +153,7 @@ enum DeviceEvent {
   final int nativeValue;
 
   /// Mirrors `PD_DEVICE_EVENT_COUNT`.
-  static const int nativeCount = 12;
+  static const int nativeCount = 13;
 
   static DeviceEvent fromNative(int value) {
     for (final member in values) {
@@ -425,9 +433,8 @@ enum Binarization {
 /// Orthogonal to [ConfidenceLevel]: the level says how far up the ladder a job climbed,
 /// the grade says what kind of evidence the claim is made of.
 ///
-/// Not carried by `pd_job_result` in the C ABI at this revision, so [JobDone.grade] is
-/// currently always null; the enum exists so the shape does not change when the ABI
-/// grows the field.
+/// Carried by `pd_job_result`, so [JobDone.grade] is the core's own answer rather than
+/// anything this wrapper derived.
 enum ConfidenceGrade {
   /// `GS ( H`, ePOS JobID result, Star checked block.
   aJobLevelConfirmation(0),
@@ -442,27 +449,58 @@ enum ConfidenceGrade {
   dSpoolerCompleted(3),
 
   /// The write succeeded and nothing else is known.
-  eTransportOnly(4);
+  eTransportOnly(4),
+
+  /// A `pd_confidence_grade` this build does not know.
+  unrecognized(-1);
 
   const ConfidenceGrade(this.nativeValue);
 
   final int nativeValue;
 
-  /// The letter used in reports.
-  String get letter => const ['A', 'B', 'C', 'D', 'E'][nativeValue];
+  /// Mirrors `PD_GRADE_COUNT`.
+  static const int nativeCount = 5;
+
+  /// The letter used in reports; `?` for a grade this build cannot name.
+  String get letter =>
+      nativeValue < 0 ? '?' : const ['A', 'B', 'C', 'D', 'E'][nativeValue];
+
+  static ConfidenceGrade fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
 }
 
 /// Who is making the claim a [JobResult] carries (docs/device-database.md §D).
 ///
-/// Not carried by `pd_job_result` in the C ABI at this revision; see [ConfidenceGrade].
+/// Recorded separately from [ConfidenceGrade] because "completed" from a print server
+/// and "completed" from the mechanism that moved the paper are different facts.
 enum CompletionAuthority {
+  /// The device that moved the paper said so itself.
   physicalPrinter(0),
   vendorSpooler(1),
   pdAgent(2),
   printServer(3),
-  transportOnly(4);
+
+  /// Nobody said anything; the write succeeded.
+  transportOnly(4),
+
+  /// A `pd_completion_authority` this build does not know.
+  unrecognized(-1);
 
   const CompletionAuthority(this.nativeValue);
 
   final int nativeValue;
+
+  /// Mirrors `PD_AUTHORITY_COUNT`.
+  static const int nativeCount = 5;
+
+  static CompletionAuthority fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
 }

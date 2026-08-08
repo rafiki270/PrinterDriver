@@ -102,7 +102,10 @@ typedef enum pd_device_event {
   PD_DEVICE_UNRECOVERABLE_ERROR = 9,
   PD_DEVICE_CONNECTION_LOST = 10,
   PD_DEVICE_CONNECTION_RESTORED = 11,
-  PD_DEVICE_EVENT_COUNT = 12
+  /* A GS ( H echo arrived carrying a token this driver never issued: something else is
+   * writing to the same printer (docs/api.md §14). The echo is attributed to no job. */
+  PD_DEVICE_FOREIGN_WRITER_DETECTED = 12,
+  PD_DEVICE_EVENT_COUNT = 13
 } pd_device_event;
 
 /* pd::FailureReason. */
@@ -133,6 +136,36 @@ typedef enum pd_job_outcome {
   PD_OUTCOME_UNKNOWN = 2,
   PD_OUTCOME_COUNT = 3
 } pd_job_outcome;
+
+/*
+ * pd::ConfidenceGrade — what *class* of evidence a claim rests on
+ * (docs/device-database.md "Confidence grades for every route"). Orthogonal to
+ * pd_confidence_level: the level says how far up the evidence ladder a job climbed, the
+ * grade says what the claim is made of. Done at PD_CONFIDENCE_CUT_PROCESSED on grade A
+ * and Done at PD_CONFIDENCE_CUT_PROCESSED on grade D are not the same claim.
+ */
+typedef enum pd_confidence_grade {
+  PD_GRADE_A_JOB_LEVEL_CONFIRMATION = 0,  /* GS ( H, ePOS JobID, Star checked block */
+  PD_GRADE_B_ORDERED_DEVICE_RESPONSE = 1, /* GS r, vendor idle query */
+  PD_GRADE_C_DEVICE_STATUS_AROUND = 2,    /* DLE EOT / ASB / SNMP around the send */
+  PD_GRADE_D_SPOOLER_COMPLETED = 3,       /* a spooler or IPP gateway said completed */
+  PD_GRADE_E_TRANSPORT_ONLY = 4,          /* the write succeeded, nothing else is known */
+  PD_GRADE_COUNT = 5
+} pd_confidence_grade;
+
+/*
+ * pd::CompletionAuthority — who is actually making the claim. "Completed" from a print
+ * server and "completed" from the mechanism that moved the paper are different facts,
+ * which is the entire reason this is recorded separately from the grade.
+ */
+typedef enum pd_completion_authority {
+  PD_AUTHORITY_PHYSICAL_PRINTER = 0,
+  PD_AUTHORITY_VENDOR_SPOOLER = 1,
+  PD_AUTHORITY_PD_AGENT = 2,
+  PD_AUTHORITY_PRINT_SERVER = 3,
+  PD_AUTHORITY_TRANSPORT_ONLY = 4,
+  PD_AUTHORITY_COUNT = 5
+} pd_completion_authority;
 
 /* pd::CutSetting — PD_CUT_PROFILE means "whatever this printer's cutter does". */
 typedef enum pd_cut {
@@ -230,11 +263,20 @@ typedef struct pd_job_event {
  * The terminal answer. `confidence` is carried on all three outcomes, not only on
  * Done: on Failed and Unknown it records how far up the evidence ladder the job got
  * before it stopped, which is what an operator needs to decide about a reprint.
+ *
+ * `grade`, `authority` and `method` say what that claim is made of and who made it
+ * (docs/device-database.md: never a bare {success:true}). `method` names the actual
+ * command, e.g. "GS(H) fn48" — the string a support engineer needs six months later.
+ * It is owned by the pd_job that produced it and valid until pd_destroy; it is never
+ * NULL, and it is "none" when nothing was confirmed.
  */
 typedef struct pd_job_result {
   pd_job_outcome outcome;
   pd_confidence_level confidence;
   pd_failure_reason reason;
+  pd_confidence_grade grade;
+  pd_completion_authority authority;
+  const char* method;
 } pd_job_result;
 
 /*
@@ -345,11 +387,44 @@ typedef struct pd_job_options {
   int32_t open_drawer;
   pd_preflight preflight;
   uint32_t timeout_ms;  /* 0 -> the profile's completion timeout */
+
+  /* Margins (docs/receipt-dsl.md). `top_feed_dots` is fed before the first content
+   * byte. `bottom_feed_dots` is the *total* clearance between the last content and the
+   * cut: the engine feeds max(profile blade clearance, this), so it can only ever add
+   * whitespace and can never reintroduce a clipped trailing QR. Both default to 0. */
+  uint32_t top_feed_dots;
+  uint32_t bottom_feed_dots;
+
+  /* Suppresses the printed verification identifier — the trailer ORDER line and QR
+   * (docs/api.md §14). 0, the default, prints them. Inverted so that an all-zeroes
+   * pd_job_options still means "print the evidence"; the token stays journaled and
+   * pd_job_by_token still resolves it either way. */
+  int32_t suppress_verification_id;
 } pd_job_options;
+
+/*
+ * forceReprint's own options (docs/api.md §3). `suppress_banner` is inverted for the
+ * same reason as above: all-zeroes must mean the banner prints. Disabling it is a
+ * per-call, deliberate act for a receipt where the banner is inappropriate — a kitchen
+ * ticket should never disable it, because the banner is what lets staff bin the
+ * duplicate instead of cooking it twice.
+ */
+typedef struct pd_reprint_options {
+  pd_job_options job;
+  int32_t suppress_banner;
+} pd_reprint_options;
 
 /* --- Callbacks ------------------------------------------------------------------- */
 
-typedef void (*pd_job_event_cb)(pd_job* job, const pd_job_event* event, void* ctx);
+/*
+ * The event arrives **by value**, so a callback may keep it. That is deliberate: an FFI
+ * consumer whose callback runs after the native call has returned — a Dart
+ * NativeCallable.listener, a Java upcall, anything that hops to its own loop — cannot
+ * read through a pointer into the emitting worker's stack frame, and a by-value copy is
+ * what lets those consumers observe a job transition by transition instead of only
+ * replaying its history once it settles.
+ */
+typedef void (*pd_job_event_cb)(pd_job* job, pd_job_event event, void* ctx);
 typedef void (*pd_device_event_cb)(pd_printer* printer, pd_device_event event, void* ctx);
 
 /* --- Driver ---------------------------------------------------------------------- */
@@ -411,12 +486,38 @@ pd_job* pd_print(pd_driver* driver, pd_printer* printer, const pd_payload* paylo
 pd_job* pd_force_reprint(pd_driver* driver, pd_printer* printer, const char* key,
                          const pd_job_options* options);
 
+/* Same, with control over the banner. pd_force_reprint is exactly this call with an
+ * all-zeroes pd_reprint_options, i.e. with the banner on. */
+pd_job* pd_force_reprint_opts(pd_driver* driver, pd_printer* printer, const char* key,
+                              const pd_reprint_options* options);
+
 /* Any job this driver knows about, including ones reloaded from the journal after a
  * restart. NULL when the key is unknown. */
 pd_job* pd_find_job(pd_driver* driver, const char* key);
 
+/*
+ * Paper -> job (docs/api.md §14). Resolves either of a job's four-character
+ * verification identifiers, most-recent-first, including jobs reloaded from the
+ * journal. NULL when no job on this driver ever carried that token.
+ */
+pd_job* pd_job_by_token(pd_driver* driver, const char* token);
+
 const char* pd_job_id(pd_job* job);
 const char* pd_job_key(pd_job* job);
+
+/*
+ * The job's verification identifiers: the token the ticket prints as `V:` and the one
+ * its cut fence carried. "" on a printer whose completion mechanism is not GS ( H —
+ * there is no wire token to promote — and until the job reaches a worker. Owned by the
+ * handle, stable once non-empty.
+ */
+const char* pd_job_print_token(pd_job* job);
+const char* pd_job_cut_token(pd_job* job);
+
+/* The two characters every token this driver issues starts with: which driver instance
+ * owns the echo. Persisted in the storage directory, so it survives a restart. */
+const char* pd_instance_nonce(pd_driver* driver);
+
 uint32_t pd_job_attempt(pd_job* job);
 pd_job_state pd_job_current_state(pd_job* job);
 pd_confidence_level pd_job_confidence(pd_job* job);
@@ -444,6 +545,10 @@ const char* pd_confidence_level_name(pd_confidence_level value);
 const char* pd_device_event_name(pd_device_event value);
 const char* pd_failure_reason_name(pd_failure_reason value);
 const char* pd_job_outcome_name(pd_job_outcome value);
+const char* pd_confidence_grade_name(pd_confidence_grade value);
+const char* pd_completion_authority_name(pd_completion_authority value);
+/* "A".."E" — the letter a report tabulates, where the member name is too long. */
+const char* pd_confidence_grade_letter(pd_confidence_grade value);
 const char* pd_payload_kind_name(pd_payload_kind value);
 const char* pd_completion_mechanism_name(pd_completion_mechanism value);
 const char* pd_cut_variant_name(pd_cut_variant value);
