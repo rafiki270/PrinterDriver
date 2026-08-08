@@ -1,0 +1,8 @@
+# Dart tooling output.
+.dart_tool/
+.packages
+build/
+doc/api/
+
+# A library package pins nothing: the lock file is the application's business.
+pubspec.lock
