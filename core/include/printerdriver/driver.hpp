@@ -146,6 +146,19 @@ class PrintJob {
 
   PrintJob(std::string id, std::string key, std::string printer_id, uint32_t attempt);
 
+  // Registration and history replay are atomic from the subscriber's point of view:
+  // emit() parks events for a subscriber whose replay is still running, and
+  // subscribe() delivers the parked backlog before letting the subscriber go live,
+  // so a late subscriber can never see a newer event before an older recorded one.
+  // Parking, not replaying under mutex_, because no callback may ever run under
+  // mutex_: a caller that blocks or takes its own lock in a callback must not be
+  // able to deadlock the job.
+  struct Subscriber {
+    EventCallback callback;
+    bool draining = true;
+    std::vector<JobEvent> pending;
+  };
+
   void emit(JobState state, ConfidenceLevel confidence,
             std::optional<FailureReason> reason);
   void finish(const JobResult& outcome);
@@ -162,7 +175,9 @@ class PrintJob {
   mutable std::mutex mutex_;
   mutable std::condition_variable done_;
   std::vector<JobEvent> history_;
-  std::vector<EventCallback> subscribers_;
+  // shared_ptr because subscribe() keeps working with its entry after releasing
+  // mutex_, across reallocations of this vector. There is no unsubscribe.
+  std::vector<std::shared_ptr<Subscriber>> subscribers_;
   JobResult result_;
 };
 

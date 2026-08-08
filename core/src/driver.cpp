@@ -127,30 +127,61 @@ void PrintJob::subscribe(EventCallback callback) {
   if (!callback) {
     return;
   }
+  auto subscriber = std::make_shared<Subscriber>();
+  subscriber->callback = std::move(callback);
   std::vector<JobEvent> replay;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     replay = history_;
-    subscribers_.push_back(callback);
+    subscribers_.push_back(subscriber);
   }
+  // Registered but still draining, so a concurrent emit() parks its events instead
+  // of invoking the callback: nothing can overtake this replay.
   for (const JobEvent& event : replay) {
-    callback(event);
+    subscriber->callback(event);
+  }
+  // Deliver whatever was parked mid-replay, then go live. The flag only flips in
+  // the critical section that finds the backlog empty, so no event can slip
+  // between the last drained batch and the first live delivery.
+  std::vector<JobEvent> parked;
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (subscriber->pending.empty()) {
+        subscriber->draining = false;
+        break;
+      }
+      parked.swap(subscriber->pending);
+    }
+    for (const JobEvent& event : parked) {
+      subscriber->callback(event);
+    }
+    parked.clear();
   }
 }
 
 void PrintJob::emit(JobState state, ConfidenceLevel confidence,
                     std::optional<FailureReason> reason) {
   const JobEvent event = JobEvent::make(state, confidence, reason);
-  std::vector<EventCallback> subscribers;
+  std::vector<std::shared_ptr<Subscriber>> live;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     state_.store(state);
     confidence_.store(confidence);
     history_.push_back(event);
-    subscribers = subscribers_;
+    live.reserve(subscribers_.size());
+    for (const std::shared_ptr<Subscriber>& subscriber : subscribers_) {
+      if (subscriber->draining) {
+        // Parked in the same critical section that recorded the event, so the
+        // backlog is in history order; subscribe() delivers it before going live.
+        subscriber->pending.push_back(event);
+      } else {
+        live.push_back(subscriber);
+      }
+    }
   }
-  for (const EventCallback& callback : subscribers) {
-    callback(event);
+  for (const std::shared_ptr<Subscriber>& subscriber : live) {
+    subscriber->callback(event);
   }
 }
 

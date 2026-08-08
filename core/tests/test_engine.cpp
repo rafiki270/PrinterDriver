@@ -1,6 +1,8 @@
 #include "printerdriver/driver.hpp"
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 
 #include "fake_printer.hpp"
@@ -112,6 +114,151 @@ PD_TEST(engine_gsparenh_walks_the_full_state_machine_in_order) {
   }
   CHECK(job->isTerminal());
   CHECK_EQ(job->state(), JobState::DoneSoftware);
+}
+
+PD_TEST(engine_subscribe_during_live_emission_never_reorders_events) {
+  // Regression: subscribe() used to register the callback under the job mutex but
+  // replay the recorded history only after releasing it, so a worker emitting in
+  // that window handed the new subscriber a live event ahead of older recorded ones
+  // — observed from the Swift wrapper as bytesSent arriving before queued/
+  // preflightOk/sendStarted about one run in three. The contract (pd.h, "Callback
+  // threads") is replay-then-stream: every subscriber sees exactly the job's
+  // recorded history, in order, no matter when it subscribes.
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+
+  // Busy-wait rather than sleep: at microsecond scale the scheduler's wake-up jitter
+  // would swamp the emission window this test is trying to land subscriptions in.
+  const auto spin = [](std::chrono::microseconds duration) {
+    const auto until = MonotonicClock::now() + duration;
+    while (MonotonicClock::now() < until) {
+    }
+  };
+
+  for (int round = 0; round < 80; ++round) {
+    auto job = rig.printer->print(
+        Payload::raw(textPayload("RACE-" + std::to_string(round))), {});
+
+    struct Observer {
+      std::mutex mutex;
+      std::vector<JobEvent> seen;
+    } observers[4];
+    for (Observer& observer : observers) {
+      job->subscribe([&observer, &spin](const JobEvent& event) {
+        std::lock_guard<std::mutex> lock(observer.mutex);
+        observer.seen.push_back(event);
+        // Stretches the replay loop so a concurrent emission has a real window to
+        // land in; the assertions below are what make landing there harmless.
+        spin(std::chrono::microseconds(5));
+      });
+      // Stagger the next subscription into a different slice of the worker's
+      // emission burst.
+      spin(std::chrono::microseconds(25 + (round % 16) * 25));
+    }
+    job->result();
+
+    // The terminal event's callbacks complete before finish() publishes the result,
+    // and each subscribe() returned before result() was called, so by now every
+    // observer has been handed everything it will ever be handed.
+    const std::vector<JobEvent> canonical = job->history();
+    CHECK(job->isTerminal());
+    CHECK(canonical.size() >= static_cast<size_t>(2));
+    for (Observer& observer : observers) {
+      std::lock_guard<std::mutex> lock(observer.mutex);
+      CHECK_EQ(observer.seen.size(), canonical.size());
+      for (size_t i = 0; i < observer.seen.size() && i < canonical.size(); ++i) {
+        CHECK_EQ(observer.seen[i].state, canonical[i].state);
+        // Same event, not merely the same state: timestamps are unique per emit.
+        CHECK(observer.seen[i].at == canonical[i].at);
+        if (i > 0) {
+          CHECK(!(observer.seen[i].at < observer.seen[i - 1].at));
+        }
+      }
+    }
+  }
+}
+
+PD_TEST(engine_subscriber_mid_replay_receives_recorded_before_live) {
+  // The same race, reconstructed deterministically instead of hoped into: the worker
+  // is pinned on the payload write with SendStarted already recorded, subscribe()
+  // starts replaying, and the first replay callback un-pins the worker — so BytesSent
+  // and everything after it is emitted while the replay is provably still running.
+  // The subscriber must still see recorded events strictly before live ones.
+  struct Gate {
+    std::mutex mutex;
+    std::condition_variable released_cv;
+    bool armed = false;
+    bool released = false;
+  };
+  auto gate = std::make_shared<Gate>();
+
+  Rig rig(CompletionMechanism::GsParenH);
+  // Installed before build(): the factory copies behaviour when the printer is added.
+  rig.link.behaviour.before_write = [gate](const uint8_t* data, size_t size) {
+    const std::string chunk(reinterpret_cast<const char*>(data), size);
+    if (chunk.find("PINNED-") == std::string::npos) {
+      return;  // preflight probes, fences and cuts pass straight through
+    }
+    std::unique_lock<std::mutex> lock(gate->mutex);
+    if (!gate->armed) {
+      return;
+    }
+    gate->armed = false;
+    // The 2 s cap is a hang breaker, not a timing assumption: release always comes
+    // from the subscriber's callback below.
+    gate->released_cv.wait_for(lock, std::chrono::seconds(2),
+                               [&] { return gate->released; });
+  };
+  rig.build();
+
+  for (int round = 0; round < 15; ++round) {
+    {
+      std::lock_guard<std::mutex> lock(gate->mutex);
+      gate->armed = true;
+      gate->released = false;
+    }
+    auto job = rig.printer->print(
+        Payload::raw(textPayload("PINNED-" + std::to_string(round))), {});
+
+    // The worker records SendStarted, then blocks in before_write on the payload.
+    const auto deadline = MonotonicClock::now() + std::chrono::seconds(2);
+    while (job->state() != JobState::SendStarted && MonotonicClock::now() < deadline) {
+    }
+    CHECK_EQ(job->state(), JobState::SendStarted);
+
+    std::mutex seen_mutex;
+    std::vector<JobEvent> seen;
+    job->subscribe([&](const JobEvent& event) {
+      {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        seen.push_back(event);
+      }
+      {
+        std::lock_guard<std::mutex> lock(gate->mutex);
+        if (!gate->released) {
+          gate->released = true;
+          gate->released_cv.notify_all();
+        }
+      }
+      // Dawdle so the rest of the replay is still running when the un-pinned worker
+      // emits: the mock's writes and answers take microseconds, this takes 700 each.
+      const auto until = MonotonicClock::now() + std::chrono::microseconds(700);
+      while (MonotonicClock::now() < until) {
+      }
+    });
+    job->result();
+
+    const std::vector<JobEvent> canonical = job->history();
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    // Queued, PreflightOk, SendStarted recorded before the pin; at least BytesSent
+    // and a terminal after release.
+    CHECK(canonical.size() >= static_cast<size_t>(5));
+    CHECK_EQ(seen.size(), canonical.size());
+    for (size_t i = 0; i < seen.size() && i < canonical.size(); ++i) {
+      CHECK_EQ(seen[i].state, canonical[i].state);
+      CHECK(seen[i].at == canonical[i].at);
+    }
+  }
 }
 
 // --- b. Fallback sequence, GS r 1 ------------------------------------------------
