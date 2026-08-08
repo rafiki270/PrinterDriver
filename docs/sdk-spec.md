@@ -1,9 +1,10 @@
 # SDK Spec: PrinterDriver — Cross-Platform Receipt Printing SDK
 
 Companion to [docs/brief.md](brief.md) (problem research summary),
-[docs/techspec.md](techspec.md) (protocol-level detail), and
-[docs/testing-plan.md](testing-plan.md) (hardware capability probe). This document
-defines what we are actually building.
+[docs/techspec.md](techspec.md) (protocol-level detail),
+[docs/testing-plan.md](testing-plan.md) (hardware capability probe), and
+[docs/api.md](api.md) (the public interface). This document defines what we are
+actually building.
 
 ---
 
@@ -50,14 +51,14 @@ A **native printing SDK for iOS and Android with a shared C++ core**.
    value (`UNKNOWN`, `UNSUPPORTED`), never a missing callback or a silent success.
 3. **Printing interface as standard as possible.** The public API models standard receipt
    semantics (text, styling, alignment, feed, cut, raster images, barcodes/QR, cash
-   drawer). Raster deserves equal billing with text: KiloMayo renders receipts to canvas
-   and prints images today (§10). The wire default is a **conservative standard ESC/POS
-   subset** — the dialect
+   drawer). Raster deserves equal billing with text: our existing POS renders receipts
+   to canvas and prints images today (§10). The wire default is a **conservative
+   standard ESC/POS subset** — the dialect
    the widest range of cheap "ESC/POS compatible" printers actually implements. Vendor
    quirks and extensions live behind capability profiles inside the core, never in the
    public API.
 4. **Works with the most standard printers.** Support target = the printers already
-   deployed/implemented in the KiloMayo monorepo (see §9) plus the Xprinter XP-S260M
+   deployed/implemented in our existing POS apps (see §9) plus the Xprinter XP-S260M
    studied in the research docs. Cheap ESC/POS-compatible hardware is the norm, not the
    exception — the SDK must degrade honestly (see confidence levels, §5) rather than
    require premium hardware.
@@ -201,9 +202,8 @@ the SDK reports exactly that, honestly, instead of pretending.
 
 ## 9. Printer support matrix
 
-Support target: every printer currently implemented/used in the KiloMayo monorepo
-(`kilomayocom/monorepo`, checkout at `/Users/dictator/Projects/monorepo`), plus the
-XP-S260M. Filled from the monorepo scan run 2026-08-08:
+Support target: every printer currently implemented/used in our existing POS apps, plus
+the XP-S260M. Filled from a scan of the existing POS monorepo run 2026-08-08:
 
 | Printer | Protocol today | Notes for the SDK |
 |---|---|---|
@@ -216,7 +216,7 @@ XP-S260M. Filled from the monorepo scan run 2026-08-08:
 Paper widths in use today: 384 / 504 / 576 dots per line (58 mm and 80 mm papers at
 203 dpi / 8 dots-per-mm).
 
-## 10. Current state in the KiloMayo monorepo (what the SDK replaces)
+## 10. Current state in the existing POS stack (what the SDK replaces)
 
 From the 2026-08-08 scan. Main code: `organization/web/pos/src/utilities/device/printer/`
 (web POS printer stack) and `organization/native/pos-shell/modules/tcpModule/` (native
@@ -260,7 +260,7 @@ duplicate. The ePOS path parses `success="true"` from the XML; no retry on parse
 
 **Requirements this adds to the SDK:**
 
-- **Raster is a first-class job type.** KiloMayo prints receipts as rendered images, not
+- **Raster is a first-class job type.** The existing POS prints receipts as rendered images, not
   ESC/POS text — so raster jobs (dithering, width fitting to 384/504/576 dots, banding
   for tall images) matter as much as text primitives, and the existing
   one-job-at-a-time-per-printer queue semantics must be preserved (the core already
@@ -268,7 +268,8 @@ duplicate. The ePOS path parses `success="true"` from the XML; no retry on parse
 - **Job payloads stay opaque; routing stays app-side.** The POS distinguishes 15
   printable types (receipt, guestCheck, ticket, customerTicket, cancellationTicket,
   seatChange, customerTabsMerge, closingSummary, customerPager, payment, paidAndClosed,
-  startPreparation, internalMessage, image, gpTomReceipt) routed to per-role printers
+  startPreparation, internalMessage, image, plus a card-terminal receipt type) routed to
+  per-role printers
   (receiptPrinter / ticketPrinters / customerPagerPrinter / paymentAndClosurePrinter).
   The SDK prints jobs; which printer gets which document type remains the app's decision.
 
@@ -284,7 +285,7 @@ duplicate. The ePOS path parses `success="true"` from the XML; no retry on parse
    storage callback).
 5. **Whether the Linux/RPi agent ships from this repo** using the same core (probable
    yes — it is the strongest argument for the C++ core).
-6. **ePOS-Print protocol support** — the monorepo drives Epson TM-T88VI+ via ePOS
+6. **ePOS-Print protocol support** — the existing POS stack drives Epson TM-T88VI+ via ePOS
    (SOAP/HTTP) today. Does v1 include an ePOS transport in the core, or are those
    printers driven through their ESC/POS mode instead (most Epson TM models speak both)?
 
