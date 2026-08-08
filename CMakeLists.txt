@@ -20,15 +20,32 @@ add_library(printerdriver_core STATIC
   core/src/types.cpp
   core/src/code_page.cpp
   core/src/escpos_encoder.cpp
-  core/src/response_parser.cpp)
+  core/src/response_parser.cpp
+  core/src/capability_profile.cpp
+  core/src/job_store.cpp
+  core/src/transport.cpp
+  core/src/driver.cpp)
 
 target_include_directories(printerdriver_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/core/include>)
+
+# POSIX sockets and one thread per printer plus one per connection: the only OS
+# services the core uses.
+find_package(Threads REQUIRED)
+target_link_libraries(printerdriver_core PUBLIC Threads::Threads)
 
 if(MSVC)
   target_compile_options(printerdriver_core PRIVATE /W4)
 else()
   target_compile_options(printerdriver_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(pdctl tools/pdctl.cpp)
+target_link_libraries(pdctl PRIVATE printerdriver_core)
+if(MSVC)
+  target_compile_options(pdctl PRIVATE /W4)
+else()
+  target_compile_options(pdctl PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 enable_testing()
@@ -39,7 +56,9 @@ set(printerdriver_tests
   test_codepage
   test_raster
   test_qr
-  test_parser)
+  test_parser
+  test_store
+  test_engine)
 
 foreach(test_name IN LISTS printerdriver_tests)
   add_executable(${test_name}

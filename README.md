@@ -11,10 +11,14 @@ fences (`GS ( H` process-ID markers, `GS r 1`) and an honest tri-state job outco
 
 ## Status
 
-Milestone 1 — the foundations only: the closed public enums, the ESC/POS byte encoder, and
-the incremental response parser, with golden-byte tests including the exact frames captured
-from this project's Xprinter XP-S260M. The job state machine, transports, engine, job store
-and CLI are milestone 2 and are not in this repository yet.
+Milestone 2. On top of milestone 1's closed enums, ESC/POS encoder and response parser
+there is now a durable job store, a TCP transport with a live backchannel, capability
+profiles, and the print engine implementing the ordered completion sequences from
+[docs/techspec.md §5.2](docs/techspec.md) and [§5.3](docs/techspec.md) behind the public
+API in [docs/api.md](docs/api.md). `pdctl` drives all of it from the command line.
+
+Not built yet: the C ABI and platform wrappers, Bluetooth/USB/serial transports,
+discovery, and the print-queue addon.
 
 ## Build and test
 
@@ -27,19 +31,47 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The build produces the static library `printerdriver_core`; public headers live in
-`core/include/printerdriver/`. Tests are plain executables using a small built-in assert
-harness (`core/tests/test_harness.hpp`) and are registered individually with CTest.
+The build produces the static library `printerdriver_core` and the `pdctl` diagnostic CLI;
+public headers live in `core/include/printerdriver/`. Tests are plain executables using a
+small built-in assert harness (`core/tests/test_harness.hpp`) and are registered
+individually with CTest.
+
+## pdctl
+
+```sh
+build/pdctl status <host>                     # DLE EOT 1-4 decoded plus raw bytes
+build/pdctl probe  <host>                     # which completion fence this unit supports
+build/pdctl print  <host> --text "..." --key order-7F3A
+```
+
+`print` runs through the whole engine — preflight, ordered fence, cut fence, cutter
+status, job store — and exits 0 on `done`, 1 on `failed`, 2 on `unknown`. The core owns a
+printer connection exclusively, so stop CUPS and every other client first.
 
 ## Layout
 
 ```
-core/include/printerdriver/   public headers (types, escpos_encoder, response_parser)
+core/include/printerdriver/   public headers
+  types.hpp                   closed enums, JobResult, JobEvent
+  escpos_encoder.hpp          byte builder and the fence/status primitives
+  response_parser.hpp         incremental parser for the interleaved return stream
+  capability_profile.hpp      per-model data; decides the reachable ConfidenceLevel
+  job_store.hpp               append-only durable job journal
+  transport.hpp               Transport interface and the TCP implementation
+  driver.hpp                  PrinterDriver / Printer / PrintJob — the public API
 core/src/                     implementation
-core/tests/                   test harness and per-area test binaries
+core/tests/                   test harness, scriptable fake printer, test binaries
+tools/pdctl.cpp               command-line diagnostics
 docs/                         specifications — these are authoritative, not the code
-scripts/printer_probe.py      hardware capability probe
+scripts/printer_probe.py      standalone hardware capability probe
 ```
+
+## Threads
+
+One worker thread per printer runs jobs strictly FIFO, one at a time. Each open
+connection has its own reader thread pumping received bytes into the response parser.
+Job-event and device-event callbacks run on those threads and must not block or call
+back into the driver.
 
 ## Documentation
 
