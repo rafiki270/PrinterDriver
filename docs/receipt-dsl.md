@@ -102,3 +102,42 @@ disappears — the same honesty contract as printing itself.
 2. Wrapper builders (Swift/Kotlin/Dart) generating the model.
 3. Raster path via wrapper-side text rendering hook; preview API.
 4. Core-side raster fonts (vendored rasterizer) if/when wrapper-side proves limiting.
+
+## Templates + parameter models
+
+A **ReceiptTemplate** is the same document model with binding expressions; printing
+binds a plain params model (JSON) into it — design once, print many:
+
+```json
+{ "v": 1, "template": true,
+  "styles": { "h1": { "bold": true, "widthScale": 2, "align": "center" } },
+  "blocks": [
+    { "text": "{{venue.name}}", "style": "h1" },
+    { "text": "Order {{order.id}} · Table {{order.table}}" },
+    { "divider": "dashed" },
+    { "each": "order.items", "block":
+      { "columns": [ { "content": "{{qty}}× {{name}}", "width": "flex" },
+                     { "content": "{{price}}", "width": { "chars": 8 }, "align": "right" } ] } },
+    { "divider": "solid" },
+    { "columns": [ { "content": "TOTAL", "width": "flex", "style": "total" },
+                   { "content": "{{order.total}}", "width": { "chars": 8 }, "align": "right", "style": "total" } ] },
+    { "if": "order.note", "block": { "text": "NOTE: {{order.note}}", "style": "bold" } },
+    { "qr": "{{order.id}}", "size": 6, "align": "center" } ] }
+```
+
+Binding rules (deliberately small — logic-less, Mustache-like): `{{path.to.value}}`
+substitution with escaping; `each` repeats a block per array element (scope = element);
+`if`/`unless` on truthiness; missing path → declared render-report warning + empty
+string, never a crash mid-receipt. No expressions, no arithmetic — the app prepares the
+model; the template only lays it out.
+
+Wrapper sugar:
+
+```swift
+let kitchen = try ReceiptTemplate.load(jsonTemplate)      // or built with the builder
+let job = printer.send(kitchen, model: order.printModel,  // Encodable → JSON
+                       key: "order-\(order.id)#kitchen-1") { result in ... }
+```
+
+Templates live wherever the app wants — bundled, fetched from a backend, cached by the
+agent — and bind identically on every platform because binding happens in the core.
