@@ -248,7 +248,10 @@ public enum PayloadKind: UInt32, ABIMirroredEnum {
 public enum CompletionMechanism: UInt32, ABIMirroredEnum {
   case gsParenH = 0
   case gsR1 = 1
-  case none = 2
+  case vendorIdle = 2
+  case eposJobId = 3
+  case starCheckedBlock = 4
+  case none = 5
 
   public static let abiTypeName = "CompletionMechanism"
   /// Claims nothing. An unrecognized mechanism must not imply a fence the wrapper cannot
