@@ -1,0 +1,8 @@
+// Test-only module. Nothing that ships depends on it: the SwiftPM target built from
+// this directory (CPrinterDriverTestSupport) is a dependency of the XCTest bundle and of
+// nothing else, so pd_add_printer_scripted and the enum bridge stay out of every
+// consumer's binary — the same rule CMakeLists.txt applies to test_capi.
+module CPrinterDriverTestSupport {
+  header "pd_test_support.h"
+  export *
+}

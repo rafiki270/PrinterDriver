@@ -36,6 +36,20 @@ public headers live in `core/include/printerdriver/`. Tests are plain executable
 small built-in assert harness (`core/tests/test_harness.hpp`) and are registered
 individually with CTest.
 
+## Swift package
+
+`Package.swift` sits at the repository root so this repository is consumable directly by
+SwiftPM — the git URL is the package URL. It compiles the same `core/src` and `capi/src`
+files CMake does, and adds the Swift wrapper over the C ABI.
+
+```sh
+swift build      # iOS 16+ / macOS 13+
+swift test       # runs on macOS
+```
+
+See [wrappers/swift/README.md](wrappers/swift/README.md) for the API, the threading
+contract and the platform matrix.
+
 ## pdctl
 
 ```sh
@@ -61,6 +75,12 @@ core/include/printerdriver/   public headers
   driver.hpp                  PrinterDriver / Printer / PrintJob — the public API
 core/src/                     implementation
 core/tests/                   test harness, scriptable fake printer, test binaries
+capi/include/printerdriver/   pd.h — the C ABI every wrapper binds, plus its modulemap
+capi/src/                     the ABI implementation and its enum static_asserts
+capi/tests/                   the C ABI test, the scripted-device factory, the enum bridge
+queue/                        the print-queue addon (separate library on purpose)
+Package.swift                 SwiftPM manifest for the whole repository
+wrappers/swift/               the Swift wrapper: Sources, Tests, README
 tools/pdctl.cpp               command-line diagnostics
 docs/                         specifications — these are authoritative, not the code
 scripts/printer_probe.py      standalone hardware capability probe
