@@ -167,7 +167,11 @@ Straight from the research, now enforced by the core:
   again. This alone kills the "resend because it looked stuck" duplicate.
 - **Explicit `forceReprint`.** Printing the same key again is a distinct, deliberate
   operation, and the core marks the ticket visibly:
-  `*** REPRINT / POSSIBLE DUPLICATE ***`, `PRINT ATTEMPT: n`.
+  `*** REPRINT / POSSIBLE DUPLICATE ***`, `ORDER: <key>`, `PRINT ATTEMPT: n` — on all
+  payload tiers, from the core, so no wrapper or app can forget it. The banner is
+  **configurable and enabled by default** (per-call `ReprintOptions.banner`; disabling
+  is deliberate and per-call — see [api.md §3](api.md#3-payload-tiers)). Fresh attempts
+  after a terminal failure carry no banner, since nothing printed the first time.
 - **Visible stable ID on every ticket** (and optionally a QR of it), so staff can
   reconcile paper against orders.
 - **No automatic retry from `Unknown`** — for kitchen tickets a duplicate is as bad as a

@@ -119,9 +119,32 @@ timeoutMs:  per-phase completion-wait budget (default per profile)
 ```
 
 Re-submitting an existing `key` does **not** print — it returns the existing `PrintJob`
-(whatever state it is in). Printing the same key again is only possible via
-`forceReprint`, which marks the ticket (`*** REPRINT / POSSIBLE DUPLICATE ***`,
-`PRINT ATTEMPT: n` — prepended as a text banner even for raster payloads).
+(whatever state it is in; a key whose job terminally **failed** starts a fresh attempt
+instead, attempt+1, no banner — nothing printed the first time). Printing the same key
+again after a `done`/`unknown` outcome is only possible via `forceReprint`.
+
+### The reprint banner (normative)
+
+`forceReprint` marks the ticket in the core, on every platform identically:
+
+```
+*** REPRINT / POSSIBLE DUPLICATE ***
+ORDER: <key>
+PRINT ATTEMPT: <n>
+```
+
+- Prepended as text lines for **all three payload tiers** (raster included — the banner
+  precedes the image).
+- The exact strings are exported constants (`kReprintBannerLine`,
+  `kReprintAttemptPrefix`) so wrapper tests assert the same bytes the wire carries.
+- **Configurable, enabled by default.** `ReprintOptions.banner: true` (default) |
+  `false`. Disabling is a per-call, deliberate act for receipts where the banner is
+  inappropriate (e.g. a customer-facing copy); kitchen tickets should never disable it —
+  the banner is what lets staff bin the duplicate instead of cooking it twice. A
+  driver-level default (`DriverConfig.reprintBannerDefault`) may tighten this to
+  always-on for a deployment, never loosen it silently.
+- Fresh attempts after a terminal `failed` never carry the banner (no duplicate risk
+  exists); the attempt counter still increments.
 
 ## 4. Feedback: one stream, honest terminal states
 
