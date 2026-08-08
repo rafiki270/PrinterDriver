@@ -298,3 +298,44 @@ let job = queue.enqueue(on: kitchen, .document(doc),
 The queue drains through the same core submit path (fenced, confidence-graded), never
 re-drives a job that reached `.unknown`, and returns the existing job when a key is
 re-enqueued.
+
+## 12. Send-with-closure ergonomics (wrappers)
+
+Every wrapper exposes, besides the stream/await forms, a closure form:
+
+```swift
+printer.send(receipt, key: "order-7F3A-92C1#kitchen-1",
+             onProgress: { event in ticketUI.update(event.state) }) { result in
+  switch result {                       // terminal, exactly once
+  case .done(let confidence): markPrinted(confidence)
+  case .failed(let reason):   showFailure(reason)
+  case .unknown:              askOperator()
+  }
+}
+```
+
+Kotlin: trailing lambda + optional `onProgress`; Dart: `Future<JobResult>` +
+`onProgress` callback. Rules: the terminal closure fires exactly once, always (crash
+recovery included via findJob); `onProgress` receives every JobEvent in order; both are
+sugar over the same core event stream — no separate code path.
+
+## 13. explore(): printer metadata as data
+
+`printer.explore()` (and `driver.explore(transport)` pre-add) returns the full
+`PrinterInfo` produced by the fingerprint + probe machinery
+([capability-profiles.md](capability-profiles.md)) as one metadata object:
+
+```
+PrinterInfo
+├─ identity: vendor, model, firmware, serial?, identityTrusted, confidencePercent
+├─ media: nominalPaperMm, printableWidthDots, dpi, charsPerLine (per font),
+│         sensors {paperEnd, nearEnd, cover, blackMark}, cutter {full, partial}
+├─ completion: mechanism, confidenceCeiling, grade (A–E), authority
+├─ features: codepages, barcodeSymbologies, qrMax, drawerKick, buzzer,
+│            maintenanceCounters, recoveryCommands (data only)
+└─ transports: available + recommended ranking
+```
+
+Serializable (JSON) like everything else; cached from the persisted probe, refreshed on
+demand with `explore(refresh: true)`. The DSL renderer consumes `media` — apps consume
+the rest (e.g. showing "80 mm / 576 dots / cutter OK" in settings UIs).
