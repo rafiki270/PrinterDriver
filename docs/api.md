@@ -199,7 +199,9 @@ when (val result = job.await()) {
 ```
 
 Both wrappers are generated-thin: enum bridging + async adapters over the C ABI. No
-logic.
+logic. The **Flutter/Dart wrapper is first-wave too** (one consumer app is Flutter,
+using the document tier) and follows the same shape via FFI: `Stream<JobEvent>`,
+`Future<JobResult>`, sealed result classes.
 
 ## 7. Web bridge (how the existing web-POS shell consumes it)
 
@@ -272,7 +274,27 @@ impossible.
 3. Does `Printer.print` accept multiple copies natively, or is that app-side looping
    with distinct keys? Lean: app-side (`#kitchen-1`, `#kitchen-2` suffixes), keeps
    dedupe semantics obvious.
-4. Discovery API (`driver.discover() → stream of found printers`) — v1 or later? The
-   monorepo's scan is a stub today, so nothing depends on it yet.
+4. Discovery API (`driver.discover() → stream of found printers`) — v1 or later? Demand
+   exists on both sides: the web POS's scanner is a stub, and the native suite has
+   Android-only /24 scanning with no iOS equivalent.
 5. ePOS transport in core vs ESC/POS-mode-only for Epson TM models —
    [sdk-spec §11.6](sdk-spec.md#11-open-questions).
+
+## 11. Planned addon: print queue
+
+Layered on this API, not part of it — design and safety rules in
+[sdk-spec §12](sdk-spec.md#12-print-queue-addon-planned). Sketch:
+
+```swift
+let queue = PrintQueue(driver, policy: .init(holdWhileOffline: true,
+                                             defaultTTL: .minutes(5)))
+let job = queue.enqueue(on: kitchen, .document(doc),
+                        options: .init(key: "order-7F3A-92C1#kitchen-1"))
+// `job` is a normal PrintJob — same event stream, same tri-state result.
+// Extra pre-send state while held: .heldOffline
+// Extra failure reasons: .expired (TTL passed while held), .queueOverflow
+```
+
+The queue drains through the same core submit path (fenced, confidence-graded), never
+re-drives a job that reached `.unknown`, and returns the existing job when a key is
+re-enqueued.
