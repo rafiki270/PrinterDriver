@@ -164,14 +164,14 @@ public sealed class PrintJob
         }
     }
 
-    private static void Trampoline(nint _, nint jobEvent, nint context)
+    private static void Trampoline(nint _, PdJobEvent jobEvent, nint context)
     {
         var job = CallbackRoots.FromContext<PrintJob>(context);
-        if (job is null || jobEvent == 0)
+        if (job is null)
         {
             return;
         }
-        job.Publish(JobEvent.FromNative(Marshal.PtrToStructure<PdJobEvent>(jobEvent)));
+        job.Publish(JobEvent.FromNative(jobEvent));
     }
 
     private void Publish(JobEvent jobEvent)

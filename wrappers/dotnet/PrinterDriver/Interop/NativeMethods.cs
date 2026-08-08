@@ -30,7 +30,7 @@ internal static class NativeMethods
     // --- Callback signatures ---------------------------------------------------------
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate void JobEventCallback(nint job, nint jobEvent, nint context);
+    internal delegate void JobEventCallback(nint job, PdJobEvent jobEvent, nint context);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void DeviceEventCallback(nint printer, int deviceEvent, nint context);
@@ -193,6 +193,9 @@ internal struct PdJobOptions
     public int OpenDrawer;
     public int Preflight;
     public uint TimeoutMs;
+    public uint TopFeedDots;
+    public uint BottomFeedDots;
+    public int SuppressVerificationId;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -211,6 +214,9 @@ internal struct PdJobResult
     public int Outcome;
     public int Confidence;
     public int Reason;
+    public int Grade;
+    public int Authority;
+    public nint Method;
 }
 
 [StructLayout(LayoutKind.Sequential)]

@@ -108,6 +108,48 @@ public enum DeviceEvent
 
     /// <summary>The link came back.</summary>
     ConnectionRestored = 11,
+
+    /// <summary>A GS(H) echo arrived carrying a token this driver never issued —
+    /// something else is writing to the same printer (docs/api.md §14).</summary>
+    ForeignWriterDetected = 12,
+}
+
+/// <summary>What class of evidence backs a result — docs/device-database.md.</summary>
+public enum ConfidenceGrade
+{
+    /// <summary>Job-level confirmation from the mechanism (GS(H) echo, ePOS JobID).</summary>
+    AJobLevelConfirmation = 0,
+
+    /// <summary>Ordered device response with weaker semantics (GS r 1).</summary>
+    BOrderedDeviceResponse = 1,
+
+    /// <summary>Device status around transmission (DLE EOT, ASB).</summary>
+    CDeviceStatusAround = 2,
+
+    /// <summary>A spooler said completed.</summary>
+    DSpoolerCompleted = 3,
+
+    /// <summary>Transport only: a write succeeded somewhere.</summary>
+    ETransportOnly = 4,
+}
+
+/// <summary>Who is authoritative for the completion claim.</summary>
+public enum CompletionAuthority
+{
+    /// <summary>The physical printer's own mechanism answered.</summary>
+    PhysicalPrinter = 0,
+
+    /// <summary>A vendor spooler answered (e.g. ePOS).</summary>
+    VendorSpooler = 1,
+
+    /// <summary>The pd agent daemon answered.</summary>
+    PdAgent = 2,
+
+    /// <summary>An intermediate print server answered.</summary>
+    PrintServer = 3,
+
+    /// <summary>Nothing beyond the transport accepted the bytes.</summary>
+    TransportOnly = 4,
 }
 
 /// <summary>Why a job failed, or why its outcome is unknown.</summary>

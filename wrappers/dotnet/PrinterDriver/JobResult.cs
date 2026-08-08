@@ -63,11 +63,21 @@ public abstract record JobResult
     public sealed record Unknown(ConfidenceLevel Confidence, FailureReason Reason)
         : JobResult(Confidence, Reason);
 
+    /// <summary>Evidence class A-E backing this result — docs/device-database.md.</summary>
+    public ConfidenceGrade Grade { get; internal init; } = ConfidenceGrade.ETransportOnly;
+
+    /// <summary>Who is authoritative for the completion claim.</summary>
+    public CompletionAuthority Authority { get; internal init; } =
+        CompletionAuthority.TransportOnly;
+
+    /// <summary>The mechanism that produced the evidence, e.g. "GS(H) fn48".</summary>
+    public string Method { get; internal init; } = "none";
+
     internal static JobResult FromNative(in PdJobResult native)
     {
         var confidence = (ConfidenceLevel)native.Confidence;
         var reason = (FailureReason)native.Reason;
-        return (JobOutcome)native.Outcome switch
+        JobResult result = (JobOutcome)native.Outcome switch
         {
             JobOutcome.Done => new Done(confidence, reason),
             JobOutcome.Failed => new Failed(confidence, reason),
@@ -77,6 +87,14 @@ public abstract record JobResult
             // this wrapper does not recognise is "we do not know what happened" -- never
             // "it worked".
             _ => new Unknown(confidence, reason),
+        };
+        return result with
+        {
+            Grade = (ConfidenceGrade)native.Grade,
+            Authority = (CompletionAuthority)native.Authority,
+            Method = native.Method != 0
+                ? System.Runtime.InteropServices.Marshal.PtrToStringUTF8(native.Method) ?? "none"
+                : "none",
         };
     }
 }

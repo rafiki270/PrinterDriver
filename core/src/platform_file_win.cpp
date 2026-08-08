@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "platform_file.hpp"
 
 // The Win32 half of the durable-file edge (docs/platforms.md, step 2). CMake compiles
@@ -185,3 +186,5 @@ bool isSeparator(char c) noexcept { return c == '/' || c == '\\'; }
 
 }  // namespace platform_file
 }  // namespace pd
+
+#endif  // _WIN32

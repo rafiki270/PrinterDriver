@@ -1128,6 +1128,14 @@ int main(int argc, char** argv) {
       const std::string flag = argv[i];
       if (flag == "--store" && i + 1 < argc) {
         store = argv[++i];
+      } else {
+        std::cout << "unknown option: " << flag << "\n\n";
+        return usage();
+      }
+    }
+    return runVerify(argv[2], store);
+  }
+
   // `render` takes no printer, so it is dispatched before the endpoint is parsed.
   if (argc >= 2 && std::string(argv[1]) == "render") {
     RenderArgs args;
@@ -1155,7 +1163,6 @@ int main(int argc, char** argv) {
         return usage();
       }
     }
-    return runVerify(argv[2], store);
     if (args.template_path.empty()) {
       std::cout << "render requires --template\n\n";
       return usage();

@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "printerdriver/transport.hpp"
 
 // Winsock2 implementation of TcpTransport (docs/platforms.md, "Using the SDK from a
@@ -444,3 +445,5 @@ TransportFactory tcp(TcpConfig config) {
 }
 
 }  // namespace pd
+
+#endif  // _WIN32

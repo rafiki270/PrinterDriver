@@ -44,10 +44,8 @@ prints that report and a character approximation of the paper without touching a
 
 Not built yet: Bluetooth/USB/serial transports, the ePOS and StarPRNT transports (their
 profiles are data only — Star printers refuse honestly instead of printing unfenced),
-network discovery in the core, the DSL's raster path (wrapper-side text rendering and
-barcode symbologies), and the Windows port ([docs/platforms.md](docs/platforms.md)).
-network discovery in the core, and the receipt-DSL renderer
-([docs/receipt-dsl.md](docs/receipt-dsl.md) is specified).
+network discovery in the core, and the DSL's raster path (wrapper-side text rendering
+and barcode symbologies).
 
 The **Windows port** ([docs/platforms.md](docs/platforms.md)) is written but not built:
 the Winsock2 transport and the `FlushFileBuffers`/`ReplaceFile` journal path are

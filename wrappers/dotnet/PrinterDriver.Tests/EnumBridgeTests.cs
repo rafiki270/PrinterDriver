@@ -35,7 +35,7 @@ public sealed class EnumBridgeTests
     [
         new(BridgedEnum.JobState, 11, typeof(JobState), true),
         new(BridgedEnum.Confidence, 6, typeof(ConfidenceLevel), true),
-        new(BridgedEnum.DeviceEvent, 12, typeof(DeviceEvent), true),
+        new(BridgedEnum.DeviceEvent, 13, typeof(DeviceEvent), true),
         new(BridgedEnum.FailureReason, 11, typeof(FailureReason), true),
         new(BridgedEnum.JobOutcome, 3, typeof(JobOutcome), true),
         new(BridgedEnum.Cut, 4, typeof(CutSetting), false),
@@ -173,9 +173,9 @@ public sealed class AbiLayoutTests
     {
         Assert.Equal(32, Marshal.SizeOf<PdConfig>());          // ptr, int+pad, ptr, ptr
         Assert.Equal(40, Marshal.SizeOf<PdTcpConfig>());       // ptr, ptr, u16+pad, u32+pad, ptr, u32+pad
-        Assert.Equal(24, Marshal.SizeOf<PdJobOptions>());      // ptr, 4 x int
+        Assert.Equal(40, Marshal.SizeOf<PdJobOptions>());      // ptr, 7 x int, +pad
         Assert.Equal(24, Marshal.SizeOf<PdJobEvent>());        // 4 x int, u64
-        Assert.Equal(12, Marshal.SizeOf<PdJobResult>());       // 3 x int
+        Assert.Equal(32, Marshal.SizeOf<PdJobResult>());       // 5 x int, +pad, ptr
         Assert.Equal(36, Marshal.SizeOf<PdDeviceStatus>());    // 9 x int
         Assert.Equal(32, Marshal.SizeOf<PdRasterRgba8>());     // ptr, 3 x u32, int, u8+pad, u32
         Assert.Equal(24, Marshal.SizeOf<PdOp>());              // int+pad, ptr, int+pad
