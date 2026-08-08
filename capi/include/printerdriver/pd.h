@@ -162,8 +162,11 @@ typedef enum pd_payload_kind {
 typedef enum pd_completion_mechanism {
   PD_COMPLETION_GS_PAREN_H = 0,
   PD_COMPLETION_GS_R1 = 1,
-  PD_COMPLETION_NONE = 2,
-  PD_COMPLETION_COUNT = 3
+  PD_COMPLETION_VENDOR_IDLE = 2,
+  PD_COMPLETION_EPOS_JOB_ID = 3,
+  PD_COMPLETION_STAR_CHECKED_BLOCK = 4,
+  PD_COMPLETION_NONE = 5,
+  PD_COMPLETION_COUNT = 6
 } pd_completion_mechanism;
 
 /* pd::CutVariant — the cut a profile's mechanism actually performs. */

@@ -1313,7 +1313,7 @@ void PrinterRuntime::submitReserved(const std::shared_ptr<PrintJob>& job,
     return;
   }
   Task task;
-  task.run = [this, job, payload, options] { runJob(job, *payload, options, 1); };
+  task.run = [this, job, payload, options] { runJob(job, *payload, options, 1, false); };
   task.cancel = [this, job] {
     terminate(job, JobState::FailedKnown,
               JobResult::failed(FailureReason::Unknown, ConfidenceLevel::TransportAccepted));
