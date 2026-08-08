@@ -110,6 +110,10 @@ static_assert(PD_PAYLOAD_RAW == value_of(pd::PayloadKind::Raw));
 
 static_assert(PD_COMPLETION_GS_PAREN_H == value_of(pd::CompletionMechanism::GsParenH));
 static_assert(PD_COMPLETION_GS_R1 == value_of(pd::CompletionMechanism::GsR1));
+static_assert(PD_COMPLETION_VENDOR_IDLE == value_of(pd::CompletionMechanism::VendorIdle));
+static_assert(PD_COMPLETION_EPOS_JOB_ID == value_of(pd::CompletionMechanism::EposJobId));
+static_assert(PD_COMPLETION_STAR_CHECKED_BLOCK ==
+              value_of(pd::CompletionMechanism::StarCheckedBlock));
 static_assert(PD_COMPLETION_NONE == value_of(pd::CompletionMechanism::None));
 
 static_assert(PD_CUT_VARIANT_PARTIAL == value_of(pd::CutVariant::Partial));
@@ -170,7 +174,8 @@ const char* const kJobOutcomeNames[PD_OUTCOME_COUNT] = {"Done", "Failed", "Unkno
 
 const char* const kPayloadKindNames[PD_PAYLOAD_KIND_COUNT] = {"Raster", "Document", "Raw"};
 
-const char* const kCompletionNames[PD_COMPLETION_COUNT] = {"GsParenH", "GsR1", "None"};
+const char* const kCompletionNames[PD_COMPLETION_COUNT] = {
+    "GsParenH", "GsR1", "VendorIdle", "EposJobId", "StarCheckedBlock", "None"};
 
 const char* const kCutVariantNames[PD_CUT_VARIANT_COUNT] = {"Partial", "Full", "None"};
 
