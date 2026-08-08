@@ -282,8 +282,17 @@ enum CompletionMechanism {
   /// Queued `GS r 1`: an ordered device response, not a job-level one.
   gsR1(1),
 
+  /// Vendor "working state"/idle query; profile data only.
+  vendorIdle(2),
+
+  /// ePOS JobID + queryable print result; profile data only.
+  eposJobId(3),
+
+  /// StarPRNT begin/endCheckedBlock; profile data only.
+  starCheckedBlock(4),
+
   /// Write-only. Nothing above [ConfidenceLevel.transportAccepted] is claimable.
-  none(2),
+  none(5),
 
   /// A `pd_completion_mechanism` this build does not know.
   unrecognized(-1);
@@ -293,7 +302,7 @@ enum CompletionMechanism {
   final int nativeValue;
 
   /// Mirrors `PD_COMPLETION_COUNT`.
-  static const int nativeCount = 3;
+  static const int nativeCount = 6;
 
   static CompletionMechanism fromNative(int value) {
     for (final member in values) {
