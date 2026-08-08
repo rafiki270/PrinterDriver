@@ -44,6 +44,38 @@ PD_TEST(job_outcome_names_are_unique_and_complete) {
   checkNamesUniqueAndNonEmpty(kAllJobOutcomes);
 }
 
+PD_TEST(confidence_grade_and_authority_names_are_unique_and_complete) {
+  checkNamesUniqueAndNonEmpty(kAllConfidenceGrades);
+  checkNamesUniqueAndNonEmpty(kAllCompletionAuthorities);
+  CHECK_EQ(std::string(to_string(ConfidenceGrade::A_JobLevelConfirmation)),
+           std::string("A_JobLevelConfirmation"));
+  CHECK_EQ(std::string(to_string(CompletionAuthority::PhysicalPrinter)),
+           std::string("PhysicalPrinter"));
+  std::set<std::string> letters;
+  for (const ConfidenceGrade grade : kAllConfidenceGrades) {
+    CHECK(letters.insert(gradeLetter(grade)).second);
+  }
+  CHECK_EQ(letters.size(), static_cast<size_t>(5));
+}
+
+PD_TEST(job_result_carries_grade_authority_and_method) {
+  // docs/device-database.md: every result says what kind of evidence it rests on and
+  // who produced it, never a bare success flag.
+  const JobResult bare = JobResult::done(ConfidenceLevel::CutFaultFree);
+  CHECK_EQ(bare.grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(bare.authority, CompletionAuthority::TransportOnly);
+  CHECK_EQ(bare.method, std::string("none"));
+
+  const JobResult graded = JobResult::done(ConfidenceLevel::CutFaultFree)
+                               .with(JobEvidence{ConfidenceGrade::A_JobLevelConfirmation,
+                                                 CompletionAuthority::PhysicalPrinter,
+                                                 "GS(H) fn48"});
+  CHECK_EQ(graded.outcome, JobOutcome::Done);
+  CHECK_EQ(graded.grade, ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK_EQ(graded.authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(graded.method, std::string("GS(H) fn48"));
+}
+
 PD_TEST(queue_addon_reservations_are_present) {
   // docs/sdk-spec.md §12: the core never produces these, but every wrapper must
   // ship them so the addon needs no enum change later.
