@@ -363,3 +363,22 @@ PD_TEST(profiles_without_a_feature_declare_the_omission) {
   CHECK_EQ(output.report.count(ReportKind::UnsupportedBlock), static_cast<size_t>(4));
   CHECK(output.bytes().empty());
 }
+
+PD_TEST(render_clamps_absurd_feed_dots_and_declares_it) {
+  // kimix adversarial-review finding: {"feed":{"dots":INT32_MAX}} made the text
+  // preview allocate ~90 million lines. The layout clamp bounds both paths.
+  const char* doc_json = R"({"v":1,"blocks":[{"text":"x"},{"feed":{"dots":2147483647}}]})";
+  pd::dsl::Document doc = pd::dsl::parseDocument(pd::dsl::parseJson(doc_json));
+  pd::dsl::RenderOptions options;
+  pd::dsl::RenderOutput out = pd::dsl::render(doc, options);
+  bool declared = false;
+  for (const auto& entry : out.report.entries) {
+    if (entry.requested.find("feed of 2147483647") != std::string::npos) {
+      declared = true;
+      CHECK_EQ(entry.delivered, std::string("clamped to 65535"));
+    }
+  }
+  CHECK(declared);
+  const std::string preview = pd::dsl::renderText(doc, options).text();
+  CHECK(preview.size() < 1000000);  // bounded, not ~90M lines
+}

@@ -226,7 +226,17 @@ class Layout {
         op.kind = LayoutOp::Kind::Feed;
         op.source = where;
         if (block.feed_dots.has_value()) {
-          op.feed_dots = static_cast<uint32_t>(std::max(0, *block.feed_dots));
+          // 0xFFFF dots (~8 m of paper at 203 dpi) matches the emission clamp; without
+          // it a single literal like {"feed":{"dots":2147483647}} makes the text
+          // preview allocate ~90 million lines.
+          const int requested = std::max(0, *block.feed_dots);
+          op.feed_dots = static_cast<uint32_t>(std::min(requested, 0xFFFF));
+          if (requested > 0xFFFF) {
+            out_->report.add(ReportKind::MalformedTemplate, where,
+                             "feed of " + std::to_string(requested) + " dots",
+                             "clamped to 65535", RenderPath::Hardware,
+                             "beyond any physical roll");
+          }
         } else {
           op.feed_lines = static_cast<uint32_t>(std::clamp(block.feed_lines, 0, 255));
         }

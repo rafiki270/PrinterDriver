@@ -114,13 +114,33 @@ std::string loadOrCreateNonce(const std::string& directory) {
     }
   }
   const std::string nonce = randomNonce();
-  std::ofstream output(path, std::ios::trunc);
-  if (output) {
+  // Temp-file + rename, like the journal's compact(): a crash mid-write can no longer
+  // leave a partial nonce that silently rotates the instance identity on next boot,
+  // orphaning every V: token already on paper.
+  const std::string temp = path + ".tmp";
+  {
+    std::ofstream output(temp, std::ios::trunc);
+    if (!output) {
+      // A directory that cannot be written still gets a working driver: the tokens
+      // simply stop being resolvable across a restart — a diagnostic loss, not a
+      // printing one.
+      return nonce;
+    }
     output << nonce << "\n";
   }
-  // A directory that cannot be written still gets a working driver: the tokens simply
-  // stop being resolvable across a restart, which is a diagnostic loss and not a
-  // printing one.
+  std::rename(temp.c_str(), path.c_str());
+  // Two constructors racing on one store directory (out of contract — the journal has
+  // a single owner, docs/sdk-spec.md §14 — but cheap to soften): re-read after the
+  // rename so both racers converge on whichever write landed, instead of each keeping
+  // a private nonce and flagging the other's echoes as a foreign writer.
+  {
+    std::ifstream reread(path);
+    std::string stored;
+    if (reread && std::getline(reread, stored) && stored.size() == 2 &&
+        isTokenAlphabet(stored[0]) && isTokenAlphabet(stored[1])) {
+      return stored;
+    }
+  }
   return nonce;
 }
 

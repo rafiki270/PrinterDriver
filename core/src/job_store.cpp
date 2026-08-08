@@ -230,7 +230,13 @@ std::optional<JournalEntry> parseLine(const std::string& line) {
         parseEnum(fields[7], kAllCompletionAuthorities, entry.record.authority);
     if (has_evidence) {
       entry.record.method = unescapeField(fields[8]);
-    } else if (atLeastPrintConfirmed(entry.record.confidence)) {
+    } else if (atLeastPrintConfirmed(entry.record.confidence) &&
+               (entry.record.state == JobState::DoneSoftware ||
+                entry.record.state == JobState::PhysicallyVerified)) {
+      // Only a state that actually completed may claim device authority. A legacy
+      // FailedKnown/Unknown line keeps the E/TransportOnly default no matter how far
+      // its confidence climbed — grade B on a failure would be the operator-facing
+      // overclaim the grade system exists to prevent.
       entry.record.grade = ConfidenceGrade::B_OrderedDeviceResponse;
       entry.record.authority = CompletionAuthority::PhysicalPrinter;
       entry.record.method = "journal-legacy";

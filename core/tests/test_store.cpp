@@ -198,6 +198,8 @@ PD_TEST(store_derives_conservative_evidence_for_legacy_journal_lines) {
     out << "S\tjob-strong\tDoneSoftware\tCutProcessed\tNone\t1000\n";
     out << "J\tjob-weak\torder-weak\tprinter-1\t1000\t1\tRaw\t10\n";
     out << "S\tjob-weak\tFailedKnown\tTransportAccepted\tTransportUnreachable\t1000\n";
+    out << "J\tjob-failed-late\torder-failed-late\tprinter-1\t1000\t1\tRaw\t10\n";
+    out << "S\tjob-failed-late\tFailedKnown\tPrintConfirmed\tCutterFault\t1000\n";
   }
   JobStore store(StorageConfig::at(dir.path()));
 
@@ -215,6 +217,16 @@ PD_TEST(store_derives_conservative_evidence_for_legacy_journal_lines) {
   CHECK_EQ(weak->grade, ConfidenceGrade::E_TransportOnly);
   CHECK_EQ(weak->authority, CompletionAuthority::TransportOnly);
   CHECK_EQ(weak->method, std::string("none"));
+
+  // A failure whose confidence climbed to PrintConfirmed before it failed must NOT be
+  // upgraded: grade B with PhysicalPrinter authority on a FailedKnown line would be an
+  // operator-facing overclaim. Only completed states earn the legacy derivation.
+  const auto failed_late = store.findByKey("order-failed-late");
+  CHECK(failed_late.has_value());
+  CHECK_EQ(failed_late->state, JobState::FailedKnown);
+  CHECK_EQ(failed_late->grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(failed_late->authority, CompletionAuthority::TransportOnly);
+  CHECK_EQ(failed_late->method, std::string("none"));
 }
 
 PD_TEST(store_roundtrips_verification_tokens_through_compaction) {
