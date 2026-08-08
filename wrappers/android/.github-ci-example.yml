@@ -1,0 +1,132 @@
+# Template GitHub Actions workflow for wrappers/android.
+#
+# This file intentionally lives at wrappers/android/.github-ci-example.yml, NOT under
+# .github/workflows/ -- per this scaffold's brief, it is a template, inert until a
+# maintainer reviews it and copies it into the repo's real workflow directory. See
+# README.md "Continuous integration" for activation steps.
+#
+# UNVERIFIED: never run. Written against action versions and SDK/NDK/CMake component
+# versions believed current and mutually compatible at authoring time; review and bump
+# before activating (see README.md "Verification status" for the full list of what
+# activating this workflow would need to confirm for the first time).
+#
+# What it does:
+#   1. build   -- compiles the Kotlin + JNI/CMake native library and assembles the AAR
+#                 for all four ABIs (arm64-v8a, armeabi-v7a, x86_64, x86).
+#   2. test    -- runs ONLY the JVM-side unit test layer (src/test/kotlin), which is
+#                 instrumented-free: no emulator/device involved. It deliberately does
+#                 NOT run connectedAndroidTest -- there is no src/androidTest in this
+#                 scaffold, and adding one (plus the emulator matrix to run it) is out
+#                 of scope here.
+#   3. publish -- gated off (`if: false`) until signing is wired up; see
+#                 build.gradle.kts "Signing".
+
+name: android-wrapper-ci-example
+
+on:
+  workflow_dispatch:
+  # Uncomment once this file is copied to .github/workflows/:
+  # push:
+  #   branches: [main]
+  #   paths: ["wrappers/android/**", "core/**", "capi/**"]
+  # pull_request:
+  #   paths: ["wrappers/android/**", "core/**", "capi/**"]
+
+defaults:
+  run:
+    working-directory: wrappers/android
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK cmdline-tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake packages
+        run: sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Provision Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+          # This scaffold does not commit a gradlew wrapper (jar/scripts) -- see
+          # README.md "Repository layout" for why -- so this action provisions Gradle
+          # directly via `gradle-version` instead of `./gradlew`. Once a maintainer has
+          # run `gradle wrapper --gradle-version 8.7` once and committed the result,
+          # switch every `gradle` invocation below to `./gradlew` and drop this input
+          # (setup-gradle then reads the wrapper's own pinned version instead).
+
+      - name: Assemble AAR (all ABIs)
+        run: gradle assembleRelease --stacktrace
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: printerdriver-release-aar
+          path: wrappers/android/build/outputs/aar/*.aar
+          if-no-files-found: error
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - name: JVM-side unit tests (instrumented-free)
+        run: gradle testDebugUnitTest --stacktrace
+        # src/test/kotlin only exercises pure-Kotlin logic (enum <-> raw-int mapping,
+        # JobResult.fromRaw, DeviceStatus tri-state decoding) that never calls
+        # System.loadLibrary, so this needs no native .so and no device/emulator.
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: wrappers/android/build/reports/tests/testDebugUnitTest/
+
+  publish:
+    needs: [build, test]
+    if: false # TODO: flip on (or gate on a tag/release event) once signing is wired up.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - name: Publish to GitHub Packages
+        run: gradle publish --stacktrace
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # TODO (see build.gradle.kts "Signing"): Maven Central additionally requires
+          # a GPG signature on every artifact (GitHub Packages does not). Provide, as
+          # repository secrets, then uncomment the `signing` block in build.gradle.kts:
+          #   ORG_GRADLE_PROJECT_signingKey       (armored private key)
+          #   ORG_GRADLE_PROJECT_signingPassword  (its passphrase)

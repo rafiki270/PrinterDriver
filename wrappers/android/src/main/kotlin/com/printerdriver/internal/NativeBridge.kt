@@ -1,0 +1,176 @@
+package com.printerdriver.internal
+
+/**
+ * The entire JNI surface, in one place. Every function here is a thin, mechanical
+ * crossing into src/main/cpp/printerdriver_jni.cpp -- no decisions get made on this
+ * side of the boundary, only marshaling (see Enums.kt's file-level note and
+ * Payload.kt's header comment for what "mechanical" means here). Public Kotlin API
+ * types (PrinterDriver, Printer, PrintJob, the sealed Payload/JobResult, the mirrored
+ * enums) are the only supported way to reach these; app code should never call
+ * NativeBridge directly.
+ *
+ * Handles: pd_driver*/pd_printer*/pd_job* cross the JNI boundary as `Long` (a raw
+ * pointer value reinterpret_cast to jlong on the native side -- see AsDriverHandle/
+ * AsPrinter/AsJob in printerdriver_jni.cpp). 0L is the failure/not-found sentinel
+ * everywhere a function can legitimately return "no handle" (mirroring pd.h's own
+ * NULL-on-failure convention); it is never a valid handle.
+ *
+ * Visibility: this object is `internal`, but its individual members are deliberately
+ * left at default (public) visibility -- see NativeCallbacks.kt's header comment for
+ * why (Kotlin's `internal`-function name mangling would break the
+ * Java_com_printerdriver_internal_NativeBridge_<name> symbol match). `@JvmStatic` is
+ * required on every entry so each compiles to a real `static native` JVM method
+ * (JNI: `(JNIEnv*, jclass, ...)`) rather than an instance method requiring the
+ * object's singleton `this` (JNI: `(JNIEnv*, jobject, ...)`); the native
+ * implementations are written for the static form.
+ */
+internal object NativeBridge {
+    init {
+        System.loadLibrary("printerdriver_jni")
+    }
+
+    // --- Driver (pd_create / pd_destroy / pd_last_error / pd_profile_ids) ----------
+
+    /** Returns 0L on failure (see PrinterDriverException's docs for why pd_create
+     *  alone cannot carry a message). [logCallback] may be null. */
+    @JvmStatic external fun driverCreate(storageDirectory: String?, fsyncDisabled: Boolean, logCallback: NativeLogCallback?): Long
+
+    /** Idempotent no-op on an already-destroyed/0L handle, matching pd_destroy(NULL). */
+    @JvmStatic external fun driverDestroy(driverHandle: Long)
+
+    @JvmStatic external fun driverLastError(driverHandle: Long): String
+
+    @JvmStatic external fun profileIds(): Array<String>
+
+    // --- Printers (pd_add_printer_tcp and friends) -----------------------------------
+
+    /** Returns 0L on failure (bad host, unknown profile id) -- check driverLastError. */
+    @JvmStatic external fun addPrinterTcp(
+        driverHandle: Long,
+        printerId: String?,
+        host: String,
+        port: Int,
+        widthDots: Int,
+        profileId: String?,
+        connectTimeoutMs: Int
+    ): Long
+
+    @JvmStatic external fun printerId(printerHandle: Long): String
+    @JvmStatic external fun printerWidthDots(printerHandle: Long): Int
+    @JvmStatic external fun printerCompletionMechanism(printerHandle: Long): Int
+
+    /** Returns the 9 pd_device_status fields packed as
+     *  [connected, observed, online, coverOpen, paperOut, paperNearEnd, cutterError,
+     *  unrecoverableError, recoverableError] -- see DeviceStatus.fromRaw. Never blocks
+     *  (pd_printer_status is a snapshot read). */
+    @JvmStatic external fun printerStatus(driverHandle: Long, printerHandle: Long): IntArray
+
+    /** Same packing as [printerStatus]. Blocks behind any active job -- call from a
+     *  background dispatcher (Printer.refreshStatus already does). */
+    @JvmStatic external fun printerRefreshStatus(driverHandle: Long, printerHandle: Long, timeoutMs: Int): IntArray
+
+    @JvmStatic external fun openCashDrawer(driverHandle: Long, printerHandle: Long)
+
+    /** Blocks until the printer's queue is empty and its active job is terminal. */
+    @JvmStatic external fun printerDrain(driverHandle: Long, printerHandle: Long)
+
+    /** Registers [callback] for the life of the driver -- there is no
+     *  pd_unsubscribe_device in the C ABI. See README.md "Threading contract". */
+    @JvmStatic external fun subscribeDevice(driverHandle: Long, printerHandle: Long, callback: NativeDeviceEventCallback)
+
+    // --- Jobs: submit (pd_print, one native entry point per payload tier) -----------
+    //
+    // Three entry points instead of one generic `print(payload: Any)` so the native
+    // side never has to reflect Kotlin object fields back out through JNI -- callers
+    // (Printer.print) flatten the sealed Payload into primitives/arrays first. Options
+    // are passed as their five primitive fields rather than a JobOptions object for
+    // the same reason.
+
+    /** Returns 0L on failure (malformed payload / handle mismatch) -- check
+     *  driverLastError. [strideBytes] 0 means tightly packed; [threshold] 0 and
+     *  [maxRowsPerBand] 0 mean "use the core's default", matching pd_raster_rgba8. */
+    @JvmStatic external fun printRaster(
+        driverHandle: Long,
+        printerHandle: Long,
+        pixels: ByteArray,
+        width: Int,
+        height: Int,
+        strideBytes: Int,
+        binarization: Int,
+        threshold: Int,
+        maxRowsPerBand: Int,
+        key: String?,
+        cut: Int,
+        openDrawer: Boolean,
+        preflight: Int,
+        timeoutMs: Int
+    ): Long
+
+    /** [opKinds]/[opTexts]/[opValues] are parallel arrays, one entry per pd_op (raw
+     *  pd_op_kind, nullable text, value) -- see Printer.print's flattening of
+     *  List<DocumentOp>. Returns 0L on failure. */
+    @JvmStatic external fun printDocument(
+        driverHandle: Long,
+        printerHandle: Long,
+        opKinds: IntArray,
+        opTexts: Array<String?>,
+        opValues: IntArray,
+        codePage: Int,
+        key: String?,
+        cut: Int,
+        openDrawer: Boolean,
+        preflight: Int,
+        timeoutMs: Int
+    ): Long
+
+    /** Returns 0L on failure. */
+    @JvmStatic external fun printRaw(
+        driverHandle: Long,
+        printerHandle: Long,
+        bytes: ByteArray,
+        key: String?,
+        cut: Int,
+        openDrawer: Boolean,
+        preflight: Int,
+        timeoutMs: Int
+    ): Long
+
+    /** Returns 0L when [key] is unknown, or when its job was reconstructed from the
+     *  journal (pd.h: "those records carry what happened to a job, never what it
+     *  contained") -- both routine, both handled by Printer.forceReprint returning
+     *  `null` rather than throwing. */
+    @JvmStatic external fun forceReprint(
+        driverHandle: Long,
+        printerHandle: Long,
+        key: String,
+        cut: Int,
+        openDrawer: Boolean,
+        preflight: Int,
+        timeoutMs: Int
+    ): Long
+
+    /** Returns 0L when [key] is unknown. */
+    @JvmStatic external fun findJob(driverHandle: Long, key: String): Long
+
+    // --- Jobs: accessors (none of these take a driver handle -- pd.h doesn't either) -
+
+    @JvmStatic external fun jobId(jobHandle: Long): String
+    @JvmStatic external fun jobKey(jobHandle: Long): String
+    @JvmStatic external fun jobAttempt(jobHandle: Long): Int
+    @JvmStatic external fun jobCurrentState(jobHandle: Long): Int
+    @JvmStatic external fun jobConfidence(jobHandle: Long): Int
+    @JvmStatic external fun jobIsTerminal(jobHandle: Long): Boolean
+
+    /** Replays every event recorded so far synchronously on the calling thread, then
+     *  streams the rest on the printer's worker thread (pd_subscribe_job's documented
+     *  contract, unchanged here) -- see README.md "Threading contract". Registers
+     *  [callback] for the life of the driver; there is no pd_unsubscribe_job. */
+    @JvmStatic external fun subscribeJob(driverHandle: Long, jobHandle: Long, callback: NativeJobEventCallback)
+
+    /** Returns null on timeout (mirrors pd_job_await returning 0 / leaving `out`
+     *  untouched); otherwise the 3 pd_job_result fields packed as
+     *  [outcome, confidence, reason] -- see JobResult.fromRaw. [timeoutMs] 0 waits
+     *  indefinitely; PrintJob.result() never passes 0 directly (it polls with a bounded
+     *  interval instead, for coroutine-cancellation responsiveness -- see PrintJob.kt). */
+    @JvmStatic external fun jobAwait(driverHandle: Long, jobHandle: Long, timeoutMs: Int): IntArray?
+}
