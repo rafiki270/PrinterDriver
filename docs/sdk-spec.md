@@ -212,6 +212,7 @@ the XP-S260M. Filled from a scan of the existing POS monorepo run 2026-08-08:
 | **Rongta ESC/POS models** | ESC/POS over TCP 9100 | Known quirk: cuts too early — today compensated by hardcoding 6 newlines before the cut (`canvasToEscposCommands.ts`); CP852 code page. Exactly what capability profiles (§8) exist for. |
 | **Generic ESC/POS thermal printers** | ESC/POS over TCP 9100 | The DB `PrinterType` enum is just `escpos` \| `epos`, with `escpos` the default — the fleet is generic-ESC/POS-shaped. |
 | **Xprinter XP-S260M** | ESC/POS over TCP 9100 (also serial/USB) | Partial cutter, 128 KB buffer. Research subject of [techspec.md](techspec.md). **Capability probe run 2026-08-08 (our unit, `192.168.1.101`, LAN): `GS ( H` process-ID completion SUPPORTED; `DLE EOT` and `GS r 1` also respond — primary completion path is `GS ( H`** ([testing-plan.md](testing-plan.md#-result-our-xp-s260m-unit--tested-2026-08-08)). |
+| **Partner Tech RP-110** (Sewoo-designed) | ESC/POS (USB/serial/LAN variants) | Deployed with our native POS suite (photo-identified unit, 24 V thermal receipt printer, Partner Tech Europe import). ESC/POS-compatible per vendor; completion-mechanism probe pending — run `scripts/printer_probe.py` against it. |
 
 Paper widths in use today: 384 / 504 / 576 dots per line (58 mm and 80 mm papers at
 203 dpi / 8 dots-per-mm).
