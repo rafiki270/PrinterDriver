@@ -1,0 +1,17 @@
+name: printerdriver
+version: 0.1.0
+description: >-
+  Dart FFI bindings for the PrinterDriver receipt-printing SDK: ordered completion
+  fences, an honest tri-state job result and a per-printer device event stream over the
+  portable C++ core.
+repository: https://github.com/rafiki270/PrinterDriver
+issue_tracker: https://github.com/rafiki270/PrinterDriver/issues
+
+environment:
+  sdk: ^3.4.0
+
+# No runtime dependencies on purpose. dart:ffi is enough for the whole binding, and a
+# package that a POS app links into its printing path should not drag a transitive tree
+# behind it. The native library is supplied by the application (see README).
+dev_dependencies:
+  test: ^1.25.0
