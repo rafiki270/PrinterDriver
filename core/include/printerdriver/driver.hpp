@@ -31,6 +31,10 @@ struct DriverEventHub;
 struct JobIndex;
 }  // namespace detail
 
+// The print-queue addon (docs/sdk-spec.md §12). Declared here only so it can drive a
+// PrintJob it reserved; it lives in its own library and the core never calls it.
+class PrintQueue;
+
 // --- Payload tiers (docs/api.md §3) ---------------------------------------------
 
 // Tier 1. 8-bit grayscale, row-major, no padding; 0 = black. The core scales to the
@@ -133,6 +137,10 @@ class PrintJob {
   friend class detail::PrinterRuntime;
   friend class PrinterDriver;
   friend class Printer;
+  // The queue addon publishes HeldOffline, and terminates jobs that expire or overflow
+  // before they ever reach a worker (docs/sdk-spec.md §12). Both are transitions on a
+  // job the engine has not started, which is exactly why they cannot come from it.
+  friend class PrintQueue;
 
   PrintJob(std::string id, std::string key, std::string printer_id, uint32_t attempt);
 
@@ -199,6 +207,26 @@ class Printer {
 
   // Blocks until the queue is empty and the active job is terminal.
   void drain();
+
+  // --- Print-queue addon hooks (docs/sdk-spec.md §12) ------------------------------
+  //
+  // An addon that holds jobs has to hand its caller an ordinary PrintJob while the
+  // bytes are still parked, then send that same job later — one handle, one id, one
+  // journal record, one event stream. These two calls are the whole mechanism.
+  //
+  // reserveJob() mints the job and claims the idempotency key in the driver's index,
+  // so a key waiting in a queue already dedupes against a direct print() and shows up
+  // in PrinterDriver::findJob. It returns the existing job (with *created false) when
+  // the key is already known, which is how docs/sdk-spec.md §12 rule 2 falls out.
+  //
+  // submitReserved() runs a reserved job down the identical path print() uses: same
+  // worker thread, same preflight, same fences, same confidence grading. There is no
+  // second engine and no bypass (§12 rule 3) — the only difference from print() is
+  // that the handle already exists and the caller already published states on it.
+  std::shared_ptr<PrintJob> reserveJob(const std::string& key, PayloadKind kind,
+                                       uint64_t payload_bytes, bool* created);
+  void submitReserved(const std::shared_ptr<PrintJob>& job, Payload payload,
+                      const JobOptions& options);
 
  private:
   friend class PrinterDriver;
