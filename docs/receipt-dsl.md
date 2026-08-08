@@ -186,3 +186,24 @@ The trailing cut is on by default and controllable at three levels — most spec
 `{ "cut": "partial" }` blocks mid-document still work independently (multi-ticket
 documents). `cut:none` ends the job after the final feed; completion fencing is
 unaffected (the fence never depended on cutting — see techspec §5.3).
+
+## Margins: whitespace before and after the print
+
+Blank paper around the content is a first-class setting, with the same three-level
+precedence as cut control (caller > document meta > profile):
+
+```json
+"meta": { "margins": { "topDots": 40, "bottomDots": 160 } }
+```
+
+- **Top margin** (`topDots` / `topMm`): fed before the first content line — tear-off
+  clearance, presentation space. Default 0.
+- **Bottom margin** (`bottomDots` / `bottomMm`): the *total* visible whitespace between
+  the last content and the cut. Contract: the engine feeds
+  `max(head_to_cutter_feed_dots, bottomDots)` — you can always ask for more space than
+  the hardware minimum, never less; the blade-clearance floor
+  ([capability profile media](capability-profiles.md)) is unconditional, so no margin
+  setting can ever reintroduce the clipped-QR defect.
+- `mm` variants convert via the profile's dpi (203 dpi ⇒ 8 dots/mm).
+- Per-call override: `JobOptions.topFeedDots` / `JobOptions.bottomFeedDots` win over
+  document meta.
