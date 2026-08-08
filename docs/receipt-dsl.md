@@ -141,3 +141,35 @@ let job = printer.send(kitchen, model: order.printModel,  // Encodable → JSON
 
 Templates live wherever the app wants — bundled, fetched from a backend, cached by the
 agent — and bind identically on every platform because binding happens in the core.
+
+## Repeating groups (multi-line, nested) and value formatters
+
+`each` repeats a **block list**, not just one block — so a line item can be a full
+group: title, subtitle, modifier lines, amount×price row. Groups nest (modifiers under
+items):
+
+```json
+{ "each": "order.items", "blocks": [
+    { "text": "{{title}}", "style": "itemTitle" },
+    { "if": "subtitle", "block": { "text": "{{subtitle}}", "style": "muted" } },
+    { "each": "modifiers", "blocks": [ { "text": "  + {{name}}", "style": "muted" } ] },
+    { "columns": [ { "content": "{{qty}} × {{unitPrice|number:2}}", "width": "flex" },
+                   { "content": "{{total|money}}", "width": { "chars": 10 }, "align": "right" } ] },
+    { "feed": 1 } ] }
+```
+
+**Formatters** — declarative filters after `|`, still logic-less; locale/currency come
+from document meta (`"meta": { "locale": "cs-CZ", "currency": "CZK", "tz": "Europe/Prague" }`)
+with per-use override:
+
+```
+{{v|number:2}}          1234.5 → "1 234,50"  (locale grouping/decimal)
+{{v|money}}             → "1 234,50 Kč"      ({{v|money:EUR}} to override)
+{{v|date:short}}        ISO input → "08/08/2026"  (named: short|medium|long|time|datetime)
+{{v|date:HH:mm}}        pattern form
+{{v|pad:8:right}}       fixed-width padding   {{v|upper}} {{v|lower}} {{v|trunc:20}}
+```
+
+Inputs stay plain JSON (numbers, ISO-8601 strings); formatting happens in the core at
+bind time so every platform renders identically. Unknown formatter or unformattable
+value → declared render-report warning + raw value printed, never a crash.
