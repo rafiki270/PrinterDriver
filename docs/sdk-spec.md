@@ -32,9 +32,10 @@ A **native printing SDK for iOS and Android with a shared C++ core**.
   parsing, job state machine, retry/duplicate policy. One implementation means **one
   point of possible failure**: one place bugs can exist, one place to fix them, identical
   behavior on every platform.
-- **Platform wrappers are thin bindings, not implementations.** iOS (Swift) and Android
-  (Kotlin) first; wrappers for any other system later (React Native, Flutter, .NET,
-  Node, plain C ABI). A wrapper that contains logic is a bug.
+- **Platform wrappers are thin bindings, not implementations.** First wave: iOS (Swift),
+  Android (Kotlin), and **Flutter (Dart FFI)** — one of our POS apps is Flutter, so Dart
+  is a launch consumer, not a "later" (§10). Wrappers for any other system later
+  (React Native, .NET, Node, plain C ABI). A wrapper that contains logic is a bug.
 - The same core should be reusable for a Linux/Raspberry Pi printer agent
   (see [techspec.md §5](techspec.md#5-recommended-architecture)) — that's the payoff of
   putting everything in portable C++.
@@ -68,9 +69,8 @@ A **native printing SDK for iOS and Android with a shared C++ core**.
 ```
 ┌────────────────────────────────────────────────────────┐
 │                    Platform wrappers                   │
-│  iOS (Swift)   Android (Kotlin/JNI)   later: RN,       │
-│                                       Flutter, .NET,   │
-│                                       Node, C ABI      │
+│  iOS (Swift)  Android (Kotlin/JNI)  Flutter (Dart FFI) │
+│                          later: RN, .NET, Node, C ABI  │
 │  — thin bindings only, zero printing logic —           │
 ├────────────────────────────────────────────────────────┤
 │                      C++ core                          │
@@ -215,7 +215,9 @@ the XP-S260M. Filled from a scan of the existing POS monorepo run 2026-08-08:
 | **Partner Tech RP-110** (Sewoo-designed) | ESC/POS (USB/serial/LAN variants) | Deployed with our native POS suite (photo-identified unit, 24 V thermal receipt printer, Partner Tech Europe import). ESC/POS-compatible per vendor; completion-mechanism probe pending — run `scripts/printer_probe.py` against it. |
 
 Paper widths in use today: 384 / 504 / 576 dots per line (58 mm and 80 mm papers at
-203 dpi / 8 dots-per-mm).
+203 dpi / 8 dots-per-mm). The native POS suite additionally prints in **text mode** with
+configurable 32 / 40 / 42 / 48 characters per line — the document tier must handle
+character-based widths as well as dot widths.
 
 ## 10. Current state in the existing POS stack (what the SDK replaces)
 
@@ -274,6 +276,35 @@ duplicate. The ePOS path parses `success="true"` from the XML; no retry on parse
   (receiptPrinter / ticketPrinters / customerPagerPrinter / paymentAndClosurePrinter).
   The SDK prints jobs; which printer gets which document type remains the app's decision.
 
+### 10.1 The second consumer: the native POS suite (scanned 2026-08-08)
+
+A Flutter POS app with a Node.js backend; printer configs are served per-device by the
+backend (`API/src/routes/printers.js`) and cached in an encrypted local store for
+offline use. Printing is a from-scratch in-house Dart stack under
+`lib/services/printing/`:
+
+- **Text-mode ESC/POS, not raster.** Receipts and kitchen tickets are rendered by text
+  templates into an ESC/POS command builder (`esc_pos/commands.dart`), with a custom
+  UTF-16 → CP852 transliteration codec for Czech/Hungarian/Polish and a lossy fallback
+  for unmapped glyphs (`esc_pos/codec.dart`). This makes the **document tier** the
+  drop-in path here — the raster tier is the web POS's.
+- **Transport:** TCP 9100 only, `TCP_NODELAY` on, timeouts connect 2 s / write 3 s /
+  close 5 s, private IPv4 ranges only. Per-endpoint job serialization is already
+  enforced (matches the core's one-active-job rule).
+- **Feedback: none.** Fire-and-forget after socket flush. Its retry discipline is
+  notable: failures *before* flush retry 3× with 500 ms backoff; failures *after* flush
+  are logged but deliberately never retried, to avoid double prints. That is the right
+  instinct — the SDK formalizes exactly this distinction as `FailedKnown` (never sent,
+  safe to retry) vs `Unknown` (sent, operator decides).
+- **Discovery:** Android-only native subnet detection (reads the OS route table),
+  currently /24 only with a planned range expansion; **no iOS equivalent exists**.
+- **Pain points in its own backlog:** no queue-to-disk fallback while a printer is
+  offline (→ §12), sluggish-feeling connect timeouts, discovery range limits.
+
+Adoption shape: replace `thermal_printer_client.dart` and the ESC/POS byte building with
+the Dart wrapper (document tier; CP852 via capability profiles); the coordinator's
+kitchen/receipt role routing stays app-side, unchanged.
+
 ## 11. Open questions
 
 1. **iOS binding mechanism** — direct Swift/C++ interop (Xcode 15+) vs. an Objective-C++
@@ -281,7 +312,9 @@ duplicate. The ePOS path parses `success="true"` from the XML; no retry on parse
 2. **Android binding** — hand-rolled JNI vs. generated bindings (djinni-style). Decide
    after the API surface stabilizes.
 3. **Discovery** (mDNS/network scan/BT scan) — in core or per-platform? Leaning core for
-   LAN discovery, platform-assisted for Bluetooth.
+   LAN discovery, platform-assisted for Bluetooth. Demand is real on both sides: the web
+   POS's scanner is a stub returning fake devices, and the native suite has Android-only
+   /24 scanning with no iOS equivalent.
 4. **Persistence backend** for the job store on mobile (SQLite in core vs. host-provided
    storage callback).
 5. **Whether the Linux/RPi agent ships from this repo** using the same core (probable
@@ -290,7 +323,53 @@ duplicate. The ePOS path parses `success="true"` from the XML; no retry on parse
    (SOAP/HTTP) today. Does v1 include an ePOS transport in the core, or are those
    printers driven through their ESC/POS mode instead (most Epson TM models speak both)?
 
-## 12. Non-goals (for v1)
+## 12. Print-queue addon (planned)
+
+Decision 2026-08-08: a print queue is worth building — **as an optional addon layered on
+the core, never as core behavior.** The core already contains the only queue that
+correctness requires: one active job per printer with completion fences between jobs
+(§4); that part is not optional and not policy. Everything beyond it — holding, draining,
+expiry, priority — is policy that differs per app, which is exactly what an addon is
+for. Demand already exists: the native suite's own backlog lists the missing
+queue-to-disk fallback for offline printers (§10.1).
+
+What the addon adds:
+
+- **Store-and-forward.** Accept jobs while a printer is offline/out of paper, persist
+  them, drain automatically on recovery (driven by the core's `DeviceEvent` stream).
+- **TTL / staleness per job.** A held kitchen ticket has a shelf life; on expiry the job
+  fails as `Expired` and notifies — it must never print into a recovered kitchen half an
+  hour late. Default TTLs per document class (kitchen short, closing summaries long).
+- **Priority** within the waiting set only — in-flight jobs are never preempted
+  (fencing forbids it).
+- **Pause/resume, inspection, depth limits** with loud backpressure: refusing at depth N
+  beats silently accumulating tickets toward a dead printer — that is the printer's
+  128 KB buffer problem recreated one layer up.
+- **One feedback surface.** Queue-held jobs are ordinary `PrintJob`s in pre-send states:
+  `JobState` gains `HeldOffline`, `FailureReason` gains `Expired` and `QueueOverflow` —
+  closed enums, regenerated into every wrapper as usual (§5).
+
+Safety rules, inherited from §5/§6 and non-negotiable:
+
+1. **A queue is not a retry engine.** A job that reached `Unknown` blocks its printer's
+   lane and demands an operator decision; the queue may only re-drive jobs that
+   verifiably never sent a byte (preflight refusals, transport failures before send).
+2. **Idempotency keys flow through.** Re-enqueueing an existing key returns the already
+   queued/printed job, never a second copy.
+3. **No bypass.** The queue drains through the same core submit path — every drained job
+   is fenced and confidence-graded like any direct print.
+
+Deployment shapes:
+
+- **In-process addon (v1):** each app instance queues for the printers it owns.
+- **Shared agent (later):** the same core + queue compiled as the Linux/RPi daemon
+  ([techspec.md §5](techspec.md#5-recommended-architecture)) with a small submission
+  API, for many-terminals-one-printer sites. The addon API is identical; only the
+  transport to it differs. Explicitly unsupported either way: several devices each
+  running their own queue against the same printer — exclusive connection ownership is
+  what makes acknowledgements attributable (§4).
+
+## 13. Non-goals (for v1)
 
 - Physical print verification hardware (exit sensors, QR scanners) — designed for in the
   state machine (`PhysicallyVerified`), not built now
