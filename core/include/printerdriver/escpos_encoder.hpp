@@ -44,6 +44,21 @@ enum class DleEotKind : uint8_t {
   PaperSensor = 4,
 };
 
+// Values are the `n` operand of GS I n (printer identification). 1-3 answer with a
+// single ID byte; 65-68 answer with a text field. Text answers are framed
+// Header(0x5F) + data + NUL on Epson and Epson-compatible firmware, but the whole
+// point of docs/capability-profiles.md is that the *content* of these fields cannot be
+// trusted — Rongta's manual documents returning "EPOSN" / "TM-T88V".
+enum class PrinterInfoKind : uint8_t {
+  ModelId = 1,
+  TypeId = 2,
+  RomVersionId = 3,
+  FirmwareVersion = 65,
+  MakerName = 66,
+  ModelName = 67,
+  SerialNumber = 68,
+};
+
 // Values are the `n1` operand of GS ( k function 165.
 enum class QrModel : uint8_t { Model1 = 49, Model2 = 50, MicroQr = 51 };
 
@@ -65,6 +80,9 @@ enum class Binarization { FixedThreshold, FloydSteinberg };
 inline constexpr uint32_t kWidth58mm = 384;
 inline constexpr uint32_t kWidth76mm = 504;
 inline constexpr uint32_t kWidth80mm = 576;
+// 104 mm of printable area at 203 dpi, which is what the 112 mm wide-media class
+// actually prints (docs/device-database.md: never infer raster width from roll width).
+inline constexpr uint32_t kWidth104mm = 832;
 
 inline constexpr uint8_t kAsbAllEnabled = 0x0E;  // docs/techspec.md §3.4
 inline constexpr uint8_t kUnmappedCodepointFallback = 0x3F;  // '?'
@@ -91,6 +109,35 @@ bool isValidProcessIdToken(std::string_view token) noexcept;
 // GS a n — 1D 61 n. n = 0x0E enables online/offline, error and paper notifications.
 Bytes asbEnable(uint8_t mask = kAsbAllEnabled);
 Bytes asbDisable();
+
+// GS I n — 1D 49 n. Read-only identification, safe in an automatic probe.
+Bytes gsIdentity(PrinterInfoKind kind);
+Bytes gsIdentity(uint8_t n);
+
+// --- Deliberate operator commands -------------------------------------------------
+// None of these are ever emitted by the engine or by the automatic capability probe.
+// DLE ENQ resumes or discards a partly printed ticket and DLE DC4 can power the device
+// off; on a kitchen printer that is a duplicate or a lost ticket, so they exist only
+// behind an explicit operator action (docs/capability-profiles.md §5).
+
+// DLE ENQ n — 10 05 n. 1 = recover and reprint from the line the error occurred on,
+// 2 = recover while clearing the receive and print buffers.
+Bytes dleEnq(uint8_t n);
+inline constexpr uint8_t kDleEnqResume = 1;
+inline constexpr uint8_t kDleEnqClearBuffers = 2;
+
+// GS g 2 — 1D 67 32 00 nL nH. Reads a maintenance counter; the counter numbering is
+// model-specific, so callers pass the number and report the raw answer.
+Bytes gsMaintenanceCounter(uint16_t counter);
+
+// GS ( A — 1D 28 41 02 00 n m. Built-in test print: n selects the paper, m the
+// pattern (2 = printer status sheet).
+Bytes gsTestPrint(uint8_t paper = 0, uint8_t pattern = 2);
+
+// GS ( E fn 4 / fn 6 — settings readback. Reading is non-destructive, but it sits with
+// the operator commands because the same command family writes settings.
+Bytes gsReadMemorySwitch(uint8_t switch_number);
+Bytes gsReadCustomizedSetting(uint8_t setting_number);
 
 // --- Text encoding --------------------------------------------------------------
 
@@ -122,6 +169,10 @@ class Encoder {
   Encoder& line(std::string_view utf8 = {});
   Encoder& feed();                          // LF
   Encoder& feedLines(uint8_t lines);        // ESC d n
+  // ESC J n — feeds n dots without printing, e.g. to clear the head-to-cutter gap
+  // before a cut (docs/testing-plan.md). n is a single byte; requests above 255 are
+  // split across as many ESC J commands as needed.
+  Encoder& feedDots(uint16_t dots);
 
   // GS V m (m = 0 full, 1 partial). When cut-with-feed is enabled the GS V 65/66 n
   // variant is emitted instead: the printer feeds n vertical motion units to the

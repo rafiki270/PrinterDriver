@@ -253,17 +253,23 @@ class PrinterRuntime {
  public:
   PrinterRuntime(PrinterConfig config, std::shared_ptr<JobStore> store,
                  std::shared_ptr<MarkerAllocator> markers,
-                 std::shared_ptr<DriverEventHub> hub, std::shared_ptr<JobIndex> index)
+                 std::shared_ptr<DriverEventHub> hub, std::shared_ptr<JobIndex> index,
+                 std::shared_ptr<FindingsStore> capabilities)
       : config_(std::move(config)),
         store_(std::move(store)),
         markers_(std::move(markers)),
         hub_(std::move(hub)),
-        index_(std::move(index)) {}
+        index_(std::move(index)),
+        capabilities_(std::move(capabilities)) {}
 
   ~PrinterRuntime() { stop(); }
 
   void start() {
+    applyStoredFindings();
     worker_ = std::thread([this] { workerLoop(); });
+    // Queued before any job can be, so a promoted profile is in force by the time the
+    // first receipt is built rather than one receipt too late.
+    scheduleProbe();
   }
 
   void stop() {
@@ -291,7 +297,14 @@ class PrinterRuntime {
   }
 
   const std::string& id() const noexcept { return config_.id; }
-  const CapabilityProfile& profile() const noexcept { return config_.profile; }
+  CapabilityProfile profile() const {
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    return config_.profile;
+  }
+  std::optional<CapabilityFindings> findings() const {
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    return findings_;
+  }
   uint32_t widthDots() const noexcept { return config_.width_dots; }
 
   // A null payload is only valid for a reprint, where the original submission's
@@ -326,8 +339,12 @@ class PrinterRuntime {
   bool ensureConnected(std::string* error);
   void closeTransport();
 
+  void applyStoredFindings();
+  void scheduleProbe();
+  void runProbe();
+
   void runJob(const std::shared_ptr<PrintJob>& job, const Payload& payload,
-              const JobOptions& options, uint32_t attempt);
+              const JobOptions& options, uint32_t attempt, bool banner);
 
   void beginJobIo();
   WaitOutcome awaitToken(const std::string& token, std::chrono::milliseconds timeout);
@@ -341,21 +358,32 @@ class PrinterRuntime {
   void mergeStatus(const escpos::StatusFlags& flags, std::vector<DeviceEvent>* out);
   void dispatchDeviceEvents(const std::vector<DeviceEvent>& events);
 
+  // `evidence` defaults to none: most transitions are mid-flight and have not earned
+  // any yet. terminate() is the one caller that has something to pass.
   void advance(const std::shared_ptr<PrintJob>& job, JobState state,
-               ConfidenceLevel confidence, FailureReason reason);
+               ConfidenceLevel confidence, FailureReason reason,
+               const JobEvidence& evidence = {});
   void terminate(const std::shared_ptr<PrintJob>& job, JobState state,
                  const JobResult& outcome);
 
-  escpos::Bytes buildPayload(const Payload& payload, const JobOptions& options,
-                             uint32_t attempt, const std::string& key) const;
-  escpos::Bytes buildCut(CutVariant variant, const std::string& marker_token) const;
-  TransportResult sendPaced(const escpos::Bytes& bytes);
+  escpos::Bytes buildPayload(const CapabilityProfile& profile, const Payload& payload,
+                             const JobOptions& options, uint32_t attempt,
+                             const std::string& key, bool banner) const;
+  escpos::Bytes buildCut(const CapabilityProfile& profile, CutVariant variant,
+                         const std::string& marker_token) const;
+  TransportResult sendPaced(const CapabilityProfile& profile,
+                            const escpos::Bytes& bytes);
 
   PrinterConfig config_;
+  mutable std::mutex profile_mutex_;
+  std::optional<CapabilityFindings> findings_;
   std::shared_ptr<JobStore> store_;
   std::shared_ptr<MarkerAllocator> markers_;
   std::shared_ptr<DriverEventHub> hub_;
   std::shared_ptr<JobIndex> index_;
+  std::shared_ptr<FindingsStore> capabilities_;
+  std::shared_ptr<CapabilityProbe> probe_;
+  mutable std::mutex probe_mutex_;
 
   std::thread worker_;
   std::mutex queue_mutex_;
@@ -486,7 +514,87 @@ void PrinterRuntime::closeTransport() {
   status_.connected = false;
 }
 
+void PrinterRuntime::applyStoredFindings() {
+  if (config_.probe == ProbePolicy::Never || !capabilities_ ||
+      !capabilities_->persistent()) {
+    return;
+  }
+  // Nothing is known about the identity until something has interrogated the device,
+  // so a stored record is found by endpoint on this path and re-keyed by identity
+  // once a probe has run.
+  std::optional<CapabilityFindings> stored = capabilities_->findByEndpoint(config_.id);
+  if (!stored) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(profile_mutex_);
+  config_.profile = promote(config_.profile, *stored);
+  findings_ = std::move(stored);
+}
+
+void PrinterRuntime::scheduleProbe() {
+  if (config_.probe == ProbePolicy::Never || config_.probe == ProbePolicy::UseStored) {
+    return;
+  }
+  if (config_.probe == ProbePolicy::IfUnknown) {
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    if (findings_.has_value()) {
+      return;
+    }
+  }
+  Task task;
+  task.run = [this] { runProbe(); };
+  push(std::move(task));
+}
+
+void PrinterRuntime::runProbe() {
+  std::string error;
+  if (!ensureConnected(&error)) {
+    return;
+  }
+  ProbeOptions options = config_.probe_options;
+  options.endpoint = config_.id;
+  options.hints = config_.identity_hints;
+  auto probe = std::make_shared<CapabilityProbe>(options);
+  {
+    std::lock_guard<std::mutex> lock(probe_mutex_);
+    probe_ = probe;
+  }
+  CapabilityProfile snapshot = profile();
+  CapabilityFindings findings = probe->run([this, &snapshot](const escpos::Bytes& bytes) {
+    return sendPaced(snapshot, bytes).ok;
+  });
+  {
+    std::lock_guard<std::mutex> lock(probe_mutex_);
+    probe_.reset();
+  }
+  if (findings.empty()) {
+    return;
+  }
+  findings.endpoint = config_.id;
+  {
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    config_.profile = promote(config_.profile, findings);
+    findings_ = findings;
+  }
+  if (capabilities_ && capabilities_->persistent()) {
+    capabilities_->save(findings);
+  }
+}
+
 void PrinterRuntime::onBytes(const uint8_t* data, size_t size) {
+  {
+    // While the probe owns the conversation it owns the whole backchannel: its
+    // questions are the only ones outstanding, and its parser has the expectations.
+    std::shared_ptr<CapabilityProbe> probe;
+    {
+      std::lock_guard<std::mutex> lock(probe_mutex_);
+      probe = probe_;
+    }
+    if (probe) {
+      probe->onBytes(data, size);
+      return;
+    }
+  }
   std::vector<DeviceEvent> events;
   {
     std::lock_guard<std::mutex> lock(io_mutex_);
@@ -644,10 +752,11 @@ WaitOutcome PrinterRuntime::awaitRealtime(size_t count, std::chrono::millisecond
 }
 
 void PrinterRuntime::advance(const std::shared_ptr<PrintJob>& job, JobState state,
-                             ConfidenceLevel confidence, FailureReason reason) {
+                             ConfidenceLevel confidence, FailureReason reason,
+                             const JobEvidence& evidence) {
   // Persist first, then publish: an observer must never learn of a transition the
   // journal has not committed (docs/techspec.md §5.1).
-  store_->recordState(job->id(), state, confidence, reason);
+  store_->recordState(job->id(), state, confidence, reason, evidence);
   job->emit(state, confidence,
             reason == FailureReason::None ? std::optional<FailureReason>()
                                           : std::optional<FailureReason>(reason));
@@ -655,17 +764,22 @@ void PrinterRuntime::advance(const std::shared_ptr<PrintJob>& job, JobState stat
 
 void PrinterRuntime::terminate(const std::shared_ptr<PrintJob>& job, JobState state,
                                const JobResult& outcome) {
-  advance(job, state, outcome.confidence, outcome.reason);
+  // The evidence rides with the same transition that carries the outcome, so a
+  // reload never has to guess what a completed job actually earned (docs/techspec.md
+  // §5.1, docs/device-database.md "Confidence grades for every route").
+  advance(job, state, outcome.confidence, outcome.reason,
+         JobEvidence{outcome.grade, outcome.authority, outcome.method.c_str()});
   job->finish(outcome);
 }
 
-escpos::Bytes PrinterRuntime::buildPayload(const Payload& payload,
+escpos::Bytes PrinterRuntime::buildPayload(const CapabilityProfile& profile,
+                                           const Payload& payload,
                                            const JobOptions& options, uint32_t attempt,
-                                           const std::string& key) const {
+                                           const std::string& key, bool banner) const {
   const escpos::CodePage code_page =
       std::holds_alternative<DocumentPayload>(payload.content)
           ? std::get<DocumentPayload>(payload.content).code_page
-          : config_.profile.code_page;
+          : profile.code_page;
 
   escpos::Encoder encoder;
   // The core owns job framing: every job starts from a known printer state, which is
@@ -673,7 +787,10 @@ escpos::Bytes PrinterRuntime::buildPayload(const Payload& payload,
   encoder.initialize();
   encoder.selectCodePage(code_page);
 
-  if (attempt > 1) {
+  // The banner marks a deliberate duplicate, so it belongs to forceReprint and not to
+  // the attempt counter: a fresh attempt after a FailedKnown printed nothing, and
+  // warning about a duplicate that does not exist trains operators to ignore it.
+  if (banner) {
     encoder.align(escpos::Alignment::Center)
         .bold(true)
         .line(kReprintBannerLine)
@@ -703,30 +820,41 @@ escpos::Bytes PrinterRuntime::buildPayload(const Payload& payload,
     encoder.kickCashDrawer();
   }
   // The fence attaches to the last print operation, so the job has to end in one.
-  encoder.feedLines(config_.profile.final_feed_lines);
+  encoder.feedLines(profile.final_feed_lines);
   return encoder.take();
 }
 
-escpos::Bytes PrinterRuntime::buildCut(CutVariant variant,
+escpos::Bytes PrinterRuntime::buildCut(const CapabilityProfile& profile,
+                                       CutVariant variant,
                                        const std::string& marker_token) const {
   escpos::Encoder encoder;
-  encoder.useCutWithFeed(config_.profile.cut_with_feed, config_.profile.cut_feed_units);
+  // The print head sits ahead of the blade, so the guarantee is: at cut time, at
+  // least head_to_cutter_feed_dots of feed has occurred since the last printed
+  // content. This rides on top of final_feed_lines rather than replacing it, right
+  // before the cut command and the fence that follows it (docs/testing-plan.md).
+  encoder.feedDots(profile.media.head_to_cutter_feed_dots);
+  encoder.useCutWithFeed(profile.quirks.extra_feed_before_cut > 0,
+                         profile.quirks.extra_feed_before_cut);
   encoder.cut(variant == CutVariant::Full ? escpos::CutMode::Full
                                           : escpos::CutMode::Partial);
-  switch (config_.profile.completion) {
+  switch (profile.completion) {
     case CompletionMechanism::GsParenH:
       encoder.processId(marker_token);
       break;
     case CompletionMechanism::GsR1:
       encoder.queuedPaperStatus();
       break;
+    case CompletionMechanism::VendorIdle:
+    case CompletionMechanism::EposJobId:
+    case CompletionMechanism::StarCheckedBlock:
     case CompletionMechanism::None:
       break;
   }
   return encoder.take();
 }
 
-TransportResult PrinterRuntime::sendPaced(const escpos::Bytes& bytes) {
+TransportResult PrinterRuntime::sendPaced(const CapabilityProfile& profile,
+                                          const escpos::Bytes& bytes) {
   Transport* transport = nullptr;
   {
     std::lock_guard<std::mutex> lock(connection_mutex_);
@@ -735,7 +863,7 @@ TransportResult PrinterRuntime::sendPaced(const escpos::Bytes& bytes) {
   if (transport == nullptr) {
     return TransportResult::failure(TransportError::NotConnected, "no transport");
   }
-  const size_t chunk = config_.profile.chunk_bytes;
+  const size_t chunk = profile.chunk_bytes;
   if (chunk == 0) {
     return transport->write(bytes.data(), bytes.size());
   }
@@ -748,34 +876,57 @@ TransportResult PrinterRuntime::sendPaced(const escpos::Bytes& bytes) {
                                       offset + result.bytes_written);
     }
     offset += take;
-    if (offset < bytes.size() && config_.profile.inter_chunk_delay_ms > 0) {
+    if (offset < bytes.size() && profile.inter_chunk_delay_ms > 0) {
       std::this_thread::sleep_for(
-          std::chrono::milliseconds(config_.profile.inter_chunk_delay_ms));
+          std::chrono::milliseconds(profile.inter_chunk_delay_ms));
     }
   }
   return TransportResult::success(offset);
 }
 
 void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload& payload,
-                            const JobOptions& options, uint32_t attempt) {
-  const CapabilityProfile& profile = config_.profile;
+                            const JobOptions& options, uint32_t attempt, bool banner) {
+  // One snapshot for the whole job: a probe may have replaced the effective profile,
+  // and a job must not be built under one set of capabilities and fenced under another.
+  const CapabilityProfile profile = this->profile();
   const ConfidenceLevel ceiling = profile.maxConfidence();
   const auto timeout = std::chrono::milliseconds(
       options.timeout_ms != 0 ? options.timeout_ms : profile.completion_timeout_ms);
   const auto realtime_timeout = std::chrono::milliseconds(profile.preflight_timeout_ms);
   ConfidenceLevel confidence = ConfidenceLevel::TransportAccepted;
   const auto reached = [&] { return clampTo(confidence, ceiling); };
+  // Grades a failure or an Unknown honestly: nothing was confirmed, so the claim is
+  // transport-only whatever fence the profile would have used. The two differ in
+  // whether the link ever accepted a byte, which is exactly what an operator needs
+  // to know before deciding about a reprint.
+  const JobEvidence transport_evidence = evidenceFor(CompletionMechanism::None);
+  const JobEvidence no_evidence{ConfidenceGrade::E_TransportOnly,
+                                CompletionAuthority::TransportOnly, "none"};
+  // A refusal or a fault read out of DLE EOT is grade C: device status taken around
+  // the transmission, reported by the printer itself.
+  const JobEvidence status_evidence{ConfidenceGrade::C_DeviceStatusAround,
+                                    CompletionAuthority::PhysicalPrinter, "DLE EOT"};
+
+  if (!profile.drivableByEscposEngine()) {
+    // Star's checked block and the ePOS JobID are real mechanisms this core does not
+    // speak. Printing anyway would produce a receipt with no fence behind it and a
+    // result nobody should believe (docs/device-database.md "Vendor stacks").
+    terminate(job, JobState::FailedKnown,
+              JobResult::failed(FailureReason::Unsupported, reached()).with(no_evidence));
+    return;
+  }
 
   std::string error;
   if (!ensureConnected(&error)) {
     terminate(job, JobState::FailedKnown,
-              JobResult::failed(FailureReason::TransportUnreachable, reached()));
+              JobResult::failed(FailureReason::TransportUnreachable, reached())
+                  .with(no_evidence));
     return;
   }
   beginJobIo();
 
   // --- Preflight (docs/techspec.md §5.2 steps 3-4) --------------------------------
-  if (options.preflight == PreflightMode::Strict && profile.supports_realtime_status) {
+  if (options.preflight == PreflightMode::Strict && profile.status.dle_eot) {
     escpos::Bytes probe;
     {
       std::lock_guard<std::mutex> lock(io_mutex_);
@@ -787,17 +938,19 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
         probe.insert(probe.end(), command.begin(), command.end());
       }
     }
-    const TransportResult sent = sendPaced(probe);
+    const TransportResult sent = sendPaced(profile, probe);
     if (!sent.ok) {
       terminate(job, JobState::FailedKnown,
-                JobResult::failed(FailureReason::TransportUnreachable, reached()));
+                JobResult::failed(FailureReason::TransportUnreachable, reached())
+                    .with(no_evidence));
       return;
     }
     std::vector<escpos::ParsedEvent> answers;
     const WaitOutcome outcome = awaitRealtime(4, realtime_timeout, &answers);
     if (outcome == WaitOutcome::LinkDown) {
       terminate(job, JobState::FailedKnown,
-                JobResult::failed(FailureReason::TransportUnreachable, reached()));
+                JobResult::failed(FailureReason::TransportUnreachable, reached())
+                    .with(no_evidence));
       return;
     }
     escpos::StatusFlags merged;
@@ -826,7 +979,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     if (refusal) {
       // Zero payload bytes have been sent, which is what makes this FailedKnown and
       // safe to resubmit rather than Unknown (docs/techspec.md §6).
-      terminate(job, JobState::FailedKnown, JobResult::failed(*refusal, reached()));
+      terminate(job, JobState::FailedKnown,
+                JobResult::failed(*refusal, reached()).with(status_evidence));
       return;
     }
     if (!answers.empty()) {
@@ -838,7 +992,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     // and the completion fence below is where the truth comes out.
   }
 
-  const escpos::Bytes wire = buildPayload(payload, options, attempt, job->key());
+  const escpos::Bytes wire =
+      buildPayload(profile, payload, options, attempt, job->key(), banner);
   const std::string marker_suffix =
       profile.completion == CompletionMechanism::GsParenH ? markers_->acquire()
                                                           : std::string();
@@ -859,14 +1014,16 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   // point may be ambiguous; nothing before it can be.
   advance(job, JobState::SendStarted, reached(), FailureReason::None);
 
-  const TransportResult sent = sendPaced(wire);
+  const TransportResult sent = sendPaced(profile, wire);
   if (!sent.ok) {
     if (sent.bytes_written == 0) {
       terminate(job, JobState::FailedKnown,
-                JobResult::failed(FailureReason::TransportUnreachable, reached()));
+                JobResult::failed(FailureReason::TransportUnreachable, reached())
+                    .with(no_evidence));
     } else {
       terminate(job, JobState::Unknown,
-                JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown});
+                JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
+                    .with(transport_evidence));
     }
     return;
   }
@@ -884,19 +1041,24 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
       fence = escpos::gsPaperStatus();
       break;
     }
+    case CompletionMechanism::VendorIdle:
+    case CompletionMechanism::EposJobId:
+    case CompletionMechanism::StarCheckedBlock:
     case CompletionMechanism::None:
       // Nothing will ever be waited for, so the cut goes out with the payload rather
-      // than after an acknowledgement that is never coming.
+      // than after an acknowledgement that is never coming. The non-ESC/POS
+      // mechanisms never reach here: the job was refused as Unsupported above.
       if (cut != CutVariant::None) {
-        fence = buildCut(cut, print_token);
+        fence = buildCut(profile, cut, print_token);
       }
       break;
   }
   if (!fence.empty()) {
-    const TransportResult fence_sent = sendPaced(fence);
+    const TransportResult fence_sent = sendPaced(profile, fence);
     if (!fence_sent.ok) {
       terminate(job, JobState::Unknown,
-                JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown});
+                JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
+                    .with(transport_evidence));
       return;
     }
   }
@@ -906,7 +1068,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     // The write-only truth (docs/sdk-spec.md §5): bytes reached a buffer somewhere,
     // and this printer can never say more than that.
     terminate(job, JobState::DoneSoftware,
-              JobResult::done(clampTo(ConfidenceLevel::TransportAccepted, ceiling)));
+              JobResult::done(clampTo(ConfidenceLevel::TransportAccepted, ceiling))
+                  .with(profile.evidence()));
     return;
   }
 
@@ -920,14 +1083,16 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
               JobResult{JobOutcome::Unknown, reached(),
                         print_ack == WaitOutcome::Timeout
                             ? FailureReason::TimeoutAwaitingCompletion
-                            : FailureReason::Unknown});
+                            : FailureReason::Unknown}
+                  .with(transport_evidence));
     return;
   }
   confidence = raise(confidence, ConfidenceLevel::PrintConfirmed);
   advance(job, JobState::PrintConfirmed, reached(), FailureReason::None);
 
   if (cut == CutVariant::None) {
-    terminate(job, JobState::DoneSoftware, JobResult::done(reached()));
+    terminate(job, JobState::DoneSoftware,
+              JobResult::done(reached()).with(profile.evidence()));
     return;
   }
 
@@ -935,10 +1100,11 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     std::lock_guard<std::mutex> lock(io_mutex_);
     parser_.expectQueued();
   }
-  const TransportResult cut_sent = sendPaced(buildCut(cut, cut_token));
+  const TransportResult cut_sent = sendPaced(profile, buildCut(profile, cut, cut_token));
   if (!cut_sent.ok) {
     terminate(job, JobState::Unknown,
-              JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown});
+              JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
+                  .with(transport_evidence));
     return;
   }
   const WaitOutcome cut_ack =
@@ -949,7 +1115,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
               JobResult{JobOutcome::Unknown, reached(),
                         cut_ack == WaitOutcome::Timeout
                             ? FailureReason::TimeoutAwaitingCompletion
-                            : FailureReason::Unknown});
+                            : FailureReason::Unknown}
+                  .with(transport_evidence));
     return;
   }
   confidence = raise(confidence, ConfidenceLevel::CutProcessed);
@@ -959,7 +1126,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     // A second GS r 1 fences the cut command but is not a documented cutter
     // guarantee (docs/techspec.md §3.2), so the claim stops here: print completion
     // confirmed, cut command processed, no cutter status read.
-    terminate(job, JobState::DoneSoftware, JobResult::done(reached()));
+    terminate(job, JobState::DoneSoftware,
+              JobResult::done(reached()).with(profile.evidence()));
     return;
   }
 
@@ -970,7 +1138,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     std::lock_guard<std::mutex> lock(io_mutex_);
     parser_.expectRealtime(escpos::DleEotKind::ErrorCause);
   }
-  const TransportResult status_sent = sendPaced(escpos::dleEot(escpos::DleEotKind::ErrorCause));
+  const TransportResult status_sent =
+      sendPaced(profile, escpos::dleEot(escpos::DleEotKind::ErrorCause));
   std::vector<escpos::ParsedEvent> answers;
   if (status_sent.ok) {
     awaitRealtime(1, realtime_timeout, &answers);
@@ -978,7 +1147,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   for (const escpos::ParsedEvent& answer : answers) {
     if (answer.flags.cutter_error.value_or(false)) {
       terminate(job, JobState::FailedKnown,
-                JobResult::failed(FailureReason::CutterFault, reached()));
+                JobResult::failed(FailureReason::CutterFault, reached())
+                    .with(status_evidence));
       return;
     }
   }
@@ -987,7 +1157,8 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   }
   // Answers empty means the bit could not be read, so the claim stays at
   // CutProcessed instead of being upgraded on silence.
-  terminate(job, JobState::DoneSoftware, JobResult::done(reached()));
+  terminate(job, JobState::DoneSoftware,
+            JobResult::done(reached()).with(profile.evidence()));
 }
 
 size_t payloadInputBytes(const Payload& payload) {
@@ -1004,14 +1175,22 @@ std::shared_ptr<PrintJob> PrinterRuntime::submit(std::shared_ptr<Payload> payloa
                                                  JobOptions options, bool reprint) {
   std::string key = options.key;
   uint32_t attempt = 1;
+  bool banner = reprint;
 
   std::lock_guard<std::mutex> index_lock(index_->mutex);
   if (!key.empty()) {
     const auto existing = index_->by_key.find(key);
     if (existing != index_->by_key.end()) {
-      if (!reprint) {
-        // docs/api.md §3: an existing key never prints again, whatever state it is in.
-        return existing->second.job;
+      const std::shared_ptr<PrintJob>& previous = existing->second.job;
+      // docs/api.md §4: a failed job printed nothing, so resubmitting its key is safe
+      // and is exactly what an app does after showing the failure. Returning the dead
+      // job instead swallows the retry — the regression the hardware soak found.
+      // Done and Unknown keep the strict rule: one is already on paper and the other
+      // may be, and a duplicate kitchen ticket is as damaging as a missing one.
+      const bool failed_and_finished =
+          previous && previous->isTerminal() && previous->state() == JobState::FailedKnown;
+      if (!reprint && !failed_and_finished) {
+        return previous;
       }
       attempt = existing->second.attempt + 1;
       if (!payload) {
@@ -1056,8 +1235,8 @@ std::shared_ptr<PrintJob> PrinterRuntime::submit(std::shared_ptr<Payload> payloa
 
   auto shared_payload = entry.payload;
   Task task;
-  task.run = [this, job, shared_payload, options, attempt] {
-    runJob(job, *shared_payload, options, attempt);
+  task.run = [this, job, shared_payload, options, attempt, banner] {
+    runJob(job, *shared_payload, options, attempt, banner);
   };
   task.cancel = [this, job] {
     // Never dequeued, so provably zero bytes on the wire.
@@ -1167,7 +1346,7 @@ DeviceStatus PrinterRuntime::refreshStatus(std::chrono::milliseconds timeout) {
           probe.insert(probe.end(), command.begin(), command.end());
         }
       }
-      if (sendPaced(probe).ok) {
+      if (sendPaced(this->profile(), probe).ok) {
         awaitRealtime(4, timeout, nullptr);
       }
       clearRealtime();
@@ -1192,7 +1371,7 @@ void PrinterRuntime::openCashDrawer() {
     }
     escpos::Encoder encoder;
     encoder.kickCashDrawer();
-    sendPaced(encoder.bytes());
+    sendPaced(this->profile(), encoder.bytes());
   };
   push(std::move(task));
 }
@@ -1208,7 +1387,8 @@ Printer::~Printer() = default;
 
 const std::string& Printer::id() const noexcept { return rt_->id(); }
 uint32_t Printer::widthDots() const noexcept { return rt_->widthDots(); }
-const CapabilityProfile& Printer::profile() const noexcept { return rt_->profile(); }
+CapabilityProfile Printer::profile() const { return rt_->profile(); }
+std::optional<CapabilityFindings> Printer::findings() const { return rt_->findings(); }
 
 std::shared_ptr<PrintJob> Printer::print(Payload payload, const JobOptions& options) {
   return rt_->submit(std::make_shared<Payload>(std::move(payload)), options, false);
@@ -1255,7 +1435,8 @@ void Printer::submitReserved(const std::shared_ptr<PrintJob>& job, Payload paylo
 // --- PrinterDriver ---------------------------------------------------------------
 
 PrinterDriver::PrinterDriver(StorageConfig storage)
-    : store_(std::make_shared<JobStore>(std::move(storage))),
+    : store_(std::make_shared<JobStore>(storage)),
+      capabilities_(std::make_shared<FindingsStore>(storage.directory)),
       markers_(std::make_shared<detail::MarkerAllocator>()) {
   hub_ = std::make_shared<detail::DriverEventHub>();
   index_ = std::make_shared<detail::JobIndex>();
@@ -1277,6 +1458,11 @@ PrinterDriver::PrinterDriver(StorageConfig storage)
         outcome = JobResult{JobOutcome::Unknown, record.confidence, record.reason};
         break;
     }
+    // The journal is the only source of truth once a job outlives the process that
+    // ran it, so a reloaded job reports whatever grade/authority/method it actually
+    // persisted rather than the struct's E_TransportOnly default — including through
+    // a same-key dedupe return, which hands back this very JobResult.
+    outcome.with(JobEvidence{record.grade, record.authority, record.method.c_str()});
     job->emit(record.state, record.confidence,
               record.reason == FailureReason::None
                   ? std::optional<FailureReason>()
@@ -1312,8 +1498,8 @@ std::shared_ptr<Printer> PrinterDriver::addPrinter(PrinterConfig config) {
     std::unique_ptr<Transport> probe = config.transport ? config.transport() : nullptr;
     config.id = probe ? probe->describe() : ("printer-" + newJobId());
   }
-  auto runtime = std::make_shared<detail::PrinterRuntime>(std::move(config), store_,
-                                                          markers_, hub_, index_);
+  auto runtime = std::make_shared<detail::PrinterRuntime>(
+      std::move(config), store_, markers_, hub_, index_, capabilities_);
   runtime->start();
   auto printer = std::shared_ptr<Printer>(new Printer(runtime));
   std::lock_guard<std::mutex> lock(mutex_);

@@ -154,6 +154,69 @@ PD_TEST(store_leaves_terminal_jobs_untouched) {
   CHECK(!reloaded.findByKey("order-done")->recovered);
 }
 
+PD_TEST(store_roundtrips_confidence_grade_authority_and_method) {
+  pdfake::TempDir dir("store-evidence-roundtrip");
+  {
+    JobStore store(StorageConfig::at(dir.path()));
+    store.createJob(makeRecord("job-1", "order-A"));
+    store.recordState("job-1", JobState::DoneSoftware, ConfidenceLevel::CutFaultFree,
+                      FailureReason::None,
+                      JobEvidence{ConfidenceGrade::A_JobLevelConfirmation,
+                                 CompletionAuthority::PhysicalPrinter, "GS(H) fn48"});
+    // A non-terminal transition with no evidence argument persists the conservative
+    // default rather than carrying the terminal grade backwards.
+    store.createJob(makeRecord("job-2", "order-B"));
+    store.recordState("job-2", JobState::SendStarted, ConfidenceLevel::PrinterHealthy,
+                      FailureReason::None);
+  }
+  JobStore reloaded(StorageConfig::at(dir.path()));
+  const auto record = reloaded.findByKey("order-A");
+  CHECK(record.has_value());
+  CHECK_EQ(record->confidence, ConfidenceLevel::CutFaultFree);
+  CHECK_EQ(record->grade, ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK_EQ(record->authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(record->method, std::string("GS(H) fn48"));
+
+  // job-2 reloads as Unknown (SendStarted with no ack is in-flight), and recovery
+  // never had real evidence to report either way.
+  const auto defaulted = reloaded.findByKey("order-B");
+  CHECK(defaulted.has_value());
+  CHECK_EQ(defaulted->grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(defaulted->authority, CompletionAuthority::TransportOnly);
+  CHECK_EQ(defaulted->method, std::string("none"));
+}
+
+PD_TEST(store_derives_conservative_evidence_for_legacy_journal_lines) {
+  pdfake::TempDir dir("store-evidence-legacy");
+  const std::string path = dir.path() + "/jobs.journal";
+  { JobStore bootstrap(StorageConfig::at(dir.path())); }  // creates the directory
+  {
+    // Overwrite with pure version-1 content: no grade/authority/method columns.
+    std::ofstream out(path, std::ios::trunc);
+    out << "#PDJOURNAL\t1\n";
+    out << "J\tjob-strong\torder-strong\tprinter-1\t1000\t1\tRaw\t10\n";
+    out << "S\tjob-strong\tDoneSoftware\tCutProcessed\tNone\t1000\n";
+    out << "J\tjob-weak\torder-weak\tprinter-1\t1000\t1\tRaw\t10\n";
+    out << "S\tjob-weak\tFailedKnown\tTransportAccepted\tTransportUnreachable\t1000\n";
+  }
+  JobStore store(StorageConfig::at(dir.path()));
+
+  // CutProcessed >= PrintConfirmed: treated as an ordered device response rather
+  // than downgraded to transport-only just because the line predates evidence.
+  const auto strong = store.findByKey("order-strong");
+  CHECK(strong.has_value());
+  CHECK_EQ(strong->grade, ConfidenceGrade::B_OrderedDeviceResponse);
+  CHECK_EQ(strong->authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(strong->method, std::string("journal-legacy"));
+
+  // TransportAccepted is below PrintConfirmed: stays at the conservative default.
+  const auto weak = store.findByKey("order-weak");
+  CHECK(weak.has_value());
+  CHECK_EQ(weak->grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(weak->authority, CompletionAuthority::TransportOnly);
+  CHECK_EQ(weak->method, std::string("none"));
+}
+
 PD_TEST(store_compacts_history_on_load) {
   pdfake::TempDir dir("store-compact");
   const std::string path = dir.path() + "/jobs.journal";

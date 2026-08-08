@@ -60,6 +60,12 @@ struct JobRecord {
   JobState state = JobState::Queued;
   ConfidenceLevel confidence = ConfidenceLevel::TransportAccepted;
   FailureReason reason = FailureReason::None;
+  // What the current state rests on (docs/device-database.md "Confidence grades for
+  // every route"). A line written before these existed has none of the three; load()
+  // derives them conservatively from `confidence` instead of leaving them blank.
+  ConfidenceGrade grade = ConfidenceGrade::E_TransportOnly;
+  CompletionAuthority authority = CompletionAuthority::TransportOnly;
+  std::string method = "none";
   uint64_t updated_unix_ms = 0;
 
   // Set by load(), not by the journal: this job was in flight when the process
@@ -73,7 +79,9 @@ struct JobRecord {
 // prove the ordering rule from outside the store, which the engine tests do.
 struct JournalEntry {
   enum class Kind { Job, State } kind = Kind::Job;
-  JobRecord record;  // Kind::Job: creation fields. Kind::State: id/state/confidence/reason.
+  // Kind::Job: creation fields. Kind::State: id/state/confidence/reason/grade/
+  // authority/method.
+  JobRecord record;
 };
 
 std::vector<JournalEntry> readJournal(const std::string& path);
@@ -90,9 +98,11 @@ class JobStore {
   void createJob(const JobRecord& record);
 
   // Appends a transition and fsyncs before returning. The caller must not perform
-  // the action this transition authorizes until it has returned.
+  // the action this transition authorizes until it has returned. `evidence` defaults
+  // to none, for the many transitions that have not earned any yet; the caller that
+  // has something to report passes it explicitly.
   void recordState(const std::string& job_id, JobState state, ConfidenceLevel confidence,
-                   FailureReason reason);
+                   FailureReason reason, const JobEvidence& evidence = {});
 
   std::optional<JobRecord> findByKey(const std::string& key) const;
   std::optional<JobRecord> findById(const std::string& id) const;
