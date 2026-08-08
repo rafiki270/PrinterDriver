@@ -20,14 +20,17 @@ namespace {
 // because a stuck kitchen printer gets debugged at 2 a.m. with `tail`, and over JSON
 // because a JSON parser is a dependency this core is not allowed to have.
 //
-//   #PDJOURNAL<TAB>1
+//   #PDJOURNAL<TAB>2
 //   J<TAB>id<TAB>key<TAB>printer<TAB>created_ms<TAB>attempt<TAB>payload_kind<TAB>bytes
-//   S<TAB>id<TAB>state<TAB>confidence<TAB>reason<TAB>updated_ms
+//   S<TAB>id<TAB>state<TAB>confidence<TAB>reason<TAB>updated_ms<TAB>grade<TAB>authority<TAB>method
 //
 // A J line is immutable; the current state of a job is its last S line. Text fields
 // are backslash-escaped so a tab or newline inside an idempotency key cannot forge a
-// record boundary.
-constexpr char kHeader[] = "#PDJOURNAL\t1";
+// record boundary. grade/authority/method are version-2 fields
+// (docs/device-database.md "Confidence grades for every route"): an S line written
+// before they existed has only six fields, and parseLine derives them conservatively
+// rather than refusing the line — see the version-2 comment below.
+constexpr char kHeader[] = "#PDJOURNAL\t2";
 constexpr char kJobPrefix = 'J';
 constexpr char kStatePrefix = 'S';
 
@@ -92,6 +95,13 @@ bool parseEnum(const std::string& name, const std::array<Enum, N>& all, Enum& ou
   return false;
 }
 
+// The conservative line for a version-1 S line (docs/api.md §4): a completion that
+// reached PrintConfirmed or better was at least ordered by the physical printer,
+// even though which mechanism ordered it was never journaled.
+bool atLeastPrintConfirmed(ConfidenceLevel confidence) noexcept {
+  return static_cast<int>(confidence) >= static_cast<int>(ConfidenceLevel::PrintConfirmed);
+}
+
 bool parseUint(const std::string& text, uint64_t& out) {
   if (text.empty()) {
     return false;
@@ -121,10 +131,12 @@ std::string jobLine(const JobRecord& record) {
 }
 
 std::string stateLine(const std::string& id, JobState state, ConfidenceLevel confidence,
-                      FailureReason reason, uint64_t at_ms) {
+                      FailureReason reason, uint64_t at_ms, ConfidenceGrade grade,
+                      CompletionAuthority authority, const std::string& method) {
   std::ostringstream os;
   os << kStatePrefix << '\t' << escapeField(id) << '\t' << to_string(state) << '\t'
-     << to_string(confidence) << '\t' << to_string(reason) << '\t' << at_ms;
+     << to_string(confidence) << '\t' << to_string(reason) << '\t' << at_ms << '\t'
+     << to_string(grade) << '\t' << to_string(authority) << '\t' << escapeField(method);
   return os.str();
 }
 
@@ -174,6 +186,22 @@ std::optional<JournalEntry> parseLine(const std::string& line) {
       return std::nullopt;
     }
     entry.record.updated_unix_ms = at_ms;
+    // Fields 6-8 (grade/authority/method) are version 2. A version-1 line, or one
+    // whose tail is corrupt, gets the conservative derivation instead of being
+    // refused (docs/api.md §4): strong enough to have reached PrintConfirmed becomes
+    // an ordered device response; anything short of that keeps the JobRecord default
+    // of E_TransportOnly/TransportOnly/"none" set above.
+    const bool has_evidence =
+        fields.size() >= 9 &&
+        parseEnum(fields[6], kAllConfidenceGrades, entry.record.grade) &&
+        parseEnum(fields[7], kAllCompletionAuthorities, entry.record.authority);
+    if (has_evidence) {
+      entry.record.method = unescapeField(fields[8]);
+    } else if (atLeastPrintConfirmed(entry.record.confidence)) {
+      entry.record.grade = ConfidenceGrade::B_OrderedDeviceResponse;
+      entry.record.authority = CompletionAuthority::PhysicalPrinter;
+      entry.record.method = "journal-legacy";
+    }
     return entry;
   }
   // Unknown record type: a newer core wrote it. Skipping keeps an old binary usable
@@ -276,6 +304,9 @@ void JobStore::load() {
     it->second.state = entry.record.state;
     it->second.confidence = entry.record.confidence;
     it->second.reason = entry.record.reason;
+    it->second.grade = entry.record.grade;
+    it->second.authority = entry.record.authority;
+    it->second.method = entry.record.method;
     it->second.updated_unix_ms = entry.record.updated_unix_ms;
   }
 
@@ -302,6 +333,12 @@ void JobStore::load() {
         record.reason = FailureReason::Unknown;
         break;
     }
+    // A job the process never got to finish never earned whatever evidence a
+    // version-1 line's confidence might otherwise imply; recovery is itself the
+    // reason the claim cannot stand.
+    record.grade = ConfidenceGrade::E_TransportOnly;
+    record.authority = CompletionAuthority::TransportOnly;
+    record.method = "none";
     record.recovered = true;
     record.updated_unix_ms = unixMillis();
     ++recovered_count_;
@@ -322,7 +359,8 @@ void JobStore::compact() {
     const JobRecord& record = by_id_.at(id);
     content += jobLine(record) + "\n";
     content += stateLine(record.id, record.state, record.confidence, record.reason,
-                         record.updated_unix_ms) +
+                         record.updated_unix_ms, record.grade, record.authority,
+                         record.method) +
                "\n";
   }
   const ssize_t written = ::write(temp_fd, content.data(), content.size());
@@ -388,12 +426,16 @@ void JobStore::createJob(const JobRecord& record) {
   stored.state = JobState::Queued;
   stored.confidence = ConfidenceLevel::TransportAccepted;
   stored.reason = FailureReason::None;
+  stored.grade = ConfidenceGrade::E_TransportOnly;
+  stored.authority = CompletionAuthority::TransportOnly;
+  stored.method = "none";
   stored.recovered = false;
 
   std::string batch = jobLine(stored);
   batch += "\n";
   batch += stateLine(stored.id, stored.state, stored.confidence, stored.reason,
-                     stored.updated_unix_ms);
+                     stored.updated_unix_ms, stored.grade, stored.authority,
+                     stored.method);
   append(batch);
 
   by_id_.emplace(stored.id, stored);
@@ -404,17 +446,22 @@ void JobStore::createJob(const JobRecord& record) {
 }
 
 void JobStore::recordState(const std::string& job_id, JobState state,
-                           ConfidenceLevel confidence, FailureReason reason) {
+                           ConfidenceLevel confidence, FailureReason reason,
+                           const JobEvidence& evidence) {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto it = by_id_.find(job_id);
   if (it == by_id_.end()) {
     throw StoreError("unknown job id " + job_id);
   }
   const uint64_t now = unixMillis();
-  append(stateLine(job_id, state, confidence, reason, now));
+  append(stateLine(job_id, state, confidence, reason, now, evidence.grade,
+                   evidence.authority, evidence.method));
   it->second.state = state;
   it->second.confidence = confidence;
   it->second.reason = reason;
+  it->second.grade = evidence.grade;
+  it->second.authority = evidence.authority;
+  it->second.method = evidence.method;
   it->second.updated_unix_ms = now;
 }
 

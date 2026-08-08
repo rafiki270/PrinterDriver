@@ -169,6 +169,10 @@ class Encoder {
   Encoder& line(std::string_view utf8 = {});
   Encoder& feed();                          // LF
   Encoder& feedLines(uint8_t lines);        // ESC d n
+  // ESC J n — feeds n dots without printing, e.g. to clear the head-to-cutter gap
+  // before a cut (docs/testing-plan.md). n is a single byte; requests above 255 are
+  // split across as many ESC J commands as needed.
+  Encoder& feedDots(uint16_t dots);
 
   // GS V m (m = 0 full, 1 partial). When cut-with-feed is enabled the GS V 65/66 n
   // variant is emitted instead: the printer feeds n vertical motion units to the

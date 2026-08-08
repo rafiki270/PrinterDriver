@@ -176,6 +176,24 @@ PD_TEST(cash_drawer_and_feeds) {
   CHECK_BYTES(encoder.bytes(), 0x0A, 0x1B, 0x64, 0x04);
 }
 
+PD_TEST(feed_dots_emits_esc_j_and_chunks_above_255) {
+  Encoder encoder;
+  encoder.feedDots(120);
+  CHECK_BYTES(encoder.bytes(), 0x1B, 0x4A, 0x78);  // 120 dots, one command
+
+  encoder.clear();
+  encoder.feedDots(0);
+  CHECK_EQ(encoder.size(), static_cast<size_t>(0));  // nothing to feed, nothing sent
+
+  encoder.clear();
+  encoder.feedDots(300);  // above the single-byte operand: 255 + 45
+  CHECK_BYTES(encoder.bytes(), 0x1B, 0x4A, 0xFF, 0x1B, 0x4A, 0x2D);
+
+  encoder.clear();
+  encoder.feedDots(510);  // an exact multiple of the 255-dot chunk
+  CHECK_BYTES(encoder.bytes(), 0x1B, 0x4A, 0xFF, 0x1B, 0x4A, 0xFF);
+}
+
 PD_TEST(raw_passthrough_and_take) {
   Encoder encoder;
   const Bytes payload{0xDE, 0xAD};
