@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Every printer transport this wrapper currently exposes (pd_add_printer_tcp,
+         docs/api.md §2) is a raw TCP socket. Declared here so the manifest merger
+         propagates it into any app that depends on this library; nothing else in this
+         module needs a permission. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+</manifest>
