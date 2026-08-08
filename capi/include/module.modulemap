@@ -1,0 +1,11 @@
+// The Swift-visible face of this SDK is the C ABI and nothing else.
+//
+// core/include holds C++ headers and capi/src holds the C++ implementation of the ABI,
+// but neither is listed here: pd.h is pure C (it compiles as C11 in the ABI test), so
+// Swift imports it directly with no C++ interop mode, no unsafe flags and no bridging
+// header. Anything a wrapper needs must therefore be added to pd.h, which is exactly the
+// constraint docs/api.md §9 asks for.
+module CPrinterDriver {
+  header "printerdriver/pd.h"
+  export *
+}
