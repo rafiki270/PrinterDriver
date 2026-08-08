@@ -99,20 +99,22 @@ final class DriverCore: @unchecked Sendable {
 /// Holds its hub weakly: the ABI cannot unsubscribe, so this object outlives the job
 /// wrapper it feeds, and once nobody is listening the events simply stop being converted.
 ///
-/// ### Why the subscription window is special
+/// ### Why the subscription window exists
 ///
-/// `pd_subscribe_job` registers the callback and replays the recorded history through it,
-/// and the two are not one atomic step: the callback is live from the moment it is
-/// registered, while the replay runs afterwards on the calling thread. A job whose worker
-/// emits during that window would otherwise hand a subscriber a live event before the
-/// older recorded ones — observed in practice as `bytesSent` arriving ahead of `queued`.
+/// The core makes registration and replay atomic from the subscriber's point of view:
+/// everything recorded up to `pd_subscribe_job`'s return is delivered on the calling
+/// thread, in order, before the stream moves to the worker. (Cores before the
+/// registration/replay fix in PrintJob::subscribe lacked that guarantee — a worker
+/// emitting mid-subscribe could hand the callback a live event ahead of the older
+/// recorded ones, observed as `bytesSent` arriving before `queued` — and this window
+/// is the workaround that shipped against them.)
 ///
-/// The ABI documents exactly the discriminator needed to fix that: the replay runs on the
-/// thread calling `pd_subscribe_job`, everything else on the printer's worker. So during
-/// the window this buffers the two sources apart by thread identity and flushes recorded
-/// before live. Both the buffering decision and the hand-off to the delivery queue happen
-/// under one lock, so a worker event cannot slip onto the queue between the flush and the
-/// end of the window either.
+/// It is kept because it costs one lock and keeps the wrapper's ordering guarantee
+/// independent of the core's: during the window the two sources are buffered apart by
+/// thread identity — the ABI documents replay on the calling thread, everything else
+/// on the worker — and flushed recorded-before-live. Both the buffering decision and
+/// the hand-off to the delivery queue happen under one lock, so events reach the queue
+/// in exactly the order the core produced them.
 final class JobEventTrampoline: @unchecked Sendable {
   private let delivery: DispatchQueue
   private let lock = NSLock()

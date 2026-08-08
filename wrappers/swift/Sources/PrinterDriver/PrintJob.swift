@@ -121,8 +121,8 @@ public final class PrintJob: @unchecked Sendable {
     lock.unlock()
     guard isFirst else { return }
 
-    // The window matters: the callback goes live before the replay runs. See
-    // JobEventTrampoline for why that would otherwise reorder a job's first events.
+    // The window keeps replay/live ordering independent of the core's own guarantee.
+    // See JobEventTrampoline for what it buffers and why it is kept.
     trampoline.beginSubscription()
     pd_subscribe_job(
       core.handle, handle, jobEventThunk, Unmanaged.passUnretained(trampoline).toOpaque())
