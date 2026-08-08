@@ -381,3 +381,45 @@ Deployment shapes:
 - Non-receipt printing (label/ZPL, A4/CUPS).
 - Cloud print routing — the SDK talks to printers directly; fleet/cloud orchestration can
   sit on top later.
+
+## 14. Topologies: many devices × many printers
+
+One invariant generates every supported topology: **each printer has exactly one
+connection owner at a time.** Completion-fence attribution and fleet-wide duplicate
+prevention both depend on it — echoes are only attributable on the socket that sent the
+markers, and idempotency keys only dedupe within one journal.
+
+**One device → many printers: native.** The core runs an independent lane per printer
+(worker thread, FIFO queue, fences); jobs to different printers execute concurrently.
+Which document type goes to which printer (receipt vs kitchen vs bar) stays app-side by
+design (§10).
+
+**Many devices → one printer: through one owner.** Either the **shared agent** — the
+same core compiled as a daemon (§12, [techspec §5](techspec.md#5-recommended-architecture))
+on a Pi or a designated till, with devices submitting over its API — or a single
+designated owner device. One owner means one journal, which is what makes the same
+order key from two tills print **once**. Direct multi-instance writing to one printer is
+explicitly unsupported: on multiplexing LAN modules receipts can interleave and echoes
+can misroute, and — decisively — separate journals cannot dedupe each other, so the
+kitchen-duplicate problem returns one layer up. (Empirically, the XP-S260M's module
+serialized two concurrent instances cleanly in testing — that is module luck, not a
+contract. Instance-nonce tokens and the `ForeignWriterDetected` event exist to make
+violations loud.)
+
+**Many ↔ many — the general restaurant case: partition ownership.** Assign every
+printer to exactly one owner; devices submit each job to the owner of its target
+printer. Mixed ownership is normal:
+
+```
+Till A ──┬────────────────────→ Receipt printer A   (owned by Till A)
+Till B ──┼────────────────────→ Receipt printer B   (owned by Till B)
+Phone C ─┤
+         └──→ pd-agent ─┬─────→ Kitchen printer     (owned by the agent)
+Till A ──────→ (same) ──┴─────→ Bar printer         (owned by the agent)
+```
+
+Rule of thumb: any printer whose duplicates are expensive (kitchen, bar) belongs behind
+the shared agent so its journal sees every device's keys; a printer used by exactly one
+device (its own receipt printer) can be owned directly. The verification identifier's
+instance nonce (api.md §14) names the owner on the paper itself, so even a mis-deployed
+topology is diagnosable from a physical receipt.
