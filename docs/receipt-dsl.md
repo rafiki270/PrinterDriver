@@ -173,3 +173,16 @@ with per-use override:
 Inputs stay plain JSON (numbers, ISO-8601 strings); formatting happens in the core at
 bind time so every platform renders identically. Unknown formatter or unformattable
 value → declared render-report warning + raw value printed, never a crash.
+
+## Cut control (enabled by default)
+
+The trailing cut is on by default and controllable at three levels — most specific wins:
+
+1. `JobOptions.cut` (caller): `profile` (default) | `partial` | `full` | `none`
+2. Document/template meta: `"meta": { "cut": false }` or `"cut": "full"` — a no-cut
+   kitchen-summary template carries that fact itself
+3. Printer profile: the native cut variant used when the above say "profile"
+
+`{ "cut": "partial" }` blocks mid-document still work independently (multi-ticket
+documents). `cut:none` ends the job after the final feed; completion fencing is
+unaffected (the fence never depended on cutting — see techspec §5.3).
