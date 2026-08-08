@@ -50,7 +50,9 @@ A **native printing SDK for iOS and Android with a shared C++ core**.
    value (`UNKNOWN`, `UNSUPPORTED`), never a missing callback or a silent success.
 3. **Printing interface as standard as possible.** The public API models standard receipt
    semantics (text, styling, alignment, feed, cut, raster images, barcodes/QR, cash
-   drawer). The wire default is a **conservative standard ESC/POS subset** — the dialect
+   drawer). Raster deserves equal billing with text: KiloMayo renders receipts to canvas
+   and prints images today (§10). The wire default is a **conservative standard ESC/POS
+   subset** — the dialect
    the widest range of cheap "ESC/POS compatible" printers actually implements. Vendor
    quirks and extensions live behind capability profiles inside the core, never in the
    public API.
@@ -200,18 +202,77 @@ the SDK reports exactly that, honestly, instead of pretending.
 ## 9. Printer support matrix
 
 Support target: every printer currently implemented/used in the KiloMayo monorepo
-(`kilomayocom/monorepo`), plus the XP-S260M. A scan of the monorepo's printer
-implementations is running; this section gets filled with its findings:
+(`kilomayocom/monorepo`, checkout at `/Users/dictator/Projects/monorepo`), plus the
+XP-S260M. Filled from the monorepo scan run 2026-08-08:
 
-- **Xprinter XP-S260M** — LAN/serial/USB, partial cutter, 128 KB buffer, ESC/POS
-  compatible. The research subject of [techspec.md](techspec.md). **Capability probe run
-  2026-08-08 (our unit, `192.168.1.101`, over LAN): `GS ( H` process-ID completion
-  SUPPORTED; `DLE EOT` status and `GS r 1` also respond — primary completion path is
-  `GS ( H`**
-  ([testing-plan.md](testing-plan.md#-result-our-xp-s260m-unit--tested-2026-08-08)).
-- *(pending monorepo scan — brands, models, libraries, transports used today)*
+| Printer | Protocol today | Notes for the SDK |
+|---|---|---|
+| **Epson TM-T20III** | ESC/POS over TCP 9100 | The monorepo's primary reference model — default 576 dots/line (`const/defaultPrinterDotsPerLine.ts`). |
+| **Epson TM-T88VI and newer TM/TM-i** | ePOS-Print (SOAP/XML over HTTP) | Job-level XML responses (`success="true"`); WebConfig auto-configuration exists but has unfinished digest-auth and model-detection TODOs. |
+| **Rongta ESC/POS models** | ESC/POS over TCP 9100 | Known quirk: cuts too early — today compensated by hardcoding 6 newlines before the cut (`canvasToEscposCommands.ts`); CP852 code page. Exactly what capability profiles (§8) exist for. |
+| **Generic ESC/POS thermal printers** | ESC/POS over TCP 9100 | The DB `PrinterType` enum is just `escpos` \| `epos`, with `escpos` the default — the fleet is generic-ESC/POS-shaped. |
+| **Xprinter XP-S260M** | ESC/POS over TCP 9100 (also serial/USB) | Partial cutter, 128 KB buffer. Research subject of [techspec.md](techspec.md). **Capability probe run 2026-08-08 (our unit, `192.168.1.101`, LAN): `GS ( H` process-ID completion SUPPORTED; `DLE EOT` and `GS r 1` also respond — primary completion path is `GS ( H`** ([testing-plan.md](testing-plan.md#-result-our-xp-s260m-unit--tested-2026-08-08)). |
 
-## 10. Open questions
+Paper widths in use today: 384 / 504 / 576 dots per line (58 mm and 80 mm papers at
+203 dpi / 8 dots-per-mm).
+
+## 10. Current state in the KiloMayo monorepo (what the SDK replaces)
+
+From the 2026-08-08 scan. Main code: `organization/web/pos/src/utilities/device/printer/`
+(web POS printer stack) and `organization/native/pos-shell/modules/tcpModule/` (native
+TCP transport). Printer entity/routing:
+`organization/contember/api/model/entities/commerce/pointOfSale/Printer.ts`.
+
+**Send path today:** React components render the receipt → canvas (`renderToCanvas()`) →
+dithered raster → ESC/POS image commands (`canvasToEscposCommands.ts`; tall images split
+at 1024 px because Epson chokes on very tall rasters) → per-printer-host serial queue
+(`enqueue-task`) → transport:
+
+- **ESC/POS:** raw TCP to `<ip>:9100` via the native TcpModule, sent in 1 KB chunks with
+  empirically tuned 9–21 ms inter-chunk delays ("some printers may need a little time
+  between commands");
+- **ePOS:** HTTP POST of SOAP XML to `http://<ip>/cgi-bin/epos/service.cgi?devid=local_printer`.
+
+**"Feedback" today — and the likely duplicate-ticket mechanism:** after sending, the
+ESC/POS path issues a real-time status query (`0x10 0x04`, i.e. `DLE EOT`) and waits up
+to 5 s. Per
+[techspec.md §3.3](techspec.md#33-dle-eot--useful-but-not-as-a-completion-acknowledgement),
+`DLE EOT` is answered immediately, out of order with buffered print data — so this check
+can report success while the receipt is still sitting in the printer's buffer, and can
+"fail" by timeout while the receipt goes on to print anyway. With no retry logic and
+kitchen tickets buffered behind a 128 KB input buffer, that is precisely the observed
+symptom: ticket looks failed → staff resend → the buffered original prints later →
+duplicate. The ePOS path parses `success="true"` from the XML; no retry on parse failure.
+
+**Pain points found in code, mapped to what the SDK fixes:**
+
+| Today (evidence in monorepo) | SDK answer |
+|---|---|
+| Android TCP module is an unimplemented stub — printing is effectively iOS-only native (`tcpModule/android/.../tcp_module.kt` TODO) | The C++ core's transport runs identically on both platforms — Android gets real printing for free |
+| `DLE EOT` misused as a completion check, 5 s timeout, `@TODO: handle errors of print functions` (`EscposPrinter.tsx`, `Printer.ts`) | Ordered `GS ( H` completion fences + `JobState`/`ConfidenceLevel` + first-class `Unknown` |
+| No print-job status logging (`printPendingTicketsAndCancellations.ts` `@TODO`) | Persistent job store with full state history |
+| Rongta early-cut hardcoded 6-newline workaround | Capability-profile quirk flag |
+| Empirical 9–21 ms chunk pacing scattered in app code | Flow control owned by the core, tuned per profile |
+| Network discovery is a stub returning fake devices (`shared/std/.../scanNetwork.ts`) | SDK discovery (open question §11.3) |
+| Broken IPv6 heuristic in ePOS URL building (`EposPrinter.tsx`) | Core owns addressing and transports |
+| CP852 hardcoded; emoji/non-Latin filtered | Encoding per capability profile |
+| Duplicate warnings only on manual reprint of some doc types (`const/reprintDuplicateWarningPrintableTypes.ts`) | Idempotency keys, explicit `forceReprint`, attempt counter on every ticket (§6) |
+
+**Requirements this adds to the SDK:**
+
+- **Raster is a first-class job type.** KiloMayo prints receipts as rendered images, not
+  ESC/POS text — so raster jobs (dithering, width fitting to 384/504/576 dots, banding
+  for tall images) matter as much as text primitives, and the existing
+  one-job-at-a-time-per-printer queue semantics must be preserved (the core already
+  requires this for completion fencing).
+- **Job payloads stay opaque; routing stays app-side.** The POS distinguishes 15
+  printable types (receipt, guestCheck, ticket, customerTicket, cancellationTicket,
+  seatChange, customerTabsMerge, closingSummary, customerPager, payment, paidAndClosed,
+  startPreparation, internalMessage, image, gpTomReceipt) routed to per-role printers
+  (receiptPrinter / ticketPrinters / customerPagerPrinter / paymentAndClosurePrinter).
+  The SDK prints jobs; which printer gets which document type remains the app's decision.
+
+## 11. Open questions
 
 1. **iOS binding mechanism** — direct Swift/C++ interop (Xcode 15+) vs. an Objective-C++
    shim. Interop is cleaner if our minimum toolchain allows it.
@@ -223,8 +284,11 @@ implementations is running; this section gets filled with its findings:
    storage callback).
 5. **Whether the Linux/RPi agent ships from this repo** using the same core (probable
    yes — it is the strongest argument for the C++ core).
+6. **ePOS-Print protocol support** — the monorepo drives Epson TM-T88VI+ via ePOS
+   (SOAP/HTTP) today. Does v1 include an ePOS transport in the core, or are those
+   printers driven through their ESC/POS mode instead (most Epson TM models speak both)?
 
-## 11. Non-goals (for v1)
+## 12. Non-goals (for v1)
 
 - Physical print verification hardware (exit sensors, QR scanners) — designed for in the
   state machine (`PhysicallyVerified`), not built now
