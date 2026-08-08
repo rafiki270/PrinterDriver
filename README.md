@@ -32,11 +32,19 @@ duplicates after resume). Two real defects found by that hardware testing — th
 slicing trailing content, and journal-reloaded jobs losing their evidence grade — are
 fixed with regression tests.
 
+The **receipt DSL** ([docs/receipt-dsl.md](docs/receipt-dsl.md)) is built as its own
+library, `printerdriver_dsl`: the document model with a hand-written strict-JSON subset,
+named styles with inheritance, template binding (`{{path}}`, `each`, `if`/`unless`,
+locale-aware formatters), and the hardware-path renderer that lays columns out against
+the printer's characters-per-line. Every departure from what a document asked for — an
+italic the hardware cannot do, a barcode this milestone does not draw, a model path that
+is not there — comes back in a render report rather than disappearing. `pdctl render`
+prints that report and a character approximation of the paper without touching a printer.
+
 Not built yet: Bluetooth/USB/serial transports, the ePOS and StarPRNT transports (their
 profiles are data only — Star printers refuse honestly instead of printing unfenced),
-network discovery in the core, the receipt-DSL renderer
-([docs/receipt-dsl.md](docs/receipt-dsl.md) is specified), and the Windows port
-([docs/platforms.md](docs/platforms.md)).
+network discovery in the core, the DSL's raster path (wrapper-side text rendering and
+barcode symbologies), and the Windows port ([docs/platforms.md](docs/platforms.md)).
 
 ## Build and test
 
@@ -49,10 +57,11 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The build produces the static library `printerdriver_core` and the `pdctl` diagnostic CLI;
-public headers live in `core/include/printerdriver/`. Tests are plain executables using a
-small built-in assert harness (`core/tests/test_harness.hpp`) and are registered
-individually with CTest.
+The build produces the static libraries `printerdriver_core`, `printerdriver_queue` and
+`printerdriver_dsl`, plus the `pdctl` diagnostic CLI; public headers live in
+`core/include/printerdriver/`, `queue/include/printerdriver/` and
+`dsl/include/printerdriver/`. Tests are plain executables using a small built-in assert
+harness (`core/tests/test_harness.hpp`) and are registered individually with CTest.
 
 ## Swift package
 

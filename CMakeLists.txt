@@ -64,6 +64,25 @@ target_link_libraries(printerdriver_queue PUBLIC printerdriver_core)
 
 printerdriver_warnings(printerdriver_queue)
 
+# Receipt DSL (docs/receipt-dsl.md) — the document tier. Its own library for the same
+# reason the queue is: an app that renders its own receipts must not link a template
+# engine it never calls. Depends on the core for the encoder and the media profile, and
+# on nothing else — the strict JSON subset it needs is written by hand in dsl/src.
+add_library(printerdriver_dsl STATIC
+  dsl/src/text.cpp
+  dsl/src/json.cpp
+  dsl/src/report.cpp
+  dsl/src/document.cpp
+  dsl/src/format.cpp
+  dsl/src/bind.cpp
+  dsl/src/render.cpp)
+
+target_include_directories(printerdriver_dsl PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/dsl/include>)
+target_link_libraries(printerdriver_dsl PUBLIC printerdriver_core)
+
+printerdriver_warnings(printerdriver_dsl)
+
 # C ABI (docs/api.md §9) — what every other wrapper binds.
 add_library(printerdriver_capi STATIC
   capi/src/pd_capi.cpp)
@@ -114,7 +133,7 @@ if(PD_BUILD_SHARED_CAPI)
 endif()
 
 add_executable(pdctl tools/pdctl.cpp)
-target_link_libraries(pdctl PRIVATE printerdriver_core)
+target_link_libraries(pdctl PRIVATE printerdriver_dsl)
 printerdriver_warnings(pdctl)
 
 enable_testing()
@@ -136,6 +155,25 @@ foreach(test_name IN LISTS printerdriver_tests)
     core/tests/${test_name}.cpp
     core/tests/test_harness.cpp)
   target_link_libraries(${test_name} PRIVATE printerdriver_core)
+  target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
+  printerdriver_warnings(${test_name})
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
+
+# The DSL suites reuse the core's assert harness; they need no printer at all, because
+# the whole layer is a pure function of (document, model, profile).
+set(printerdriver_dsl_tests
+  test_dsl_json
+  test_dsl_document
+  test_dsl_format
+  test_dsl_bind
+  test_dsl_render)
+
+foreach(test_name IN LISTS printerdriver_dsl_tests)
+  add_executable(${test_name}
+    dsl/tests/${test_name}.cpp
+    core/tests/test_harness.cpp)
+  target_link_libraries(${test_name} PRIVATE printerdriver_dsl)
   target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
   printerdriver_warnings(${test_name})
   add_test(NAME ${test_name} COMMAND ${test_name})

@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -14,6 +16,7 @@
 #include "printerdriver/device_profiles.hpp"
 #include "printerdriver/driver.hpp"
 #include "printerdriver/identity.hpp"
+#include "printerdriver/receipt_dsl.hpp"
 #include "printerdriver/response_parser.hpp"
 #include "printerdriver/transport.hpp"
 
@@ -192,8 +195,17 @@ int usage() {
       "  pdctl identify <host[:port]> [--mac <address>] [--vendor <name>]\n"
       "      Fingerprint only. GS I is never trusted on its own.\n"
       "\n"
+      "  pdctl render --template <file.json> [--model <file.json>]\n"
+      "               [--width <dots>] [--profile <name>]\n"
+      "      Bind and lay out a receipt-DSL document without touching a printer:\n"
+      "      prints the render report (every degradation, declared) and a character\n"
+      "      approximation of the paper. Reads files only; opens no socket.\n"
+      "\n"
       "  pdctl print <host[:port]> --text \"...\" [options]\n"
+      "  pdctl print <host[:port]> --template <file.json> [--model <file.json>]\n"
       "      Print a small receipt through the full engine and stream job events.\n"
+      "      --template <f>              receipt-DSL document or template\n"
+      "      --model <f>                 JSON parameter model bound into the template\n"
       "      --key <k>                   idempotency key (default: generated)\n"
       "      --profile <name>            capability profile (default: xp-s260m;\n"
       "                                  --profile list prints the database)\n"
@@ -611,10 +623,104 @@ int runSettings(const Endpoint& endpoint) {
       1200ms);
 }
 
+// --- receipt DSL (docs/receipt-dsl.md) -----------------------------------------------
+
+// The document tier goes through the same three steps everywhere: parse the template,
+// bind the model, render against the media. `render` stops after step three and prints
+// what it got; `print` hands the bytes to the identical engine path a --text receipt
+// uses, so a template proves the same things about the engine that a plain job does.
+
+bool readFile(const std::string& path, std::string* out) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    return false;
+  }
+  std::ostringstream buffer;
+  buffer << stream.rdbuf();
+  *out = buffer.str();
+  return true;
+}
+
+void printDslReport(const pd::dsl::RenderReport& report) {
+  if (report.empty()) {
+    std::cout << "  nothing degraded: every block rendered as written\n";
+    return;
+  }
+  for (const pd::dsl::ReportEntry& entry : report.entries) {
+    std::cout << "  " << std::left << std::setw(22)
+              << (entry.block.empty() ? "document" : entry.block) << std::setw(20)
+              << pd::dsl::to_string(entry.kind) << "\n"
+              << "      requested  " << entry.requested << "\n"
+              << "      delivered  " << entry.delivered << " ("
+              << pd::dsl::to_string(entry.path) << ")\n";
+    if (!entry.detail.empty()) {
+      std::cout << "      because    " << entry.detail << "\n";
+    }
+  }
+}
+
+// Parses the template and, when a model is supplied, binds it. Returns false and
+// explains itself on stdout when a file is missing or the JSON is not a document;
+// everything softer than that becomes a render-report entry instead.
+bool loadDocument(const std::string& template_path, const std::string& model_path,
+                  pd::dsl::Document* out, pd::dsl::RenderReport* report) {
+  std::string template_text;
+  if (!readFile(template_path, &template_text)) {
+    std::cout << "cannot read template: " << template_path << "\n";
+    return false;
+  }
+  std::vector<std::string> warnings;
+  pd::dsl::Document document;
+  try {
+    document = pd::dsl::parseDocument(template_text, &warnings);
+  } catch (const std::exception& error) {
+    std::cout << "template rejected: " << error.what() << "\n";
+    return false;
+  }
+  for (const std::string& warning : warnings) {
+    report->add(pd::dsl::ReportKind::Note, "template", warning, "ignored",
+                pd::dsl::RenderPath::Hardware);
+  }
+
+  if (model_path.empty()) {
+    if (document.is_template) {
+      std::cout << "this document is a template: --model is required\n";
+      return false;
+    }
+    *out = std::move(document);
+    return true;
+  }
+
+  std::string model_text;
+  if (!readFile(model_path, &model_text)) {
+    std::cout << "cannot read model: " << model_path << "\n";
+    return false;
+  }
+  pd::dsl::Json model;
+  std::string error;
+  if (!pd::dsl::tryParseJson(model_text, &model, &error)) {
+    std::cout << "model rejected: " << error << "\n";
+    return false;
+  }
+  pd::dsl::BindOutcome bound = pd::dsl::bind(document, model);
+  report->append(bound.report);
+  *out = std::move(bound.document);
+  return true;
+}
+
+struct RenderArgs {
+  std::string template_path;
+  std::string model_path;
+  std::string profile = "xp-s260m";
+  uint32_t width = 0;
+};
+
 // --- print ------------------------------------------------------------------------
 
 struct PrintArgs {
   std::string text;
+  std::string template_path;
+  std::string model_path;
   std::string key;
   std::string profile = "xp-s260m";
   std::string store;
@@ -643,6 +749,71 @@ bool profileExists(const std::string& name) {
   return name == "xp-s260m" || name == "generic" || pd::devices::exists(name);
 }
 
+// --- render (no printer involved) -----------------------------------------------------
+
+void printCutAndMargins(const pd::dsl::RenderOutput& output) {
+  // docs/receipt-dsl.md: the document declares cut and margins, the caller applies them.
+  // The renderer returns them; it never emits a trailing cut of its own.
+  row("document cut", output.requested_cut.has_value()
+                          ? pd::dsl::to_string(*output.requested_cut)
+                          : "not stated (caller and profile decide)");
+  row("top margin", output.requested_margins.top_dots.has_value()
+                        ? std::to_string(*output.requested_margins.top_dots) + " dots"
+                        : "not stated");
+  row("bottom margin", output.requested_margins.bottom_dots.has_value()
+                           ? std::to_string(*output.requested_margins.bottom_dots) + " dots"
+                           : "not stated");
+}
+
+int runRender(const RenderArgs& args) {
+  const pd::CapabilityProfile profile = profileByName(args.profile);
+  pd::dsl::RenderReport report;
+  pd::dsl::Document document;
+  if (!loadDocument(args.template_path, args.model_path, &document, &report)) {
+    return kExitFailed;
+  }
+
+  pd::dsl::RenderOptions options;
+  options.profile = pd::dsl::RenderProfile::from(profile, args.width);
+  const pd::dsl::TextPreview preview = pd::dsl::renderText(document, options);
+  const pd::dsl::RenderOutput output = pd::dsl::render(document, options);
+  report.append(preview.report);
+
+  const pd::dsl::ResolvedStyle plain;
+  const uint32_t columns = options.profile.charsPerLine(plain);
+
+  std::cout << "Receipt render - " << args.template_path << "\n";
+  section("Media");
+  row("profile", profile.name);
+  row("printable width", std::to_string(options.profile.width_dots) + " dots");
+  row("characters per line", std::to_string(columns) + " (font A)");
+  row("code page", std::to_string(static_cast<int>(options.profile.code_page)));
+  row("escpos bytes", std::to_string(output.bytes().size()));
+  printCutAndMargins(output);
+
+  section("Render report");
+  printDslReport(report);
+
+  section("Text approximation");
+  // A line in font B or at a width multiplier is laid out against its own column count,
+  // so the box is drawn at the widest line rather than clipping anything away.
+  size_t box = columns;
+  for (const std::string& line : preview.lines) {
+    box = std::max(box, pd::dsl::text::width(line));
+  }
+  std::cout << "  +" << std::string(box, '-') << "+\n";
+  for (const std::string& line : preview.lines) {
+    std::cout << "  |" << pd::dsl::text::pad(line, box, pd::dsl::Align::Left) << "|\n";
+  }
+  std::cout << "  +" << std::string(box, '-') << "+\n";
+  std::cout << "\nthis is an approximation: character cells only. Scaled and font-B lines\n"
+               "carry their own column count (" << columns
+            << " is font A at this width), and QR,\n"
+               "images and barcodes appear as markers. The byte count above is what a\n"
+               "printer would actually receive.\n";
+  return kExitDone;
+}
+
 int runPrint(const Endpoint& endpoint, const PrintArgs& args) {
   const pd::CapabilityProfile profile = profileByName(args.profile);
 
@@ -665,31 +836,83 @@ int runPrint(const Endpoint& endpoint, const PrintArgs& args) {
     std::cout << "  device  " << pd::to_string(event) << "\n" << std::flush;
   });
 
-  pd::escpos::Encoder receipt;
-  receipt.selectCodePage(profile.code_page)
-      .align(pd::escpos::Alignment::Center)
-      .bold(true)
-      .textSize(2, 2)
-      .line("PRINTERDRIVER")
-      .textSize(1, 1)
-      .bold(false)
-      .line("pdctl test receipt")
-      .feed()
-      .align(pd::escpos::Alignment::Left)
-      .line("--------------------------------")
-      .line(args.text)
-      .line("--------------------------------");
-  if (!args.key.empty()) {
-    receipt.line("ORDER: " + args.key).qr(args.key, 4);
-  }
-
   pd::JobOptions options;
   options.key = args.key;
   options.cut = args.cut ? pd::CutSetting::Profile : pd::CutSetting::None;
   options.preflight = args.preflight ? pd::PreflightMode::Strict : pd::PreflightMode::Skip;
   options.timeout_ms = args.timeout_ms;
 
-  auto job = printer->print(pd::Payload::document(receipt), options);
+  pd::Payload payload = pd::Payload::raw({});
+  if (!args.template_path.empty()) {
+    pd::dsl::RenderReport report;
+    pd::dsl::Document document;
+    if (!loadDocument(args.template_path, args.model_path, &document, &report)) {
+      return kExitFailed;
+    }
+    pd::dsl::RenderOptions render_options;
+    render_options.profile = pd::dsl::RenderProfile::from(profile, args.width);
+    const pd::dsl::RenderOutput output = pd::dsl::render(document, render_options);
+    report.append(output.report);
+
+    section("Render report");
+    printDslReport(report);
+    section("Document meta");
+    printCutAndMargins(output);
+
+    // The three-level precedence of docs/receipt-dsl.md, applied by the caller: an
+    // explicit --no-cut wins over the document, and the document wins over the profile.
+    if (args.cut && output.requested_cut.has_value()) {
+      switch (*output.requested_cut) {
+        case pd::dsl::CutRequest::Profile: options.cut = pd::CutSetting::Profile; break;
+        case pd::dsl::CutRequest::Partial: options.cut = pd::CutSetting::Partial; break;
+        case pd::dsl::CutRequest::Full: options.cut = pd::CutSetting::Full; break;
+        case pd::dsl::CutRequest::None: options.cut = pd::CutSetting::None; break;
+      }
+    }
+
+    // The top margin is whitespace the caller feeds before the content, so it belongs
+    // in the payload. The bottom margin is the engine's (it has to survive the
+    // blade-clearance floor), and this build's JobOptions cannot carry it yet.
+    pd::escpos::Bytes bytes;
+    if (output.requested_margins.top_dots.value_or(0) > 0) {
+      pd::escpos::Encoder lead;
+      lead.feedDots(static_cast<uint16_t>(
+          std::min<uint32_t>(*output.requested_margins.top_dots, 0xFFFF)));
+      bytes = lead.take();
+    }
+    const pd::escpos::Bytes& rendered = output.bytes();
+    bytes.insert(bytes.end(), rendered.begin(), rendered.end());
+    payload = pd::Payload::document(std::move(bytes), output.codePage());
+    if (output.requested_margins.bottom_dots.has_value()) {
+      std::cout << "\n  note: the document asks for a "
+                << *output.requested_margins.bottom_dots << " dot bottom margin.\n"
+                << "        Reported, not applied: the trailing feed belongs to the\n"
+                   "        engine, which always feeds at least the blade-clearance\n"
+                   "        distance before a cut.\n";
+    }
+    std::cout << "\n";
+  } else {
+    pd::escpos::Encoder receipt;
+    receipt.selectCodePage(profile.code_page)
+        .align(pd::escpos::Alignment::Center)
+        .bold(true)
+        .textSize(2, 2)
+        .line("PRINTERDRIVER")
+        .textSize(1, 1)
+        .bold(false)
+        .line("pdctl test receipt")
+        .feed()
+        .align(pd::escpos::Alignment::Left)
+        .line("--------------------------------")
+        .line(args.text)
+        .line("--------------------------------");
+    if (!args.key.empty()) {
+      receipt.line("ORDER: " + args.key).qr(args.key, 4);
+    }
+    payload = pd::Payload::document(receipt);
+  }
+
+  auto job = printer->print(std::move(payload), options);
   std::cout << "job      " << job->id() << "\nkey      " << job->key() << "\n\n";
   job->subscribe([](const pd::JobEvent& event) {
     std::cout << "  " << std::left << std::setw(22) << pd::to_string(event.state)
@@ -745,6 +968,44 @@ int listProfiles() {
 int main(int argc, char** argv) {
   if (argc >= 3 && std::string(argv[1]) == "print" && std::string(argv[2]) == "list") {
     return listProfiles();
+  }
+  // `render` takes no printer, so it is dispatched before the endpoint is parsed.
+  if (argc >= 2 && std::string(argv[1]) == "render") {
+    RenderArgs args;
+    for (int i = 2; i < argc; ++i) {
+      const std::string flag = argv[i];
+      const bool has_value = i + 1 < argc;
+      if (flag == "--template" && has_value) {
+        args.template_path = argv[++i];
+      } else if (flag == "--model" && has_value) {
+        args.model_path = argv[++i];
+      } else if (flag == "--profile" && has_value) {
+        args.profile = argv[++i];
+        if (!profileExists(args.profile)) {
+          std::cout << "unknown profile: " << args.profile << " (try --profile list)\n\n";
+          return kExitUsage;
+        }
+      } else if (flag == "--width" && has_value) {
+        args.width = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        if (args.width == 0) {
+          std::cout << "invalid width\n\n";
+          return kExitUsage;
+        }
+      } else {
+        std::cout << "unknown option: " << flag << "\n\n";
+        return usage();
+      }
+    }
+    if (args.template_path.empty()) {
+      std::cout << "render requires --template\n\n";
+      return usage();
+    }
+    try {
+      return runRender(args);
+    } catch (const std::exception& error) {
+      std::cout << "error: " << error.what() << "\n";
+      return kExitFailed;
+    }
   }
   if (argc < 3) {
     return usage();
@@ -815,6 +1076,10 @@ int main(int argc, char** argv) {
         const bool has_value = i + 1 < argc;
         if (flag == "--text" && has_value) {
           args.text = argv[++i];
+        } else if (flag == "--template" && has_value) {
+          args.template_path = argv[++i];
+        } else if (flag == "--model" && has_value) {
+          args.model_path = argv[++i];
         } else if (flag == "--key" && has_value) {
           args.key = argv[++i];
         } else if (flag == "--profile" && has_value) {
@@ -846,8 +1111,8 @@ int main(int argc, char** argv) {
           return usage();
         }
       }
-      if (args.text.empty()) {
-        std::cout << "print requires --text\n\n";
+      if (args.text.empty() && args.template_path.empty()) {
+        std::cout << "print requires --text or --template\n\n";
         return usage();
       }
       return runPrint(endpoint, args);
