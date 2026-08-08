@@ -16,8 +16,12 @@ with thin wrappers for any other system later. Design goals:
   unsupported are explicit enum values, never missing callbacks;
 - **a printing interface as standard as possible** — standard receipt semantics over a
   conservative standard ESC/POS subset, vendor quirks hidden behind capability profiles;
-- **works with the most standard printers** — the printers already implemented in the
-  existing POS monorepo, plus the Xprinter XP-S260M studied here.
+- **works with the most standard printers** — the printers already implemented in our
+  existing POS apps, plus the Xprinter XP-S260M studied here.
+
+The SDK serves **multiple in-house apps** — the existing web-based POS monorepo and our
+native POS suite alike — so nothing app-specific may live inside it: payloads are opaque,
+document-to-printer routing stays app-side.
 
 Full SDK design: [docs/sdk-spec.md](sdk-spec.md). The research below is the protocol
 foundation the core is built on.
