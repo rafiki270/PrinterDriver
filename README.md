@@ -15,9 +15,10 @@ Built and tested: the full C++ core (encoder, interleaved response parser, durab
 store, TCP transport, fenced print engine), printer identification with compositional
 capability profiles and probe-then-promote, the device database from
 [docs/device-database.md](docs/device-database.md), the C ABI (`pd.h`), the print-queue
-addon, and three wrappers — Swift (iOS 16+/macOS 13+, verified), Dart (pub-ready,
-verified), Kotlin/Android (scaffold, CI-pending). Every job result carries a confidence
-grade, a completion authority and the method that produced it.
+addon, and four wrappers — Swift (iOS 16+/macOS 13+, verified), Dart (pub-ready,
+verified), .NET (NuGet-ready, verified on macOS against the real native library),
+Kotlin/Android (scaffold, CI-pending). Every job result carries a confidence grade, a
+completion authority and the method that produced it.
 
 Identity is untrusted by default. `GS I` is a string the firmware chooses, and at least
 one printer family ships answering as somebody else's model
@@ -45,6 +46,15 @@ Not built yet: Bluetooth/USB/serial transports, the ePOS and StarPRNT transports
 profiles are data only — Star printers refuse honestly instead of printing unfenced),
 network discovery in the core, the DSL's raster path (wrapper-side text rendering and
 barcode symbologies), and the Windows port ([docs/platforms.md](docs/platforms.md)).
+network discovery in the core, and the receipt-DSL renderer
+([docs/receipt-dsl.md](docs/receipt-dsl.md) is specified).
+
+The **Windows port** ([docs/platforms.md](docs/platforms.md)) is written but not built:
+the Winsock2 transport and the `FlushFileBuffers`/`ReplaceFile` journal path are
+syntax- and type-checked only (`scripts/check_windows_syntax.sh`, which runs negative
+controls proving the check can fail), and `.github/workflows/windows.yml` is
+manual-dispatch and has not been dispatched. The POSIX build is untouched by it — the
+two are alternative translation units, never both.
 
 ## Build and test
 
@@ -114,6 +124,24 @@ cd wrappers/dart && dart test
 (`com.printerdriver:printerdriver`) — Gradle + externalNativeBuild over the same core,
 JNI glue syntax-checked against `pd.h`, honest README stating exactly what a CI run on a
 JVM host must still confirm.
+
+## .NET package
+
+[wrappers/dotnet/](wrappers/dotnet/) is a NuGet-ready C# wrapper (`PrinterDriver`,
+net8.0, MIT) over the same C ABI: P/Invoke, the thirteen enums mirrored and asserted
+against the core's own member counts, a closed `Done`/`Failed`/`Unknown` record with no
+boolean anywhere in it, `IAsyncEnumerable` event streams and `GCHandle`-rooted native
+callbacks.
+
+```sh
+cmake -S . -B build-dotnet -DPD_BUILD_SHARED_CAPI=ON
+cmake --build build-dotnet --target printerdriver_capi_testing
+dotnet test wrappers/dotnet/PrinterDriver.Tests
+```
+
+The managed side is verified on macOS against the real native library;
+[wrappers/dotnet/README.md](wrappers/dotnet/README.md) states exactly what is verified,
+what is syntax-checked, and what a Windows CI run must still confirm.
 
 ## Example app
 
@@ -186,6 +214,7 @@ queue/                        the print-queue addon (separate library on purpose
 Package.swift                 SwiftPM manifest for the whole repository
 wrappers/swift/               the Swift wrapper: Sources, Tests, README
 wrappers/dart/                the Dart FFI package (pub-ready)
+wrappers/dotnet/              the .NET wrapper: library, tests, README (NuGet-ready)
 wrappers/android/             the Kotlin/Android AAR scaffold (CI-pending)
 tools/pdctl.cpp               command-line diagnostics
 docs/                         specifications — these are authoritative, not the code

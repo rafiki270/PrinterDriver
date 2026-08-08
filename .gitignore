@@ -12,3 +12,12 @@ build-*/
 local.properties
 *.iml
 .idea/
+
+# .NET (wrappers/dotnet). `runtimes/` is deliberately NOT ignored: a Windows release
+# build stages printerdriver_capi.dll under
+# wrappers/dotnet/PrinterDriver/runtimes/<rid>/native/ for `dotnet pack` to pick up, and
+# whether that binary is committed is a release decision, not a gitignore one.
+bin/
+obj/
+artifacts/
+*.user

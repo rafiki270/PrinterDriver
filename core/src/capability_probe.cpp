@@ -1,16 +1,6 @@
 #include "printerdriver/capability_probe.hpp"
 
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -18,7 +8,9 @@
 #include <sstream>
 #include <utility>
 
+#include "platform_file.hpp"
 #include "printerdriver/job_store.hpp"
+#include "printerdriver/net_platform.hpp"
 
 namespace pd {
 namespace {
@@ -519,12 +511,12 @@ FindingsStore::FindingsStore(std::string directory, std::string file_name) {
   if (directory.empty()) {
     return;
   }
-  if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
+  if (!platform_file::createDirectory(directory, nullptr)) {
     // A findings cache that cannot be written is a performance problem, never a
     // correctness one: the probe simply runs again next boot.
     return;
   }
-  if (directory.back() == '/') {
+  if (platform_file::isSeparator(directory.back())) {
     directory.pop_back();
   }
   path_ = directory + "/" + file_name;
@@ -549,8 +541,8 @@ void FindingsStore::flush() const {
     return;
   }
   const std::string temp = path_ + ".tmp";
-  const int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0) {
+  const NativeFile file = platform_file::openTruncate(temp, nullptr);
+  if (!nativeFileValid(file)) {
     return;
   }
   std::string blob;
@@ -558,26 +550,15 @@ void FindingsStore::flush() const {
     blob += serializeFindings(record);
     blob += '\n';
   }
-  const char* data = blob.data();
-  size_t remaining = blob.size();
-  bool ok = true;
-  while (remaining > 0) {
-    const ssize_t written = ::write(fd, data, remaining);
-    if (written <= 0) {
-      ok = false;
-      break;
-    }
-    data += written;
-    remaining -= static_cast<size_t>(written);
-  }
+  const bool ok = platform_file::writeAll(file, blob.data(), blob.size(), nullptr);
   if (ok) {
-    ::fsync(fd);
+    platform_file::sync(file, nullptr);
   }
-  ::close(fd);
+  platform_file::closeFile(file);
   if (ok) {
-    ::rename(temp.c_str(), path_.c_str());
+    platform_file::replaceFile(temp, path_, nullptr);
   } else {
-    ::unlink(temp.c_str());
+    platform_file::removeFile(temp);
   }
 }
 
@@ -632,6 +613,11 @@ size_t FindingsStore::size() const {
 // --- Port reachability ---------------------------------------------------------------
 
 bool tcpPortOpen(const std::string& host, uint16_t port, uint32_t timeout_ms) {
+  // Winsock refuses getaddrinfo too, not just socket(), until WSAStartup has run. A
+  // no-op on POSIX.
+  if (!net::startup()) {
+    return false;
+  }
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -642,27 +628,25 @@ bool tcpPortOpen(const std::string& host, uint16_t port, uint32_t timeout_ms) {
   }
   bool open = false;
   for (addrinfo* it = resolved; it != nullptr && !open; it = it->ai_next) {
-    const int fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (fd < 0) {
+    const net::Socket socket = net::create(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (!net::valid(socket)) {
       continue;
     }
-    const int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+    net::setNonBlocking(socket);
+    if (::connect(socket, it->ai_addr, static_cast<net::SockLen>(it->ai_addrlen)) == 0) {
       open = true;
-    } else if (errno == EINPROGRESS) {
-      pollfd waiter{};
-      waiter.fd = fd;
-      waiter.events = POLLOUT;
-      if (::poll(&waiter, 1, static_cast<int>(timeout_ms)) > 0) {
+    } else if (net::inProgress(net::lastError())) {
+      net::PollFd waiter;
+      waiter.socket = socket;
+      waiter.events = net::kPollOut;
+      if (net::poll(&waiter, 1, static_cast<int>(timeout_ms)) > 0) {
         int error = 0;
-        socklen_t length = sizeof(error);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0) {
+        if (net::pendingError(socket, &error) && error == 0) {
           open = true;
         }
       }
     }
-    ::close(fd);
+    net::closeSocket(socket);
   }
   ::freeaddrinfo(resolved);
   return open;

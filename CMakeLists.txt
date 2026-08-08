@@ -27,6 +27,25 @@ function(printerdriver_warnings target)
   endif()
 endfunction()
 
+# The core has exactly two platform edges: sockets and durable file writes
+# (docs/platforms.md, "Using the SDK from a Windows app"). Each is a pair of
+# alternative translation units, one of which is compiled — never both — so the POSIX
+# implementation is entirely unaffected by the existence of the Windows one.
+#
+# NOTE ON STATUS: the *_win.cpp files below have been syntax- and type-checked only
+# (scripts/check_windows_syntax.sh). They have never been compiled by MSVC or clang-cl,
+# never linked, never run. .github/workflows/windows.yml is the manual-dispatch job that
+# will produce the first real evidence; it has not been run either.
+if(WIN32)
+  set(printerdriver_platform_sources
+    core/src/transport_win.cpp
+    core/src/platform_file_win.cpp)
+else()
+  set(printerdriver_platform_sources
+    core/src/transport.cpp
+    core/src/platform_file_posix.cpp)
+endif()
+
 # Standard library only. No FetchContent, no find_package, nothing downloaded:
 # the core has to build inside iOS, Android, Flutter and Linux-agent toolchains
 # without a package manager anywhere in the loop.
@@ -40,16 +59,23 @@ add_library(printerdriver_core STATIC
   core/src/identity.cpp
   core/src/capability_probe.cpp
   core/src/job_store.cpp
-  core/src/transport.cpp
-  core/src/driver.cpp)
+  core/src/driver.cpp
+  ${printerdriver_platform_sources})
 
 target_include_directories(printerdriver_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/core/include>)
+# platform_file.hpp is an internal header: core/src is on the include path for anything
+# that compiles the core's own sources, and is not exported to consumers.
+target_include_directories(printerdriver_core PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/src)
 
-# POSIX sockets and one thread per printer plus one per connection: the only OS
-# services the core uses.
+# Sockets and one thread per printer plus one per connection: the only OS services the
+# core uses. On Windows the socket library is not in the default link set.
 find_package(Threads REQUIRED)
 target_link_libraries(printerdriver_core PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(printerdriver_core PUBLIC ws2_32)
+endif()
 
 printerdriver_warnings(printerdriver_core)
 
