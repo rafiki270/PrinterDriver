@@ -4,6 +4,7 @@
 #include <string>
 
 #include "fake_printer.hpp"
+#include "printerdriver/device_profiles.hpp"
 #include "test_harness.hpp"
 
 using namespace pd;
@@ -290,6 +291,57 @@ PD_TEST(engine_same_key_returns_the_same_job_and_prints_once) {
   CHECK_EQ(rig.link.device->cuts(), static_cast<size_t>(1));
   CHECK_EQ(rig.link.device->markers().size(), static_cast<size_t>(2));
   CHECK(rig.driver->findJob(options.key).get() == first.get());
+}
+
+PD_TEST(engine_resubmitting_a_failed_key_starts_a_fresh_attempt) {
+  // Regression from the hardware soak: a preflight refusal is FailedKnown, nothing
+  // printed, and docs/api.md §4 calls that "safe to resubmit same key". Returning the
+  // dead job instead swallowed the retry and the ticket never appeared.
+  Rig rig(CompletionMechanism::GsParenH);
+  pdfake::Script script;
+  script.paper_sensor = pdfake::paperOutByte();
+  rig.link.device->setScript(script);
+  rig.build();
+  JobOptions options;
+  options.key = "order-refused";
+
+  auto refused = rig.printer->print(Payload::raw(textPayload("KITCHEN TICKET")), options);
+  CHECK_EQ(refused->result().outcome, JobOutcome::Failed);
+  CHECK_EQ(refused->result().reason, FailureReason::PreflightPaperOut);
+  CHECK_EQ(rig.link.device->printDataBytes(), static_cast<size_t>(0));
+
+  rig.link.device->setScript(pdfake::Script{});  // operator reloads the paper
+  auto retried = rig.printer->print(Payload::raw(textPayload("KITCHEN TICKET")), options);
+  CHECK(retried.get() != refused.get());
+  CHECK_EQ(retried->attempt(), 2u);
+  CHECK_EQ(retried->key(), options.key);
+  CHECK_EQ(retried->result().outcome, JobOutcome::Done);
+  CHECK_EQ(rig.link.device->cuts(), static_cast<size_t>(1));
+  CHECK(rig.link.device->receivedContains("KITCHEN TICKET"));
+  // Nothing was printed the first time, so there is no duplicate to warn about: the
+  // banner belongs to forceReprint, not to the attempt counter.
+  CHECK(!rig.link.device->receivedContains(kReprintBannerLine));
+  CHECK(!rig.link.device->receivedContains(std::string(kReprintAttemptPrefix) + "2"));
+  CHECK(rig.driver->findJob(options.key).get() == retried.get());
+}
+
+PD_TEST(engine_resubmitting_an_unknown_key_still_returns_the_same_job) {
+  // The other half of the rule: Unknown means bytes went out and may be on paper, so
+  // a resubmission must not print again. Only a deliberate forceReprint may.
+  Rig rig(CompletionMechanism::GsParenH);
+  pdfake::Script script;
+  script.answer_process_id = false;
+  rig.link.device->setScript(script);
+  rig.build();
+  JobOptions options;
+  options.key = "order-ambiguous";
+
+  auto first = rig.printer->print(Payload::raw(textPayload("MAYBE PRINTED")), options);
+  CHECK_EQ(first->result().outcome, JobOutcome::Unknown);
+  auto second = rig.printer->print(Payload::raw(textPayload("MAYBE PRINTED")), options);
+  CHECK(first.get() == second.get());
+  CHECK_EQ(second->attempt(), 1u);
+  CHECK_EQ(rig.link.device->markers().size(), static_cast<size_t>(1));
 }
 
 PD_TEST(engine_resubmitting_a_key_mid_flight_still_returns_the_same_job) {
@@ -632,6 +684,212 @@ PD_TEST(engine_shutdown_terminates_queued_jobs_without_sending) {
   CHECK(queued->isTerminal());
   CHECK_EQ(queued->result().outcome, JobOutcome::Failed);
   CHECK(!link->device->receivedContains("QUEUED BEHIND"));
+}
+
+// --- Confidence grade and completion authority ------------------------------------------
+
+PD_TEST(engine_grades_a_gsparenh_completion_as_job_level_confirmation) {
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.build();
+  const JobResult result = runOne(rig, "GRADED A");
+
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.grade, ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK_EQ(result.authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(result.method, std::string("GS(H) fn48"));
+}
+
+PD_TEST(engine_grades_a_gsr1_completion_as_an_ordered_device_response) {
+  Rig rig(CompletionMechanism::GsR1);
+  rig.build();
+  const JobResult result = runOne(rig, "GRADED B");
+
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.grade, ConfidenceGrade::B_OrderedDeviceResponse);
+  CHECK_EQ(result.authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(result.method, std::string("GS r 1"));
+}
+
+PD_TEST(engine_grades_a_write_only_printer_as_transport_only) {
+  Rig rig(CompletionMechanism::None);
+  rig.build();
+  const JobResult result = runOne(rig, "GRADED E");
+
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(result.authority, CompletionAuthority::TransportOnly);
+  CHECK_EQ(result.method, std::string("transport-only"));
+}
+
+PD_TEST(engine_grades_a_status_refusal_and_an_unacknowledged_job_honestly) {
+  {
+    // The refusal came out of DLE EOT: device status around the transmission.
+    Rig rig(CompletionMechanism::GsParenH);
+    pdfake::Script script;
+    script.offline_cause = pdfake::coverOpenByte();
+    rig.link.device->setScript(script);
+    rig.build();
+    const JobResult result = runOne(rig, "REFUSED");
+    CHECK_EQ(result.outcome, JobOutcome::Failed);
+    CHECK_EQ(result.grade, ConfidenceGrade::C_DeviceStatusAround);
+    CHECK_EQ(result.authority, CompletionAuthority::PhysicalPrinter);
+    CHECK_EQ(result.method, std::string("DLE EOT"));
+  }
+  {
+    // No acknowledgement ever arrived, so nothing above transport was confirmed —
+    // whatever grade the profile would have been able to claim.
+    Rig rig(CompletionMechanism::GsParenH);
+    pdfake::Script script;
+    script.answer_process_id = false;
+    rig.link.device->setScript(script);
+    rig.build();
+    const JobResult result = runOne(rig, "NEVER FENCED");
+    CHECK_EQ(result.outcome, JobOutcome::Unknown);
+    CHECK_EQ(result.grade, ConfidenceGrade::E_TransportOnly);
+    CHECK_EQ(result.authority, CompletionAuthority::TransportOnly);
+  }
+  {
+    Rig rig(CompletionMechanism::GsParenH);
+    rig.link.behaviour.connect_fails = true;
+    rig.build();
+    const JobResult result = runOne(rig, "UNREACHABLE");
+    CHECK_EQ(result.outcome, JobOutcome::Failed);
+    CHECK_EQ(result.grade, ConfidenceGrade::E_TransportOnly);
+    CHECK_EQ(result.method, std::string("none"));
+  }
+}
+
+PD_TEST(engine_refuses_a_mechanism_it_cannot_drive_instead_of_printing_blind) {
+  // A Star profile describes a checked-block device this core does not speak.
+  // Printing it through Star's ESC/POS emulation would put paper out with no fence
+  // behind it and a result nobody should believe.
+  Rig rig(CompletionMechanism::GsParenH);
+  rig.profile = devices::star_tsp100();
+  rig.build();
+  const JobResult result = runOne(rig, "STAR TICKET");
+
+  CHECK_EQ(result.outcome, JobOutcome::Failed);
+  CHECK_EQ(result.reason, FailureReason::Unsupported);
+  CHECK_EQ(rig.link.device->received().size(), static_cast<size_t>(0));
+  CHECK_EQ(rig.link.stats->connects.load(), static_cast<size_t>(0));
+}
+
+// --- Probe-then-promote through the driver ------------------------------------------------
+
+namespace {
+
+pdfake::Script probeableDevice() {
+  pdfake::Script script;
+  script.answer_identity = true;
+  script.gs_i_manufacturer = "EPOSN";  // the documented impersonation
+  script.gs_i_model = "TM-T88V";
+  script.gs_i_firmware = "1.02";
+  script.gs_i_serial = "RT99001";
+  return script;
+}
+
+ProbeOptions fastProbe() {
+  ProbeOptions options;
+  options.status_timeout_ms = 150;
+  options.identity_timeout_ms = 150;
+  options.completion_timeout_ms = 400;
+  return options;
+}
+
+}  // namespace
+
+PD_TEST(engine_probes_on_add_and_promotes_the_profile_before_the_first_job) {
+  pdfake::MockLink link;
+  link.device->setScript(probeableDevice());
+
+  PrinterDriver driver(StorageConfig::inMemory());
+  PrinterConfig config;
+  config.id = "printer-under-test";
+  config.transport = link.factory();
+  // Shipped as an unknown 80 mm clone: GS r 1, capped at CutProcessed.
+  config.profile = devices::generic_80();
+  config.profile.completion_timeout_ms = 400;
+  config.profile.preflight_timeout_ms = 200;
+  config.profile.chunk_bytes = 0;
+  config.profile.inter_chunk_delay_ms = 0;
+  config.probe = ProbePolicy::IfUnknown;
+  config.probe_options = fastProbe();
+  auto printer = driver.addPrinter(config);
+
+  auto job = printer->print(Payload::raw(textPayload("PROMOTED")), {});
+  const JobResult result = job->result();
+
+  // The device answered GS ( H, so the job ran on the strong fence rather than on
+  // the conservative default the profile shipped with.
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.confidence, ConfidenceLevel::CutFaultFree);
+  CHECK_EQ(result.grade, ConfidenceGrade::A_JobLevelConfirmation);
+
+  const CapabilityProfile promoted = printer->profile();
+  CHECK(promoted.probed);
+  CHECK_EQ(promoted.completion, CompletionMechanism::GsParenH);
+  CHECK_EQ(promoted.identity.vendor, std::string("Rongta"));
+  CHECK(!promoted.identity.trusted);
+  CHECK(promoted.quirks.unreliable_identity);
+  // Media is not something a probe can measure, so the profile's facts survive.
+  CHECK_EQ(promoted.media.printable_width_dots, escpos::kWidth80mm);
+
+  const std::optional<CapabilityFindings> findings = printer->findings();
+  CHECK(findings.has_value());
+  CHECK_EQ(findings->reported.model, std::string("TM-T88V"));
+  CHECK_EQ(findings->key, std::string("tm_t88v-1_02-rt99001"));
+}
+
+PD_TEST(engine_reuses_persisted_findings_instead_of_reprobing_every_boot) {
+  pdfake::TempDir dir("engine-findings");
+  pdfake::MockLink link;
+  link.device->setScript(probeableDevice());
+
+  const auto configure = [&link](ProbePolicy policy) {
+    PrinterConfig config;
+    config.id = "tcp://printer-under-test:9100";
+    config.transport = link.factory();
+    config.profile = devices::generic_80();
+    config.profile.completion_timeout_ms = 400;
+    config.profile.preflight_timeout_ms = 200;
+    config.profile.chunk_bytes = 0;
+    config.profile.inter_chunk_delay_ms = 0;
+    config.probe = policy;
+    config.probe_options = fastProbe();
+    return config;
+  };
+
+  {
+    PrinterDriver driver(StorageConfig::at(dir.path()));
+    auto printer = driver.addPrinter(configure(ProbePolicy::IfUnknown));
+    printer->drain();
+    CHECK_EQ(printer->profile().completion, CompletionMechanism::GsParenH);
+    CHECK_EQ(driver.capabilities().size(), static_cast<size_t>(1));
+  }
+  const size_t identity_queries = link.device->identityRequests().size();
+  CHECK_EQ(identity_queries, static_cast<size_t>(7));
+
+  {
+    // Same printer, next boot: the stored findings promote the profile and the
+    // device is never interrogated again.
+    PrinterDriver driver(StorageConfig::at(dir.path()));
+    auto printer = driver.addPrinter(configure(ProbePolicy::IfUnknown));
+    printer->drain();
+    CHECK_EQ(printer->profile().completion, CompletionMechanism::GsParenH);
+    CHECK(printer->profile().probed);
+    CHECK(printer->findings().has_value());
+    CHECK_EQ(link.device->identityRequests().size(), identity_queries);
+  }
+
+  {
+    // ProbePolicy::Never ignores the cache as well: the profile is the whole truth.
+    PrinterDriver driver(StorageConfig::at(dir.path()));
+    auto printer = driver.addPrinter(configure(ProbePolicy::Never));
+    printer->drain();
+    CHECK_EQ(printer->profile().completion, CompletionMechanism::GsR1);
+    CHECK(!printer->profile().probed);
+    CHECK_EQ(link.device->identityRequests().size(), identity_queries);
+  }
 }
 
 // --- The one real-socket path ---------------------------------------------------------

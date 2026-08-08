@@ -22,6 +22,9 @@ add_library(printerdriver_core STATIC
   core/src/escpos_encoder.cpp
   core/src/response_parser.cpp
   core/src/capability_profile.cpp
+  core/src/device_profiles.cpp
+  core/src/identity.cpp
+  core/src/capability_probe.cpp
   core/src/job_store.cpp
   core/src/transport.cpp
   core/src/driver.cpp)
@@ -58,6 +61,8 @@ set(printerdriver_tests
   test_qr
   test_parser
   test_store
+  test_identity
+  test_profiles
   test_engine)
 
 foreach(test_name IN LISTS printerdriver_tests)

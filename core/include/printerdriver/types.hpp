@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <optional>
+#include <string>
 
 // Closed enums for the whole SDK. Every platform wrapper re-exports these verbatim;
 // adding a member is a core change that must flow to all wrappers at once
@@ -77,6 +78,30 @@ enum class JobOutcome {
   Unknown,
 };
 
+// docs/device-database.md "Confidence grades for every route". Orthogonal to
+// ConfidenceLevel: the level says how far up the evidence ladder a job climbed, the
+// grade says what class of evidence the claim rests on. A job can be Done at
+// CutProcessed on grade B and Done at CutProcessed on grade D, and those are not the
+// same claim.
+enum class ConfidenceGrade {
+  A_JobLevelConfirmation,   // GS ( H, ePOS JobID result, Star checked block
+  B_OrderedDeviceResponse,  // GS r, vendor idle query
+  C_DeviceStatusAround,     // DLE EOT, ASB, SNMP taken around the transmission
+  D_SpoolerCompleted,       // CUPS/Windows spooler/IPP gateway said completed
+  E_TransportOnly,          // the write succeeded and nothing else is known
+};
+
+// Who is actually making the claim carried by a JobResult. The whole point of
+// recording it is that "completed" from a print server and "completed" from the
+// mechanism that moved the paper are different facts (docs/device-database.md §D).
+enum class CompletionAuthority {
+  PhysicalPrinter,
+  VendorSpooler,
+  PdAgent,
+  PrintServer,
+  TransportOnly,
+};
+
 constexpr std::array<JobState, 11> kAllJobStates{
     JobState::Queued,        JobState::PreflightOk,         JobState::SendStarted,
     JobState::BytesSent,     JobState::PrintConfirmed,      JobState::CutCommandProcessed,
@@ -119,11 +144,37 @@ constexpr std::array<JobOutcome, 3> kAllJobOutcomes{
     JobOutcome::Unknown,
 };
 
+constexpr std::array<ConfidenceGrade, 5> kAllConfidenceGrades{
+    ConfidenceGrade::A_JobLevelConfirmation, ConfidenceGrade::B_OrderedDeviceResponse,
+    ConfidenceGrade::C_DeviceStatusAround,   ConfidenceGrade::D_SpoolerCompleted,
+    ConfidenceGrade::E_TransportOnly,
+};
+
+constexpr std::array<CompletionAuthority, 5> kAllCompletionAuthorities{
+    CompletionAuthority::PhysicalPrinter, CompletionAuthority::VendorSpooler,
+    CompletionAuthority::PdAgent,         CompletionAuthority::PrintServer,
+    CompletionAuthority::TransportOnly,
+};
+
 const char* to_string(JobState) noexcept;
 const char* to_string(ConfidenceLevel) noexcept;
 const char* to_string(DeviceEvent) noexcept;
 const char* to_string(FailureReason) noexcept;
 const char* to_string(JobOutcome) noexcept;
+const char* to_string(ConfidenceGrade) noexcept;
+const char* to_string(CompletionAuthority) noexcept;
+
+// "A".."E" for reports, where the enumerator name is too long to tabulate.
+const char* gradeLetter(ConfidenceGrade) noexcept;
+
+// What kind of evidence produced a result, and who produced it
+// (docs/device-database.md: never a bare {success:true}). `method` names the actual
+// command, e.g. "GS(H) fn48" — the string a support engineer needs six months later.
+struct JobEvidence {
+  ConfidenceGrade grade = ConfidenceGrade::E_TransportOnly;
+  CompletionAuthority authority = CompletionAuthority::TransportOnly;
+  const char* method = "none";
+};
 
 // Terminal outcome of a job. `confidence` is carried on every outcome, not only
 // Done: on Failed and Unknown it records how far up the evidence ladder the job
@@ -134,14 +185,25 @@ struct JobResult {
   ConfidenceLevel confidence = ConfidenceLevel::TransportAccepted;
   FailureReason reason = FailureReason::None;
 
-  static JobResult done(ConfidenceLevel confidence) noexcept {
+  ConfidenceGrade grade = ConfidenceGrade::E_TransportOnly;
+  CompletionAuthority authority = CompletionAuthority::TransportOnly;
+  std::string method = "none";
+
+  JobResult& with(const JobEvidence& evidence) {
+    grade = evidence.grade;
+    authority = evidence.authority;
+    method = evidence.method;
+    return *this;
+  }
+
+  static JobResult done(ConfidenceLevel confidence) {
     return JobResult{JobOutcome::Done, confidence, FailureReason::None};
   }
   static JobResult failed(FailureReason reason,
-                          ConfidenceLevel reached = ConfidenceLevel::TransportAccepted) noexcept {
+                          ConfidenceLevel reached = ConfidenceLevel::TransportAccepted) {
     return JobResult{JobOutcome::Failed, reached, reason};
   }
-  static JobResult unknown(ConfidenceLevel reached = ConfidenceLevel::TransportAccepted) noexcept {
+  static JobResult unknown(ConfidenceLevel reached = ConfidenceLevel::TransportAccepted) {
     return JobResult{JobOutcome::Unknown, reached, FailureReason::Unknown};
   }
 };
