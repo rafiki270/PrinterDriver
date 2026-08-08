@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- net8.0 is the floor a .NET app shipping to Windows POS hardware can rely on
+         today; nothing here uses an API newer than that. LangVersion is `latest` so the
+         wrapper can use collection expressions and file-scoped namespaces without
+         raising the runtime floor. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>PrinterDriver</RootNamespace>
+    <AssemblyName>PrinterDriver</AssemblyName>
+  </PropertyGroup>
+
+  <!-- NuGet packaging (docs/platforms.md, "Distribution summary").
+
+       The native library is NOT built by this project and is NOT in the package as
+       committed: `dotnet pack` here produces the managed assembly only. A release build
+       drops printerdriver_capi.dll into runtimes/win-x64/native/ first — see the
+       PackNativeLibraries target at the bottom of this file and the layout section of
+       ../README.md. That split is deliberate: the managed wrapper is verified on every
+       machine, the native DLL only on a Windows one. -->
+  <PropertyGroup>
+    <PackageId>PrinterDriver</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>PrinterDriver contributors</Authors>
+    <Description>Receipt-printing SDK with a tri-state job result: Done, Failed or Unknown, never a success boolean. Binds the C ABI of the portable C++ core over P/Invoke, bypassing the Windows print spooler so that "printed" means the printer said so.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/rafiki270/PrinterDriver</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/rafiki270/PrinterDriver.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>printer;receipt;escpos;pos;thermal-printer;native-interop</PackageTags>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PrinterDriver.Tests" />
+  </ItemGroup>
+
+  <!-- runtimes/<rid>/native is where NuGet expects a native dependency and where
+       NativeLibraryResolver looks second (after PRINTERDRIVER_LIB_PATH). Anything a
+       release build has staged under runtimes/ is packed with its directory structure
+       intact; when nothing is staged — which is the case in this repository — the glob
+       matches nothing and the package is managed-only. -->
+  <ItemGroup>
+    <None Include="runtimes/**"
+          Pack="true"
+          PackagePath="runtimes/%(RecursiveDir)%(Filename)%(Extension)"
+          Visible="false" />
+  </ItemGroup>
+
+</Project>

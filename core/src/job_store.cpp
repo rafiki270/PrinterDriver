@@ -1,17 +1,16 @@
 #include "printerdriver/job_store.hpp"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <utility>
+
+// Every filesystem call this store makes goes through platform_file.hpp, which is the
+// only part of the durability rule that differs between POSIX and Win32
+// (docs/platforms.md, step 2). Nothing below this line knows which platform it is on.
+#include "platform_file.hpp"
 
 namespace pd {
 namespace {
@@ -209,15 +208,6 @@ std::optional<JournalEntry> parseLine(const std::string& line) {
   return std::nullopt;
 }
 
-void fsyncDirectory(const std::string& path) {
-  const int dir_fd = ::open(path.c_str(), O_RDONLY);
-  if (dir_fd < 0) {
-    return;
-  }
-  ::fsync(dir_fd);
-  ::close(dir_fd);
-}
-
 }  // namespace
 
 const char* to_string(PayloadKind kind) noexcept {
@@ -262,12 +252,13 @@ JobStore::JobStore(StorageConfig config) : config_(std::move(config)) {
   if (config_.directory.empty()) {
     return;
   }
-  if (::mkdir(config_.directory.c_str(), 0700) != 0 && errno != EEXIST) {
+  std::string detail;
+  if (!platform_file::createDirectory(config_.directory, &detail)) {
     throw StoreError("cannot create storage directory " + config_.directory + ": " +
-                     std::strerror(errno));
+                     detail);
   }
   journal_path_ = config_.directory;
-  if (journal_path_.back() != '/') {
+  if (!platform_file::isSeparator(journal_path_.back())) {
     journal_path_ += '/';
   }
   journal_path_ += config_.journal_name;
@@ -277,9 +268,9 @@ JobStore::JobStore(StorageConfig config) : config_(std::move(config)) {
 }
 
 JobStore::~JobStore() {
-  if (fd_ >= 0) {
-    ::close(fd_);
-    fd_ = -1;
+  if (nativeFileValid(file_)) {
+    platform_file::closeFile(file_);
+    file_ = invalidNativeFile();
   }
 }
 
@@ -350,9 +341,10 @@ void JobStore::compact() {
   // during compaction leaves either the old journal or the new one — never a
   // half-written history.
   const std::string temp_path = journal_path_ + ".tmp";
-  const int temp_fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (temp_fd < 0) {
-    throw StoreError("cannot write journal " + temp_path + ": " + std::strerror(errno));
+  std::string detail;
+  const NativeFile temp_file = platform_file::openTruncate(temp_path, &detail);
+  if (!nativeFileValid(temp_file)) {
+    throw StoreError("cannot write journal " + temp_path + ": " + detail);
   }
   std::string content = std::string(kHeader) + "\n";
   for (const std::string& id : order_) {
@@ -363,53 +355,45 @@ void JobStore::compact() {
                          record.method) +
                "\n";
   }
-  const ssize_t written = ::write(temp_fd, content.data(), content.size());
-  const bool ok = written == static_cast<ssize_t>(content.size());
+  const int64_t written =
+      platform_file::writeSome(temp_file, content.data(), content.size(), &detail);
+  const bool ok = written == static_cast<int64_t>(content.size());
   if (ok && config_.fsync_enabled) {
-    ::fsync(temp_fd);
+    platform_file::sync(temp_file, nullptr);
   }
-  ::close(temp_fd);
+  platform_file::closeFile(temp_file);
   if (!ok) {
-    ::unlink(temp_path.c_str());
+    platform_file::removeFile(temp_path);
     throw StoreError("short write compacting journal " + temp_path);
   }
-  if (::rename(temp_path.c_str(), journal_path_.c_str()) != 0) {
-    ::unlink(temp_path.c_str());
-    throw StoreError("cannot replace journal " + journal_path_ + ": " +
-                     std::strerror(errno));
+  if (!platform_file::replaceFile(temp_path, journal_path_, &detail)) {
+    platform_file::removeFile(temp_path);
+    throw StoreError("cannot replace journal " + journal_path_ + ": " + detail);
   }
   if (config_.fsync_enabled) {
-    fsyncDirectory(config_.directory);
+    platform_file::syncDirectory(config_.directory);
   }
 }
 
 void JobStore::openJournal() {
-  fd_ = ::open(journal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-  if (fd_ < 0) {
-    throw StoreError("cannot open journal " + journal_path_ + ": " +
-                     std::strerror(errno));
+  std::string detail;
+  file_ = platform_file::openAppend(journal_path_, &detail);
+  if (!nativeFileValid(file_)) {
+    throw StoreError("cannot open journal " + journal_path_ + ": " + detail);
   }
 }
 
 void JobStore::append(const std::string& line) {
-  if (fd_ < 0) {
+  if (!nativeFileValid(file_)) {
     return;
   }
   const std::string payload = line + "\n";
-  size_t offset = 0;
-  while (offset < payload.size()) {
-    const ssize_t written =
-        ::write(fd_, payload.data() + offset, payload.size() - offset);
-    if (written < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      throw StoreError("journal write failed: " + std::string(std::strerror(errno)));
-    }
-    offset += static_cast<size_t>(written);
+  std::string detail;
+  if (!platform_file::writeAll(file_, payload.data(), payload.size(), &detail)) {
+    throw StoreError("journal write failed: " + detail);
   }
-  if (config_.fsync_enabled && ::fsync(fd_) != 0) {
-    throw StoreError("journal fsync failed: " + std::string(std::strerror(errno)));
+  if (config_.fsync_enabled && !platform_file::sync(file_, &detail)) {
+    throw StoreError("journal fsync failed: " + detail);
   }
 }
 

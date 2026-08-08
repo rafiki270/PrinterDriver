@@ -1,0 +1,128 @@
+# Windows build of the core, plus the .NET wrapper.
+#
+# -- MANUAL DISPATCH ONLY, ON PURPOSE ------------------------------------------------
+#
+# There is no `push` or `pull_request` trigger here and that is not an oversight. The
+# Windows path of the core (core/src/transport_win.cpp, core/src/platform_file_win.cpp
+# and the PD_PLATFORM_WINDOWS branches) has never been compiled by MSVC -- it is
+# syntax-checked only, by scripts/check_windows_syntax.sh against a header stub on a Mac.
+# The first real run of this workflow is expected to need iteration. A workflow that
+# failed on every push would put a permanent red badge on the repository saying something
+# nobody can act on, which is worse than no signal at all.
+#
+# Run it from the Actions tab when someone is available to read the output. Once it is
+# green, adding
+#
+#   push:
+#     branches: [main]
+#   pull_request:
+#
+# above is a one-line change, and should be made.
+#
+# -- What this proves that the syntax check cannot -------------------------------------
+#
+# See wrappers/dotnet/README.md, "What a real Windows CI run must confirm", for the
+# ordered risk list. In short: that MSVC agrees with clang about the Windows sources, that
+# ws2_32 links, that the loopback wake pair and select()-based readiness actually work,
+# and that FILE_APPEND_DATA / ReplaceFileA give the journal the durability the store
+# assumes.
+
+name: Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: CMake build configuration
+        required: false
+        default: RelWithDebInfo
+        type: choice
+        options:
+          - RelWithDebInfo
+          - Debug
+          - Release
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Core (MSVC) + .NET wrapper
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          dotnet --info
+
+      # PD_BUILD_SHARED_CAPI is on because the .NET suite binds
+      # printerdriver_capi_testing -- the same C ABI plus the scripted device of
+      # capi/tests/pd_test_support.h -- rather than the static library.
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake -S . -B build-win
+          -DPD_BUILD_SHARED_CAPI=ON
+          -DCMAKE_BUILD_TYPE=${{ inputs.configuration }}
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build-win --config ${{ inputs.configuration }}
+
+      # The twelve suites of the C++ core. These are the ones that would catch a Winsock
+      # or durability mistake: test_engine drives the whole state machine over the mock
+      # link and one real loopback socket, and test_store asserts the journal's ordering
+      # rule against the actual file on disk.
+      - name: ctest
+        shell: pwsh
+        working-directory: build-win
+        run: ctest --output-on-failure --build-config ${{ inputs.configuration }}
+
+      - name: Locate the testing library
+        id: native
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build-win -Recurse -Filter printerdriver_capi_testing.dll |
+                 Select-Object -First 1
+          if (-not $dll) { throw "printerdriver_capi_testing.dll was not built" }
+          Write-Host "found $($dll.FullName)"
+          "path=$($dll.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: dotnet build
+        shell: pwsh
+        run: dotnet build wrappers/dotnet/PrinterDriver.Tests -c Release
+
+      # PRINTERDRIVER_LIB_PATH is the wrapper's own first-choice lookup
+      # (NativeLibraryResolver), so pointing it at the freshly built DLL is all it takes
+      # for both assemblies to bind the same file.
+      - name: dotnet test
+        shell: pwsh
+        env:
+          PRINTERDRIVER_LIB_PATH: ${{ steps.native.outputs.path }}
+        run: dotnet test wrappers/dotnet/PrinterDriver.Tests -c Release --no-build
+
+      - name: dotnet pack
+        shell: pwsh
+        run: dotnet pack wrappers/dotnet/PrinterDriver -c Release -o artifacts
+
+      # Uploaded rather than published. Publishing a package whose native payload has just
+      # been built for the first time is exactly the step that should wait for a human.
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: printerdriver-nupkg
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: printerdriver-native-win-x64
+          path: |
+            build-win/**/printerdriver_capi.dll
+            build-win/**/printerdriver_capi.pdb
+          if-no-files-found: warn

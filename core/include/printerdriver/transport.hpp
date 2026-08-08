@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "printerdriver/platform.hpp"
+
 // Transports (docs/sdk-spec.md §7). The core owns each printer connection
 // exclusively and keeps it open after writing, because closing the socket after
 // sendall() is what stops status bytes from ever coming back
@@ -110,9 +112,24 @@ class TcpTransport : public Transport {
   DisconnectCallback on_disconnected_;
 
   mutable std::mutex mutex_;
+  // Two spellings of the same three handles, because the platforms disagree about what
+  // a socket is and what "no socket" looks like. POSIX: file descriptors, invalid is
+  // negative, and the reader is woken through a self-pipe. Windows: Winsock SOCKETs
+  // (UINT_PTR — they do not fit in an int), invalid is ~0, and the wake mechanism is a
+  // connected loopback TCP pair, because select() there can only wait on sockets.
+  //
+  // Kept as uintptr_t rather than SOCKET so this public header stays free of
+  // <winsock2.h>; core/src/transport_win.cpp is the only place they are touched, and
+  // core/src/transport.cpp — the POSIX implementation — is unchanged by any of this.
+#if PD_PLATFORM_WINDOWS
+  std::uintptr_t socket_ = ~static_cast<std::uintptr_t>(0);
+  std::uintptr_t wake_read_socket_ = ~static_cast<std::uintptr_t>(0);
+  std::uintptr_t wake_write_socket_ = ~static_cast<std::uintptr_t>(0);
+#else
   int fd_ = -1;
   int wake_read_fd_ = -1;
   int wake_write_fd_ = -1;
+#endif
   std::thread reader_;
   std::atomic<bool> connected_{false};
   std::atomic<bool> closing_{false};

@@ -1,12 +1,18 @@
 #pragma once
 
-#include <arpa/inet.h>
+// printerdriver/net_platform.hpp brings in the platform's socket headers — BSD sockets
+// or Winsock2 — so that the one real-socket fixture in this file (FakePrinterServer,
+// used by the end-to-end smoke test) compiles on both. The directory and process-id
+// calls TempDir needs have no such shared spelling and are branched inline below.
+#include "printerdriver/net_platform.hpp"
+
+#if PD_PLATFORM_WINDOWS
+#ifndef PD_WINDOWS_SYNTAX_CHECK
+#include <windows.h>
+#endif
+#else
 #include <dirent.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -517,29 +523,36 @@ class FakePrinterServer {
   ~FakePrinterServer() { stop(); }
 
   bool start() {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
+    listen_socket_ = pd::net::create(AF_INET, SOCK_STREAM, 0);
+    if (!pd::net::valid(listen_socket_)) {
       return false;
     }
-    int reuse = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#if !PD_PLATFORM_WINDOWS
+    // Deliberately POSIX-only. Winsock's SO_REUSEADDR is not the POSIX one: it lets a
+    // second socket steal a bound address outright rather than reusing a TIME_WAIT
+    // one, which on an ephemeral loopback port is a hijack waiting to happen. Windows
+    // does not need it for this fixture, so it does not get it.
+    pd::net::setIntOption(listen_socket_, SOL_SOCKET, SO_REUSEADDR, 1);
+#endif
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr.s_addr = pd::net::loopbackAddress();
     address.sin_port = 0;
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-        ::listen(listen_fd_, 4) != 0) {
-      ::close(listen_fd_);
-      listen_fd_ = -1;
+    if (::bind(listen_socket_, reinterpret_cast<sockaddr*>(&address),
+               static_cast<pd::net::SockLen>(sizeof(address))) != 0 ||
+        ::listen(listen_socket_, 4) != 0) {
+      pd::net::closeSocket(listen_socket_);
+      listen_socket_ = pd::net::invalidSocket();
       return false;
     }
-    socklen_t length = sizeof(address);
-    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
-      ::close(listen_fd_);
-      listen_fd_ = -1;
+    pd::net::SockLen length = static_cast<pd::net::SockLen>(sizeof(address));
+    if (::getsockname(listen_socket_, reinterpret_cast<sockaddr*>(&address), &length) !=
+        0) {
+      pd::net::closeSocket(listen_socket_);
+      listen_socket_ = pd::net::invalidSocket();
       return false;
     }
-    port_ = ntohs(address.sin_port);
+    port_ = pd::net::fromNetwork16(address.sin_port);
     thread_ = std::thread([this] { serve(); });
     return true;
   }
@@ -548,13 +561,13 @@ class FakePrinterServer {
 
   void stop() {
     running_.store(false);
-    if (listen_fd_ >= 0) {
-      ::shutdown(listen_fd_, SHUT_RDWR);
-      ::close(listen_fd_);
-      listen_fd_ = -1;
+    if (pd::net::valid(listen_socket_)) {
+      pd::net::shutdownBoth(listen_socket_);
+      pd::net::closeSocket(listen_socket_);
+      listen_socket_ = pd::net::invalidSocket();
     }
-    if (client_fd_.load() >= 0) {
-      ::shutdown(client_fd_.load(), SHUT_RDWR);
+    if (pd::net::valid(client_socket_.load())) {
+      pd::net::shutdownBoth(client_socket_.load());
     }
     if (thread_.joinable()) {
       thread_.join();
@@ -564,47 +577,48 @@ class FakePrinterServer {
  private:
   void serve() {
     while (running_.load()) {
-      pollfd waiter{};
-      waiter.fd = listen_fd_;
-      waiter.events = POLLIN;
-      if (listen_fd_ < 0 || ::poll(&waiter, 1, 100) <= 0) {
+      pd::net::PollFd waiter;
+      waiter.socket = listen_socket_;
+      waiter.events = pd::net::kPollIn;
+      if (!pd::net::valid(listen_socket_) || pd::net::poll(&waiter, 1, 100) <= 0) {
         continue;
       }
-      const int client = ::accept(listen_fd_, nullptr, nullptr);
-      if (client < 0) {
+      const pd::net::Socket client =
+          static_cast<pd::net::Socket>(::accept(listen_socket_, nullptr, nullptr));
+      if (!pd::net::valid(client)) {
         continue;
       }
-      int enabled = 1;
-      ::setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
-      client_fd_.store(client);
+      pd::net::setIntOption(client, IPPROTO_TCP, TCP_NODELAY, 1);
+      client_socket_.store(client);
       std::vector<uint8_t> buffer(4096);
       while (running_.load()) {
-        pollfd reader{};
-        reader.fd = client;
-        reader.events = POLLIN;
-        const int ready = ::poll(&reader, 1, 100);
+        pd::net::PollFd reader;
+        reader.socket = client;
+        reader.events = pd::net::kPollIn;
+        const int ready = pd::net::poll(&reader, 1, 100);
         if (ready <= 0) {
           continue;
         }
-        const ssize_t got = ::recv(client, buffer.data(), buffer.size(), 0);
+        const int64_t got = pd::net::recvSome(client, buffer.data(), buffer.size());
         if (got <= 0) {
           break;
         }
         const std::vector<uint8_t> response =
             device_->receive(buffer.data(), static_cast<size_t>(got));
         if (!response.empty()) {
-          ssize_t ignored = ::send(client, response.data(), response.size(), 0);
+          const int64_t ignored =
+              pd::net::sendSome(client, response.data(), response.size());
           (void)ignored;
         }
       }
-      client_fd_.store(-1);
-      ::close(client);
+      client_socket_.store(pd::net::invalidSocket());
+      pd::net::closeSocket(client);
     }
   }
 
   std::shared_ptr<FakePrinter> device_;
-  int listen_fd_ = -1;
-  std::atomic<int> client_fd_{-1};
+  pd::net::Socket listen_socket_ = pd::net::invalidSocket();
+  std::atomic<pd::net::Socket> client_socket_{pd::net::invalidSocket()};
   uint16_t port_ = 0;
   std::atomic<bool> running_{true};
   std::thread thread_;
@@ -638,12 +652,26 @@ class TempDir {
  public:
   explicit TempDir(const std::string& tag) {
     static std::atomic<unsigned> counter{0};
+#if PD_PLATFORM_WINDOWS
+    const char* base = std::getenv("TEMP");
+    if (base == nullptr || base[0] == '\0') {
+      base = std::getenv("TMP");
+    }
+    std::string root =
+        base != nullptr && base[0] != '\0' ? std::string(base) : std::string(".");
+    const unsigned long pid = ::GetCurrentProcessId();
+    if (root.back() != '/' && root.back() != '\\') {
+      root += '\\';
+    }
+#else
     const char* base = std::getenv("TMPDIR");
     std::string root = base != nullptr && base[0] != '\0' ? std::string(base) : "/tmp";
+    const long pid = ::getpid();
     if (root.back() != '/') {
       root += '/';
     }
-    path_ = root + "pdtest-" + tag + "-" + std::to_string(::getpid()) + "-" +
+#endif
+    path_ = root + "pdtest-" + tag + "-" + std::to_string(pid) + "-" +
             std::to_string(counter++);
   }
   ~TempDir() { remove(); }
@@ -653,7 +681,25 @@ class TempDir {
 
   const std::string& path() const { return path_; }
 
+  // Flat by design: the journal store never creates subdirectories, so a one-level
+  // sweep is the whole job on either platform.
   void remove() {
+#if PD_PLATFORM_WINDOWS
+    WIN32_FIND_DATAA entry;
+    const HANDLE search = ::FindFirstFileA((path_ + "\\*").c_str(), &entry);
+    if (search == INVALID_HANDLE_VALUE) {
+      return;
+    }
+    do {
+      const std::string name = entry.cFileName;
+      if (name == "." || name == "..") {
+        continue;
+      }
+      ::DeleteFileA((path_ + "\\" + name).c_str());
+    } while (::FindNextFileA(search, &entry) != 0);
+    ::FindClose(search);
+    ::RemoveDirectoryA(path_.c_str());
+#else
     DIR* dir = ::opendir(path_.c_str());
     if (dir == nullptr) {
       return;
@@ -667,6 +713,7 @@ class TempDir {
     }
     ::closedir(dir);
     ::rmdir(path_.c_str());
+#endif
   }
 
  private:

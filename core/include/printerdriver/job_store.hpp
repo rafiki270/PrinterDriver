@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "printerdriver/platform.hpp"
 #include "printerdriver/types.hpp"
 
 // File-backed job store (docs/sdk-spec.md §4, docs/techspec.md §5.1).
@@ -125,7 +126,9 @@ class JobStore {
   mutable std::mutex mutex_;
   StorageConfig config_;
   std::string journal_path_;
-  int fd_ = -1;
+  // A POSIX file descriptor, or a Win32 HANDLE. Opened for append and never seeked:
+  // the journal is only ever added to (see core/src/platform_file.hpp).
+  NativeFile file_ = invalidNativeFile();
   size_t recovered_count_ = 0;
   std::vector<std::string> order_;
   std::unordered_map<std::string, JobRecord> by_id_;
