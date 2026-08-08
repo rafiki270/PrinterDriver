@@ -362,3 +362,32 @@ PrinterInfo
 Serializable (JSON) like everything else; cached from the persisted probe, refreshed on
 demand with `explore(refresh: true)`. The DSL renderer consumes `media` — apps consume
 the rest (e.g. showing "80 mm / 576 dots / cutter OK" in settings UIs).
+
+## 14. Verification identifiers: the wire token as a first-class ID
+
+The `GS ( H` fence token — 4 printable chars from the 94⁴ (~78 M) space, laid out as
+`[2-char random per-instance nonce][2-char job sequence]` — is promoted from throwaway
+correlation to a **receipt verification identifier (RVI)**:
+
+- **Journaled.** Each job's print-fence and cut-fence tokens are persisted in its `J`
+  record alongside key and UUID. The instance nonce is persisted in the store at first
+  start, so tokens remain resolvable across restarts.
+- **Printed.** The ticket footer carries it next to the order id — `ORDER: <key>
+  V:<token>` — and inside the QR payload. Toggleable per job
+  (`JobOptions.printVerificationId`), **enabled by default**.
+- **Resolvable — paper → job.** `driver.jobByToken("K73F") → PrintJob?` returns the job
+  (most recent first on sequence wrap; 94² = 8 836 sequences per instance, and a token is
+  never reused while outstanding, so same-shift lookups are unambiguous in practice —
+  the journal timestamp disambiguates the rest). `pdctl verify <token>` prints the job's
+  full journal history: states, timestamps, grade, authority, method, attempts.
+- **Targetable — job → action.** `forceReprint`, status queries, and operator flows
+  accept the token anywhere a key is accepted.
+- **Attributable echoes.** Because the printer echoes these exact bytes at physical
+  print-completion, holding a receipt whose `V:` code matches a journaled
+  `PrintConfirmed` token is end-to-end evidence: this paper is the output of that job,
+  and the printer acknowledged finishing it. A foreign echo's token (multi-writer case,
+  `ForeignWriterDetected`) identifies which instance and job it belonged to.
+
+The idempotency key remains the fleet-wide business identity; the RVI is the
+per-print physical-evidence identity. Key ↔ UUID ↔ RVI resolve in both directions
+through the journal.
