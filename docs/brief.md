@@ -1,5 +1,27 @@
 # Brief: Getting Real Feedback from Thermal Printers on Finished Jobs
 
+## Project goal
+
+The operational symptom behind all of this: **kitchen receipts sometimes don't get
+printed, staff resend them, and the original then prints later** — it was buffered
+somewhere in the stack the whole time — producing duplicate tickets and duplicate food.
+
+The fix this project builds: a **native printing SDK for iOS and Android with a shared
+C++ core**, so all printing logic exists exactly once — one point of possible failure —
+with thin wrappers for any other system later. Design goals:
+
+- **ease of use** — minimal API, sensible defaults;
+- **as much feedback as possible through a single point**, using closed enums defined in
+  the core, so no wrapper can ever have a status that is "not implemented" — unknown and
+  unsupported are explicit enum values, never missing callbacks;
+- **a printing interface as standard as possible** — standard receipt semantics over a
+  conservative standard ESC/POS subset, vendor quirks hidden behind capability profiles;
+- **works with the most standard printers** — the printers already implemented in the
+  KiloMayo monorepo, plus the Xprinter XP-S260M studied here.
+
+Full SDK design: [docs/sdk-spec.md](sdk-spec.md). The research below is the protocol
+foundation the core is built on.
+
 ## Problem
 
 We can send receipts to our thermal printers (Xprinter XP-S260M), but we currently have
@@ -69,9 +91,9 @@ spec if we ever need that level for critical (e.g. kitchen) tickets.
 | Paper present | ✅ |
 | Cover open | ✅ |
 | Printer error | ✅ |
-| Receipt finished printing | ✅ Probably (pending capability test) |
+| Receipt finished printing | ✅ **Confirmed** — `GS ( H` ack received in probe (2026-08-08) |
 | Cutter error | ✅ |
-| Cut command processed | ✅ Probably (pending capability test) |
+| Cut command processed | ✅ Very likely — `GS ( H` confirmed working; cut sequence itself not yet exercised |
 | Blade physically cut the paper | ⚠️ Not absolutely — needs cutter-status check as a proxy |
 | Text visibly printed correctly | ❌ Not without a sensor/camera |
 
@@ -93,26 +115,30 @@ bytes at port 9100 (or through CUPS) and forgetting about them. That means:
 
 Full design: [docs/techspec.md](techspec.md).
 
-## Immediate next step
+## Immediate next step — ✅ done (2026-08-08)
 
-Run the capability probe against the XP-S260M before building anything. This is a direct,
-cheap test that tells us definitively which of the completion mechanisms the printer
-actually implements over which interface, rather than guessing from "ESC/POS compatible"
-marketing copy.
+The capability probe was run against our XP-S260M at `192.168.1.101` over LAN, with no
+CUPS queues configured and exclusive access. Result: **best case** — `GS ( H` process-ID
+completion acknowledgement is supported, and `DLE EOT` status and `GS r 1` both respond
+on the same socket. Full output and interpretation:
+[docs/testing-plan.md](testing-plan.md#-result-our-xp-s260m-unit--tested-2026-08-08).
 
-See [docs/testing-plan.md](testing-plan.md) for the exact script and procedure — stop
-CUPS and any other client before running it, since a shared connection would make
-responses ambiguous.
+Originally this step required stopping CUPS and any other client first (a shared
+connection makes responses ambiguous), plus the printer's LAN IP — kept here for reruns
+on other units/firmware.
 
-**What we need from you to run it:** the printer's LAN IP address (e.g. `192.168.x.x` or
-`10.x.x.x`), and which machine will run the test (Mac / Linux / Raspberry Pi / Windows).
+Next: the fault-injection matrix and cut-sequence test from the testing plan, and the SDK
+build itself per [docs/sdk-spec.md](sdk-spec.md).
 
 ## Recommended order of attack
 
-1. Run the probe against the XP-S260M's LAN port with CUPS and all POS clients stopped.
-2. If `GS ( H` works → build the local printer agent around process-ID acknowledgements.
-3. If only `GS r 1` works → use one job at a time, continuous ASB, and treat cutting as a
-   separate, weaker-confidence step.
+1. ✅ **Done 2026-08-08** — Run the probe against the XP-S260M's LAN port with CUPS and
+   all POS clients stopped.
+2. ✅ **Confirmed — this is the chosen architecture.** `GS ( H` works → build the printing
+   core around process-ID acknowledgements.
+3. ~~If only `GS r 1` works~~ (not needed — but this unit supports `GS r 1` too, so it
+   remains a validated fallback: one job at a time, continuous ASB, cutting treated as a
+   separate, weaker-confidence step.)
 4. If LAN is write-only (no backchannel) → repeat the same test through RS-232, which the
    XP-S260M also supports and which is a more reliable full-duplex channel than some LAN
    print-server implementations.
@@ -127,3 +153,6 @@ responses ambiguous.
 The most likely outcome is either strong raw completion via `GS ( H`, or reasonable print
 completion via `GS r 1` plus Xprinter's idle/cutter status. The probe will tell us which
 architecture is justified rather than us guessing from socket behavior.
+
+**Outcome (2026-08-08): the probe confirmed the strong path — `GS ( H` raw completion
+works on our XP-S260M over LAN, and `GS r 1` works as fallback.**

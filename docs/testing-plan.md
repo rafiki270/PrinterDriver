@@ -7,6 +7,37 @@ spec gets built.
 
 **This is a 5-minute test, not a research question.** Run it before writing any agent code.
 
+## ✅ Result: our XP-S260M unit — tested 2026-08-08
+
+Probe run over LAN (`192.168.1.101:9100`, MAC `00:61:17:5b:b4:65`), no CUPS queues
+configured, exclusive access:
+
+```
+DLE EOT response: 16
+GS(H): SUPPORTED 37 22 50 30 30 31 00
+GS r response: 00
+```
+
+This is the **best-case row** of the interpretation table below:
+
+- **Bidirectional LAN backchannel: YES.** `DLE EOT 1` returned `0x16` — online, no error
+  bits set. The Ethernet module forwards status bytes back on the same 9100 socket.
+- **`GS ( H` Function 48: SUPPORTED.** The printer physically printed the test line and
+  then echoed the exact process-ID frame (`37 22 50 30 30 31 00` for token `P001`).
+  Strong per-receipt print-completion acknowledgement is available on this hardware.
+- **`GS r 1`: RESPONDS.** Returned `0x00` (paper present) after the second test line —
+  the queued fallback mechanism also works.
+
+**Consequence:** build the SDK core's primary completion path on `GS ( H` process-ID
+acknowledgements ([techspec.md §3.1](techspec.md#31-gs--h-function-48--process-id-preferred-mechanism),
+[§5.2](techspec.md#52-suggested-strong-sequence-when-gs--h-is-supported)), with `GS r 1`
+as the fallback — which this unit also supports.
+
+Still untested on this unit: the fault-injection matrix below (paper-out mid-job, cutter
+jam, power loss, ack lost after print), the post-cut fence sequence (`P…`/`C…` markers
+around a real cut), the Xprinter `ESC v` / `ESC x` vendor queries, and the serial
+interface comparison.
+
 ## Before running
 
 - Stop CUPS and every other client that might be talking to the printer. The probe needs
