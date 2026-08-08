@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -53,6 +54,24 @@ struct Script {
 
   // Stop answering process-ID markers after this many have been echoed; 0 = never.
   size_t process_id_answer_limit = 0;
+
+  // GS I identification. The defaults are Rongta's documented Epson impersonation
+  // (docs/capability-profiles.md §5), because that is the case the identification
+  // path has to survive.
+  bool answer_identity = false;
+  std::string gs_i_manufacturer = "EPOSN";
+  std::string gs_i_model = "TM-T88V";
+  std::string gs_i_firmware = "1.02";
+  std::string gs_i_serial;
+  uint8_t gs_i_model_id = 0x20;
+  uint8_t gs_i_type_id = 0x02;
+  uint8_t gs_i_rom_version = 0x01;
+  // Epson frames text answers 5F <data> 00; clones vary, and the parser has to cope.
+  bool gs_i_header = true;
+
+  bool answer_asb = true;
+  // ASB frame sent when GS a enables status back: healthy, cover closed, paper ok.
+  std::array<uint8_t, 4> asb_frame{0x10, 0x10, 0x10, 0x10};
 };
 
 inline uint8_t withBit(uint8_t base, unsigned index) {
@@ -128,6 +147,14 @@ class FakePrinter {
     std::lock_guard<std::mutex> lock(mutex_);
     return raster_blocks_;
   }
+  std::vector<uint8_t> identityRequests() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return identity_requests_;
+  }
+  size_t asbEnables() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return asb_enables_;
+  }
   bool sawConcurrentWrites() const { return concurrent_writes_.load(); }
 
   bool receivedContains(const std::string& needle) const {
@@ -148,6 +175,30 @@ class FakePrinter {
     return static_cast<uint16_t>(low | (static_cast<uint16_t>(high) << 8));
   }
 
+  void emitIdentityText(std::vector<uint8_t>& out, const std::string& text) {
+    if (text.empty()) {
+      return;
+    }
+    if (script_.gs_i_header) {
+      out.push_back(0x5F);
+    }
+    out.insert(out.end(), text.begin(), text.end());
+    out.push_back(0x00);
+  }
+
+  void emitIdentity(std::vector<uint8_t>& out, uint8_t kind) {
+    switch (kind) {
+      case 1: out.push_back(script_.gs_i_model_id); break;
+      case 2: out.push_back(script_.gs_i_type_id); break;
+      case 3: out.push_back(script_.gs_i_rom_version); break;
+      case 65: emitIdentityText(out, script_.gs_i_firmware); break;
+      case 66: emitIdentityText(out, script_.gs_i_manufacturer); break;
+      case 67: emitIdentityText(out, script_.gs_i_model); break;
+      case 68: emitIdentityText(out, script_.gs_i_serial); break;
+      default: break;
+    }
+  }
+
   void emitProcessIdAck(std::vector<uint8_t>& out, const std::string& token) {
     out.push_back(0x37);
     out.push_back(0x22);
@@ -166,7 +217,7 @@ class FakePrinter {
       switch (second) {
         case 0x40: return 2;                        // ESC @
         case 0x74: case 0x61: case 0x45:            // ESC t / ESC a / ESC E
-        case 0x2D: case 0x64: return 3;             // ESC - / ESC d
+        case 0x2D: case 0x64: case 0x4A: return 3;  // ESC - / ESC d / ESC J
         case 0x70: return 5;                        // ESC p
         default: return 0;
       }
@@ -241,6 +292,31 @@ class FakePrinter {
           offset += 3;
           continue;
         }
+        if (second == 0x49) {  // GS I n
+          if (offset + 2 >= pending_.size()) {
+            break;
+          }
+          const uint8_t kind = pending_[offset + 2];
+          identity_requests_.push_back(kind);
+          if (script_.answer_identity) {
+            emitIdentity(out, kind);
+          }
+          offset += 3;
+          continue;
+        }
+        if (second == 0x61) {  // GS a n
+          if (offset + 2 >= pending_.size()) {
+            break;
+          }
+          if (pending_[offset + 2] != 0x00) {
+            ++asb_enables_;
+            if (script_.answer_asb) {
+              out.insert(out.end(), script_.asb_frame.begin(), script_.asb_frame.end());
+            }
+          }
+          offset += 3;
+          continue;
+        }
         if (second == 0x76 && offset + 2 < pending_.size() &&
             pending_[offset + 2] == 0x30) {  // GS v 0 m xL xH yL yH d...
           if (offset + 7 >= pending_.size()) {
@@ -305,6 +381,8 @@ class FakePrinter {
   std::vector<uint8_t> print_data_;
   std::vector<MarkerRecord> markers_;
   std::vector<uint8_t> realtime_requests_;
+  std::vector<uint8_t> identity_requests_;
+  size_t asb_enables_ = 0;
   size_t queued_requests_ = 0;
   size_t cuts_ = 0;
   size_t drawer_kicks_ = 0;
@@ -549,7 +627,7 @@ inline pd::CapabilityProfile fastProfile(pd::CompletionMechanism mechanism) {
   profile.code_page = pd::escpos::CodePage::PC437;
   if (mechanism == pd::CompletionMechanism::None) {
     profile.name = "none-profile";
-    profile.supports_realtime_status = false;
+    profile.status.dle_eot = false;
   }
   return profile;
 }

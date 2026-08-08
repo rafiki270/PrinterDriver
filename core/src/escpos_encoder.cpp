@@ -11,6 +11,7 @@ constexpr uint8_t kEsc = 0x1B;
 constexpr uint8_t kGs = 0x1D;
 constexpr uint8_t kDle = 0x10;
 constexpr uint8_t kEot = 0x04;
+constexpr uint8_t kEnq = 0x05;
 constexpr uint8_t kLf = 0x0A;
 
 constexpr uint32_t kMaxRasterBytesPerRow = 0xFFFF;
@@ -123,6 +124,32 @@ Bytes asbEnable(uint8_t mask) { return Bytes{kGs, 0x61, mask}; }
 
 Bytes asbDisable() { return Bytes{kGs, 0x61, 0x00}; }
 
+Bytes gsIdentity(uint8_t n) { return Bytes{kGs, 0x49, n}; }
+
+Bytes gsIdentity(PrinterInfoKind kind) {
+  return gsIdentity(static_cast<uint8_t>(kind));
+}
+
+Bytes dleEnq(uint8_t n) { return Bytes{kDle, kEnq, n}; }
+
+Bytes gsMaintenanceCounter(uint16_t counter) {
+  // GS g 2 m nL nH, m = 0.
+  return Bytes{kGs, 0x67, 0x32, 0x00, static_cast<uint8_t>(counter & 0xFF),
+               static_cast<uint8_t>((counter >> 8) & 0xFF)};
+}
+
+Bytes gsTestPrint(uint8_t paper, uint8_t pattern) {
+  return Bytes{kGs, 0x28, 0x41, 0x02, 0x00, paper, pattern};
+}
+
+Bytes gsReadMemorySwitch(uint8_t switch_number) {
+  return Bytes{kGs, 0x28, 0x45, 0x02, 0x00, 0x04, switch_number};
+}
+
+Bytes gsReadCustomizedSetting(uint8_t setting_number) {
+  return Bytes{kGs, 0x28, 0x45, 0x02, 0x00, 0x06, setting_number};
+}
+
 void Encoder::put(std::initializer_list<uint8_t> data) { appendAll(buffer_, data); }
 
 void Encoder::resetStyleState() noexcept {
@@ -221,6 +248,17 @@ Encoder& Encoder::feed() {
 
 Encoder& Encoder::feedLines(uint8_t lines) {
   put({kEsc, 0x64, lines});
+  return *this;
+}
+
+Encoder& Encoder::feedDots(uint16_t dots) {
+  // ESC J n: n is a single byte, so a request above 255 is chunked across several
+  // commands rather than truncated.
+  while (dots > 0) {
+    const uint8_t chunk = dots > 0xFF ? 0xFF : static_cast<uint8_t>(dots);
+    put({kEsc, 0x4A, chunk});
+    dots = static_cast<uint16_t>(dots - chunk);
+  }
   return *this;
 }
 

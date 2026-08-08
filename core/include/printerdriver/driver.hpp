@@ -12,8 +12,10 @@
 #include <variant>
 #include <vector>
 
+#include "printerdriver/capability_probe.hpp"
 #include "printerdriver/capability_profile.hpp"
 #include "printerdriver/escpos_encoder.hpp"
+#include "printerdriver/identity.hpp"
 #include "printerdriver/job_store.hpp"
 #include "printerdriver/transport.hpp"
 #include "printerdriver/types.hpp"
@@ -166,11 +168,26 @@ class PrintJob {
 
 // --- Printer (docs/api.md §2) ----------------------------------------------------
 
+// When the driver is allowed to interrogate the device (docs/capability-profiles.md:
+// probe once, persist, never re-probe on every boot).
+enum class ProbePolicy {
+  UseStored,   // default: apply stored findings if any, never touch the device
+  IfUnknown,   // interrogate once, when nothing is stored for this printer
+  Always,      // interrogate on every addPrinter — for a bench, not for a venue
+  Never,       // ignore stored findings too; the profile is the whole truth
+};
+
 struct PrinterConfig {
   std::string id;  // empty → derived from the transport description
   TransportFactory transport;
   uint32_t width_dots = escpos::kWidth80mm;
   CapabilityProfile profile = generic_escpos();
+  ProbePolicy probe = ProbePolicy::UseStored;
+  // Per-phase budgets for the interrogation. The endpoint and hints below are filled
+  // in by the driver.
+  ProbeOptions probe_options;
+  // Anything the caller already knows about the device, folded into the fingerprint.
+  IdentityHints identity_hints;
 };
 
 class Printer {
@@ -182,7 +199,11 @@ class Printer {
 
   const std::string& id() const noexcept;
   uint32_t widthDots() const noexcept;
-  const CapabilityProfile& profile() const noexcept;
+  // By value: a probe may replace the effective profile on the worker thread once,
+  // before the first job runs, so a reference could dangle across that swap.
+  CapabilityProfile profile() const;
+  // What the probe established first-hand, if it ran or if stored findings applied.
+  std::optional<CapabilityFindings> findings() const;
 
   // Submitting an existing key returns the existing job in whatever state it is in
   // and prints nothing (docs/api.md §3).
@@ -262,6 +283,11 @@ class PrinterDriver {
   JobStore& store() noexcept { return *store_; }
   const JobStore& store() const noexcept { return *store_; }
 
+  // Probe results, keyed by device identity and shared by every printer on this
+  // driver so a device that moves address keeps what was learned about it.
+  FindingsStore& capabilities() noexcept { return *capabilities_; }
+  const FindingsStore& capabilities() const noexcept { return *capabilities_; }
+
   void shutdown();
 
  private:
@@ -269,6 +295,7 @@ class PrinterDriver {
 
   mutable std::mutex mutex_;
   std::shared_ptr<JobStore> store_;
+  std::shared_ptr<FindingsStore> capabilities_;
   std::shared_ptr<detail::MarkerAllocator> markers_;
   std::shared_ptr<detail::DriverEventHub> hub_;
   std::shared_ptr<detail::JobIndex> index_;

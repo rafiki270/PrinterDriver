@@ -176,6 +176,24 @@ PD_TEST(cash_drawer_and_feeds) {
   CHECK_BYTES(encoder.bytes(), 0x0A, 0x1B, 0x64, 0x04);
 }
 
+PD_TEST(feed_dots_emits_esc_j_and_chunks_above_255) {
+  Encoder encoder;
+  encoder.feedDots(120);
+  CHECK_BYTES(encoder.bytes(), 0x1B, 0x4A, 0x78);  // 120 dots, one command
+
+  encoder.clear();
+  encoder.feedDots(0);
+  CHECK_EQ(encoder.size(), static_cast<size_t>(0));  // nothing to feed, nothing sent
+
+  encoder.clear();
+  encoder.feedDots(300);  // above the single-byte operand: 255 + 45
+  CHECK_BYTES(encoder.bytes(), 0x1B, 0x4A, 0xFF, 0x1B, 0x4A, 0x2D);
+
+  encoder.clear();
+  encoder.feedDots(510);  // an exact multiple of the 255-dot chunk
+  CHECK_BYTES(encoder.bytes(), 0x1B, 0x4A, 0xFF, 0x1B, 0x4A, 0xFF);
+}
+
 PD_TEST(raw_passthrough_and_take) {
   Encoder encoder;
   const Bytes payload{0xDE, 0xAD};
@@ -185,4 +203,32 @@ PD_TEST(raw_passthrough_and_take) {
   const Bytes taken = encoder.take();
   CHECK_BYTES(taken, 0xDE, 0xAD, 0xDE, 0xAD);
   CHECK_EQ(encoder.size(), static_cast<size_t>(0));
+}
+
+PD_TEST(printer_identification_commands) {
+  CHECK_BYTES(gsIdentity(PrinterInfoKind::ModelId), 0x1D, 0x49, 0x01);
+  CHECK_BYTES(gsIdentity(PrinterInfoKind::TypeId), 0x1D, 0x49, 0x02);
+  CHECK_BYTES(gsIdentity(PrinterInfoKind::RomVersionId), 0x1D, 0x49, 0x03);
+  CHECK_BYTES(gsIdentity(PrinterInfoKind::FirmwareVersion), 0x1D, 0x49, 0x41);
+  CHECK_BYTES(gsIdentity(PrinterInfoKind::MakerName), 0x1D, 0x49, 0x42);
+  CHECK_BYTES(gsIdentity(PrinterInfoKind::ModelName), 0x1D, 0x49, 0x43);
+  CHECK_BYTES(gsIdentity(PrinterInfoKind::SerialNumber), 0x1D, 0x49, 0x44);
+  CHECK_BYTES(gsIdentity(uint8_t{69}), 0x1D, 0x49, 0x45);
+}
+
+PD_TEST(operator_only_commands_are_built_but_never_by_the_engine) {
+  // DLE ENQ 1 resumes from the line the error happened on, DLE ENQ 2 resumes while
+  // discarding the buffers. Both are duplicate-or-lost-ticket risks, so they exist
+  // as builders for a deliberate operator action and nowhere else.
+  CHECK_BYTES(dleEnq(kDleEnqResume), 0x10, 0x05, 0x01);
+  CHECK_BYTES(dleEnq(kDleEnqClearBuffers), 0x10, 0x05, 0x02);
+
+  CHECK_BYTES(gsMaintenanceCounter(10), 0x1D, 0x67, 0x32, 0x00, 0x0A, 0x00);
+  CHECK_BYTES(gsMaintenanceCounter(300), 0x1D, 0x67, 0x32, 0x00, 0x2C, 0x01);
+
+  CHECK_BYTES(gsTestPrint(), 0x1D, 0x28, 0x41, 0x02, 0x00, 0x00, 0x02);
+  CHECK_BYTES(gsTestPrint(1, 3), 0x1D, 0x28, 0x41, 0x02, 0x00, 0x01, 0x03);
+
+  CHECK_BYTES(gsReadMemorySwitch(1), 0x1D, 0x28, 0x45, 0x02, 0x00, 0x04, 0x01);
+  CHECK_BYTES(gsReadCustomizedSetting(5), 0x1D, 0x28, 0x45, 0x02, 0x00, 0x06, 0x05);
 }
