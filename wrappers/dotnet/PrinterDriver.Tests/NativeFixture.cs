@@ -155,6 +155,18 @@ internal static class TestNative
     [DllImport(Library, CallingConvention = Cdecl)]
     internal static extern nint pd_test_enum_label(int which);
 
+    // M14 -- docs/cash-drawer.md. Pulses that reached the device, where the scripted
+    // microswitch sits, and an operator's hand moving the drawer without the printer.
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern nuint pd_test_drawer_kicks(nint printer);
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern int pd_test_drawer_is_open(nint printer);
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern void pd_test_set_drawer_open(nint printer, int open);
+
     internal static string ReadUtf8(nint pointer) =>
         pointer == 0 ? string.Empty : Marshal.PtrToStringUTF8(pointer) ?? string.Empty;
 }
@@ -177,6 +189,11 @@ internal enum BridgedEnum
     Binarization = 12,
     ConfidenceGrade = 13,
     CompletionAuthority = 14,
+    // M14 -- docs/cash-drawer.md.
+    DrawerState = 15,
+    DrawerPortStandard = 16,
+    DrawerKickMethod = 17,
+    DrawerStatusMethod = 18,
 }
 
 /// <summary>

@@ -107,6 +107,17 @@ CapabilityProfile sewoo_slk_ts();
 CapabilityProfile partner_rp110();
 CapabilityProfile partner_rp710();
 
+// --- M14: SNBC / New Beiyang (docs/cash-drawer.md §5) -----------------------------
+// Added with the cash-drawer milestone because the BTP-R880NP is one of the few
+// families outside Epson whose drawer interface is documented end to end: a
+// 6-position modular socket at 24 V with ~<= 1 A drive, two outputs plus a switch
+// input, and a programming manual that lists `ESC p` alongside the realtime
+// `DLE DC4 n m t` pulse. The queued `ESC p` is the one this engine emits.
+
+CapabilityProfile snbc_btp_r880();
+CapabilityProfile snbc_btp_u80();
+// --- end M14 -----------------------------------------------------------------------
+
 // --- Star (docs/compatibility-brief.md §7-§8) -------------------------------------
 // StarPRNT and beginCheckedBlock()/endCheckedBlock(), neither of which this core
 // implements: profile data only, so a Star unit in the fleet can be described rather

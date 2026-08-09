@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <string>
 
+// M14 — the drawer facet below is a peripheral capability with its own header, not a
+// field of the printer's own capabilities (docs/cash-drawer.md).
+#include "printerdriver/cash_drawer.hpp"
 #include "printerdriver/escpos_encoder.hpp"
 #include "printerdriver/types.hpp"
 
@@ -253,6 +256,16 @@ struct CapabilityProfile {
   RecoveryCapabilities recovery;
   Quirks quirks;
   MediaProfile media;
+
+  // --- M14: cash drawer (docs/cash-drawer.md) ------------------------------------
+  // A peripheral facet, deliberately a sibling of media/status/completion rather than
+  // a member of any of them: the drawer has its own electrical profile, its own
+  // command method and its own feedback method, and none of the three is derivable
+  // from anything the printer does with paper. Default-constructed means "no drawer
+  // port has been established on this model", which refuses a pulse rather than
+  // guessing a pinout.
+  DrawerCapabilities drawer;
+  // --- end M14 -------------------------------------------------------------------
 
   // True once a capability probe has overridden these defaults with first-hand
   // observations (docs/capability-profiles.md §8: generic means UNKNOWN DEVICE).

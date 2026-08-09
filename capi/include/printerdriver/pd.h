@@ -716,6 +716,217 @@ const char* pd_cut_variant_name(pd_cut_variant value);
 /* The non-contiguous code page enum, by member index 0..PD_CODE_PAGE_COUNT-1. */
 pd_code_page pd_code_page_at(int32_t index);
 
+/* ==================================================================================
+ * M14 — CASH DRAWER (docs/cash-drawer.md)
+ * ==================================================================================
+ *
+ * The drawer is a separate printer peripheral, not a feature of the printer. It has its
+ * own electrical profile, its own command method and its own feedback method, and none
+ * of the three follows from anything the printer does with paper. Everything this
+ * milestone adds to the ABI is in this one block.
+ *
+ * Two rules from that document shape the whole surface:
+ *
+ *   1. RJ11/RJ12-LOOKING DRAWER CONNECTORS ARE NOT A UNIVERSAL ELECTRICAL STANDARD.
+ *      Star's identical-looking 6P6C socket puts +24 V on pin 3 and the sense line on
+ *      pin 6, exactly where Epson puts sense and ground; 12 V outputs exist alongside
+ *      the common 24 V ones. A port whose standard is PD_DRAWER_PORT_UNKNOWN is never
+ *      pulsed by this ABI, whatever the caller asks for. pd_drawer_open returns
+ *      PD_DRAWER_UNKNOWN and writes zero bytes.
+ *   2. NEVER A BOOLEAN. `{sent: true}` cannot distinguish "the pulse went out" from "we
+ *      watched the microswitch change", and those are the two facts an operator needs
+ *      apart. So the answer is a pd_drawer_state out of a closed set, and
+ *      PD_DRAWER_KICK_SENT_UNVERIFIED is a real answer rather than a weak success.
+ */
+
+/* pd::DrawerState — docs/cash-drawer.md "API states (never a boolean)". */
+typedef enum pd_drawer_state {
+  PD_DRAWER_CLOSED = 0,
+  PD_DRAWER_OPEN = 1,
+  PD_DRAWER_OPENING = 2,
+  /* The link accepted the pulse and nothing can confirm what happened next: no switch
+   * on this port, or a path whose sensor answer never comes back. Through a cheap USB
+   * print server the kick travels forward while the response does not, and that path
+   * supports this state and never PD_DRAWER_OPEN_VERIFIED. */
+  PD_DRAWER_KICK_SENT_UNVERIFIED = 3,
+  /* The only member that claims physical movement. */
+  PD_DRAWER_OPEN_VERIFIED = 4,
+  PD_DRAWER_FAILED_TO_OPEN = 5,
+  /* This port has no switch input wired or documented. Not an error. */
+  PD_DRAWER_NO_SENSOR = 6,
+  PD_DRAWER_UNKNOWN = 7,
+  PD_DRAWER_STATE_COUNT = 8
+} pd_drawer_state;
+
+/* pd::DrawerPortStandard — the four buckets that cover the deployed fleet. */
+typedef enum pd_drawer_port_standard {
+  /* 1 FG, 2 kick 1, 3 sensor, 4 +24 V, 5 kick 2, 6 signal ground. Epson, Citizen, much
+   * of Bixolon and many clones: one large interoperable ecosystem. */
+  PD_DRAWER_PORT_EPSON_24V_6P6C = 0,
+  /* The same plug, +24 V on pin 3 and sense on pin 6. A cable that fits is not
+   * electrically correct. */
+  PD_DRAWER_PORT_STAR_24V_6P6C = 1,
+  PD_DRAWER_PORT_GENERIC_12V_6P6C = 2,
+  PD_DRAWER_PORT_UNKNOWN = 3,
+  PD_DRAWER_PORT_STANDARD_COUNT = 4
+} pd_drawer_port_standard;
+
+/* pd::DrawerKickMethod. The software command and the cable pinout are independent
+ * facts: two printers accepting the same "kick drawer 1" command may still wire the
+ * modular port differently. */
+typedef enum pd_drawer_kick_method {
+  PD_DRAWER_KICK_EPSON_ESC_P = 0,
+  PD_DRAWER_KICK_EPSON_EPOS = 1,
+  PD_DRAWER_KICK_STAR_PRNT = 2,
+  PD_DRAWER_KICK_BIXOLON_SDK = 3,
+  PD_DRAWER_KICK_CITIZEN_ESC_P = 4,
+  PD_DRAWER_KICK_SNBC_ESC_P = 5,
+  PD_DRAWER_KICK_VENDOR = 6,
+  PD_DRAWER_KICK_UNSUPPORTED = 7,
+  PD_DRAWER_KICK_METHOD_COUNT = 8
+} pd_drawer_kick_method;
+
+/* pd::DrawerStatusMethod — how the switch is read back. */
+typedef enum pd_drawer_status_method {
+  PD_DRAWER_STATUS_GS_R2 = 0,
+  PD_DRAWER_STATUS_ASB = 1,
+  PD_DRAWER_STATUS_STAR_SIGNAL = 2,
+  PD_DRAWER_STATUS_VENDOR_SDK = 3,
+  PD_DRAWER_STATUS_NONE = 4,
+  PD_DRAWER_STATUS_METHOD_COUNT = 5
+} pd_drawer_status_method;
+
+/*
+ * The drawer facet of a printer's capability profile, flattened. `voltage` and
+ * `max_current_ma` are 0 where the manufacturer does not document them, which is not
+ * the same as "low". `sensor_pin` is 3 on the Epson arrangement and 6 on Star's.
+ *
+ * `electrical_provenance` and `commands_provenance` are deliberately separate columns:
+ * the XP-S260M's DC 24 V / 1 A drawer output is in Xprinter's own specification while
+ * nothing they publish proves the pulse or the status command, and collapsing those
+ * into one "documented" flag is what the whole provenance system exists to prevent.
+ *
+ * `shared_between_drawers` is the "two outputs, ONE switch input" case: both channels
+ * kick independently and the only readable fact is that some attached drawer is open.
+ * `shared_with_buzzer` is Epson's documented conflict — with the optional external
+ * buzzer enabled the pulse sounds the buzzer instead of firing the drawer.
+ */
+typedef struct pd_drawer_capabilities {
+  int32_t present;
+  pd_drawer_port_standard standard;
+  uint16_t voltage;
+  uint16_t max_current_ma;
+  uint8_t channel_count;
+  uint8_t sensor_pin;
+  pd_drawer_kick_method method;
+  uint16_t default_pulse_ms;
+  uint16_t max_pulse_ms;
+  uint16_t cooldown_ms;
+  int32_t can_kick_during_print;
+  int32_t status_available;
+  pd_drawer_status_method status_method;
+  int32_t shared_between_drawers;
+  int32_t shared_with_buzzer;
+  pd_provenance electrical_provenance;
+  pd_provenance commands_provenance;
+  /* 1 when this engine may put a pulse on the wire for this profile: a drivable method
+   * AND an established electrical standard. A caller that reads nothing else should
+   * read this. */
+  int32_t kickable;
+} pd_drawer_capabilities;
+
+/* 0 asks for the profile's own default in both fields. `channel` is 1 for drive 1
+ * (Epson pin 2) and 2 for drive 2 (pin 5); out-of-range values are clamped to what the
+ * profile documents rather than refused. */
+typedef struct pd_drawer_request {
+  uint8_t channel;
+  uint16_t pulse_ms;
+} pd_drawer_request;
+
+/*
+ * The answer docs/cash-drawer.md asks for by name. `elapsed_ms` is the interval between
+ * the pulse leaving for the link and the verdict — the "sensor changed 143 ms after
+ * kick" number — and is 0 when there was nothing to wait for. `pulse_ms` is 0 when no
+ * pulse was emitted at all, which happens when the drawer was already open and when the
+ * call was refused.
+ */
+typedef struct pd_drawer_result {
+  pd_drawer_state state;
+  pd_drawer_state previous_state;
+  uint8_t channel;
+  uint16_t pulse_ms;
+  uint32_t elapsed_ms;
+} pd_drawer_result;
+
+/*
+ * One non-destructive read of the drawer switch. `pin_high` is PD_UNKNOWN, PD_FALSE or
+ * PD_TRUE. `needs_calibration` is 1 until this printer's polarity has been measured,
+ * and while it is 1 `state` stays PD_DRAWER_UNKNOWN however clear the level is: Star
+ * documents that the meaning of the signal depends on the attached drawer, so this ABI
+ * reports a level it cannot interpret rather than guessing a direction.
+ */
+typedef struct pd_drawer_reading {
+  int32_t available;
+  int32_t answered;
+  int32_t pin_high;
+  int32_t needs_calibration;
+  pd_drawer_state state;
+} pd_drawer_reading;
+
+/* The profile's drawer facet. All-zeroes for a NULL or foreign handle, which reads as
+ * "no drawer, unsupported method, unclassified port" — the safe answer. */
+pd_drawer_capabilities pd_printer_drawer_capabilities(pd_printer* printer);
+
+/*
+ * The verified opening sequence. Blocks until it reaches a verdict.
+ *
+ *   1. read the switch first — an already-open drawer is never pulsed again;
+ *   2. run on the printer's own worker, so the pulse cannot interleave with a fenced
+ *      job's bytes;
+ *   3. one queued ESC p at the profile's duration on the requested channel;
+ *   4. watch the switch for the profile's verification window;
+ *   5. it changed -> PD_DRAWER_OPEN_VERIFIED;
+ *   6. it did not -> PD_DRAWER_FAILED_TO_OPEN;
+ *   7. nothing can answer -> PD_DRAWER_KICK_SENT_UNVERIFIED;
+ *   8. hold the manufacturer cooldown before the next pulse.
+ *
+ * `request` may be NULL for the profile's defaults. Refused — zero bytes written,
+ * PD_DRAWER_UNKNOWN — when the profile has no drawer port, when its kick method is one
+ * this engine cannot drive (Star's peripheral command, ePOS, a vendor SDK), or when the
+ * electrical standard is PD_DRAWER_PORT_UNKNOWN.
+ */
+pd_drawer_result pd_drawer_open(pd_driver* driver, pd_printer* printer,
+                                const pd_drawer_request* request);
+
+/* Never pulses, so it is safe on hardware pd_drawer_open refuses. timeout_ms of 0
+ * selects 1500. */
+pd_drawer_reading pd_drawer_read_sensor(pd_driver* driver, pd_printer* printer,
+                                        uint32_t timeout_ms);
+
+/*
+ * Records which pin level means "open" for the drawer physically attached to this
+ * printer, and persists it in the storage directory so it outlives the process. The
+ * calling sequence is the operator one: ask for the drawer to be closed, read the
+ * sensor, ask for it to be opened, read again, and pass the level observed while it was
+ * open. Returns 1 when it was persisted, 0 when it applies to this process only (an
+ * in-memory driver, or a storage directory that cannot be written).
+ */
+int32_t pd_drawer_calibrate_polarity(pd_driver* driver, pd_printer* printer,
+                                     int32_t high_means_open);
+
+/* 1 once a polarity has been measured for this printer. */
+int32_t pd_drawer_polarity_calibrated(pd_driver* driver, pd_printer* printer);
+/* Meaningful only while pd_drawer_polarity_calibrated returns 1. */
+int32_t pd_drawer_high_means_open(pd_driver* driver, pd_printer* printer);
+
+/* Static storage, never NULL, matching the core's own spelling one-for-one. */
+const char* pd_drawer_state_name(pd_drawer_state value);
+const char* pd_drawer_port_standard_name(pd_drawer_port_standard value);
+const char* pd_drawer_kick_method_name(pd_drawer_kick_method value);
+const char* pd_drawer_status_method_name(pd_drawer_status_method value);
+
+/* ============================== end M14 ========================================== */
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

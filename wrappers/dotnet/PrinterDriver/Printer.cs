@@ -75,8 +75,88 @@ public sealed class Printer
     public DeviceStatus RefreshStatus(uint timeoutMs = 0) => DeviceStatus.FromNative(
         NativeMethods.pd_printer_refresh_status(_driver.Handle, _handle, timeoutMs));
 
-    /// <summary>Kicks the cash drawer.</summary>
+    /// <summary>Kicks the cash drawer and tells the caller nothing.</summary>
+    /// <remarks>
+    /// Kept because it is ABI, and because a caller that genuinely does not want to wait is
+    /// entitled to say so. Everything new should use <see cref="OpenDrawer"/>, which reports
+    /// what actually happened.
+    /// </remarks>
     public void OpenCashDrawer() => NativeMethods.pd_open_cash_drawer(_driver.Handle, _handle);
+
+    // --- M14: cash drawer (docs/cash-drawer.md) --------------------------------------
+
+    /// <summary>What this printer's drawer port is, and what is known about it.</summary>
+    public DrawerCapabilities DrawerCapabilities =>
+        global::PrinterDriver.DrawerCapabilities.FromNative(
+            NativeMethods.pd_printer_drawer_capabilities(_handle));
+
+    /// <summary>
+    /// Fires the drawer and reports what was observed, never a boolean.
+    /// </summary>
+    /// <remarks>
+    /// The sequence: read the switch first (a drawer that is already out is not pulsed
+    /// again), take the printer's peripheral lane so the pulse cannot land inside a fenced
+    /// job, emit one queued pulse, watch the switch for the profile's verification window,
+    /// and hold the manufacturer cooldown before the next one.
+    /// <para>
+    /// Refused — zero bytes written, <see cref="DrawerState.Unknown"/> — when this model has
+    /// no drawer port, when its kick method is one this engine does not drive, or when the
+    /// electrical standard is <see cref="DrawerPortStandard.Unknown"/>. RJ11/RJ12-looking
+    /// drawer connectors are not a universal electrical standard, and an unclassified port
+    /// is never energised.
+    /// </para>
+    /// <para>Blocks the calling thread until the sequence reaches a verdict.</para>
+    /// </remarks>
+    /// <param name="channel">
+    /// 1 for drive 1 (Epson pin 2), 2 for drive 2 (pin 5). Clamped to what the profile
+    /// documents.
+    /// </param>
+    /// <param name="pulseMs">0 uses the profile's own default.</param>
+    /// <returns>What was established.</returns>
+    public DrawerResult OpenDrawer(byte channel = 1, ushort pulseMs = 0)
+    {
+        var request = new PdDrawerRequest { Channel = channel, PulseMs = pulseMs };
+        return DrawerResult.FromNative(
+            NativeMethods.pd_drawer_open(_driver.Handle, _handle, in request));
+    }
+
+    /// <summary>
+    /// Reads the drawer switch without firing anything. Safe on hardware
+    /// <see cref="OpenDrawer"/> refuses, which is what makes it the first half of the
+    /// calibration procedure.
+    /// </summary>
+    /// <param name="timeoutMs">How long to wait for the answer; 0 means 1500 ms.</param>
+    /// <returns>The raw level, and an interpretation only where one has been earned.</returns>
+    public DrawerReading ReadDrawerSensor(uint timeoutMs = 0) => DrawerReading.FromNative(
+        NativeMethods.pd_drawer_read_sensor(_driver.Handle, _handle, timeoutMs));
+
+    /// <summary>
+    /// Records which sense level means "open" for the drawer attached to this printer, and
+    /// persists it in the driver's storage directory.
+    /// </summary>
+    /// <remarks>
+    /// The procedure is an operator's: ask for the drawer to be closed, read the sensor, ask
+    /// for it to be opened, read again, and pass the level observed while it was open.
+    /// </remarks>
+    /// <param name="highMeansOpen">The level observed while the drawer was open.</param>
+    /// <returns>
+    /// True when it was persisted; false when it applies to this process only — an in-memory
+    /// driver, or a storage directory that cannot be written.
+    /// </returns>
+    public bool CalibrateDrawerPolarity(bool highMeansOpen) =>
+        NativeMethods.pd_drawer_calibrate_polarity(_driver.Handle, _handle,
+                                                    highMeansOpen ? 1 : 0) == 1;
+
+    /// <summary>
+    /// Whether a polarity has been measured for this printer. Until it has, a sensor reading
+    /// carries a level and no interpretation.
+    /// </summary>
+    public bool IsDrawerPolarityCalibrated =>
+        NativeMethods.pd_drawer_polarity_calibrated(_driver.Handle, _handle) == 1;
+
+    /// <summary>Meaningful only while <see cref="IsDrawerPolarityCalibrated"/> is true.</summary>
+    public bool DrawerHighMeansOpen =>
+        NativeMethods.pd_drawer_high_means_open(_driver.Handle, _handle) == 1;
 
     /// <summary>Blocks until this printer's queue is empty and its active job is terminal.</summary>
     public void Drain() => NativeMethods.pd_printer_drain(_driver.Handle, _handle);

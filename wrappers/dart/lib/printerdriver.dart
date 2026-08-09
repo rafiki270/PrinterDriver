@@ -518,9 +518,97 @@ final class Printer {
     );
   }
 
+  /// Pulses the cash drawer and tells the caller nothing.
+  ///
+  /// Kept because it is ABI, and because a caller that genuinely does not want to wait is
+  /// entitled to say so. Everything new should use [openDrawer], which reports what
+  /// actually happened.
   void openCashDrawer() {
     _driver._checkAlive();
     _bindings.openCashDrawer(_driver._handle, _handle);
+  }
+
+  // --- M14: cash drawer (docs/cash-drawer.md) --------------------------------------
+
+  /// What this printer's drawer port is, and what is known about it.
+  DrawerCapabilities get drawerCapabilities {
+    _driver._checkAlive();
+    return DrawerCapabilities.fromNative(
+      _bindings.printerDrawerCapabilities(_handle),
+    );
+  }
+
+  /// Fires the drawer and reports what was observed, never a boolean.
+  ///
+  /// The sequence: read the switch first (a drawer that is already out is not pulsed
+  /// again), take the printer's peripheral lane so the pulse cannot land inside a fenced
+  /// job, emit one queued pulse, watch the switch for the profile's verification window,
+  /// and hold the manufacturer cooldown before the next one.
+  ///
+  /// Refused — zero bytes written, [DrawerState.unknown] — when this model has no drawer
+  /// port, when its kick method is one this engine does not drive, or when the electrical
+  /// standard is [DrawerPortStandard.unknown]. RJ11/RJ12-looking drawer connectors are not
+  /// a universal electrical standard, and an unclassified port is never energised.
+  ///
+  /// [channel] is 1 for drive 1 (Epson pin 2) and 2 for drive 2 (pin 5), clamped to what
+  /// the profile documents; [pulseMs] of 0 uses the profile's own default. Blocks this
+  /// isolate until the sequence reaches a verdict.
+  DrawerResult openDrawer({int channel = 1, int pulseMs = 0}) {
+    _driver._checkAlive();
+    return Arena.using((arena) {
+      final request = arena.allocate<PdDrawerRequest>(sizeOf<PdDrawerRequest>());
+      request.ref
+        ..channel = channel
+        ..pulseMs = pulseMs;
+      return DrawerResult.fromNative(
+        _bindings.drawerOpen(_driver._handle, _handle, request),
+      );
+    });
+  }
+
+  /// Reads the drawer switch without firing anything.
+  ///
+  /// Safe on hardware [openDrawer] refuses, which is what makes it the first half of the
+  /// calibration procedure. Blocks this isolate for up to [timeout] (1.5 s when null).
+  DrawerReading readDrawerSensor({Duration? timeout}) {
+    _driver._checkAlive();
+    return DrawerReading.fromNative(
+      _bindings.drawerReadSensor(
+        _driver._handle,
+        _handle,
+        timeout?.inMilliseconds ?? 0,
+      ),
+    );
+  }
+
+  /// Records which sense level means "open" for the drawer attached to this printer, and
+  /// persists it in the driver's storage directory.
+  ///
+  /// The procedure is an operator's: ask for the drawer to be closed, read the sensor, ask
+  /// for it to be opened, read again, and pass the level observed while it was open.
+  /// Returns false when it applies to this process only — an in-memory driver, or a
+  /// storage directory that cannot be written.
+  bool calibrateDrawerPolarity({required bool highMeansOpen}) {
+    _driver._checkAlive();
+    return _bindings.drawerCalibratePolarity(
+          _driver._handle,
+          _handle,
+          highMeansOpen ? 1 : 0,
+        ) ==
+        1;
+  }
+
+  /// Whether a polarity has been measured for this printer. Until it has, a sensor
+  /// reading carries a level and no interpretation.
+  bool get drawerPolarityCalibrated {
+    _driver._checkAlive();
+    return _bindings.drawerPolarityCalibrated(_driver._handle, _handle) == 1;
+  }
+
+  /// Meaningful only while [drawerPolarityCalibrated] is true.
+  bool get drawerHighMeansOpen {
+    _driver._checkAlive();
+    return _bindings.drawerHighMeansOpen(_driver._handle, _handle) == 1;
   }
 
   /// Blocks until this printer's queue is empty and its active job is terminal.
@@ -702,6 +790,28 @@ final class ScriptedDevice {
               .testReceivedContains(_printer._handle, arena.string(needle)),
         ) !=
         0;
+  }
+
+  // --- M14: cash drawer (docs/cash-drawer.md) --------------------------------------
+
+  /// How many `ESC p` pulses actually reached the device — the number a refusal test
+  /// has to watch stay at zero.
+  int get drawerKicks {
+    _printer._driver._checkAlive();
+    return _printer._bindings.testDrawerKicks(_printer._handle);
+  }
+
+  /// Where the scripted microswitch currently sits.
+  bool get drawerIsOpen {
+    _printer._driver._checkAlive();
+    return _printer._bindings.testDrawerIsOpen(_printer._handle) == 1;
+  }
+
+  /// An operator's hand: moves the drawer without going through the printer, which is
+  /// what the non-destructive polarity calibration asks for.
+  set drawerIsOpen(bool open) {
+    _printer._driver._checkAlive();
+    _printer._bindings.testSetDrawerOpen(_printer._handle, open ? 1 : 0);
   }
 }
 

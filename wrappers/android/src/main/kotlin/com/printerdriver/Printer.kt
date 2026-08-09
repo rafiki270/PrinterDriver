@@ -67,9 +67,77 @@ class Printer internal constructor(
         DeviceStatus.fromRaw(NativeBridge.printerRefreshStatus(driver.handle, handle, timeoutMs))
     }
 
+    /** Pulses the cash drawer and tells the caller nothing.
+     *
+     *  Kept because it is ABI, and because a caller that genuinely does not want to wait
+     *  is entitled to say so. Everything new should use [openDrawer], which reports what
+     *  actually happened. */
     fun openCashDrawer() {
         driver.checkOpen()
         NativeBridge.openCashDrawer(driver.handle, handle)
+    }
+
+    // --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------
+
+    /** What this printer's drawer port is, and what is known about it. */
+    fun drawerCapabilities(): DrawerCapabilities {
+        driver.checkOpen()
+        return DrawerCapabilities.fromRaw(NativeBridge.drawerCapabilities(handle))
+    }
+
+    /** Fires the drawer and reports what was observed, never a boolean.
+     *
+     *  The sequence: read the switch first (a drawer that is already out is not pulsed
+     *  again), take the printer's peripheral lane so the pulse cannot land inside a
+     *  fenced job, emit one queued pulse, watch the switch for the profile's verification
+     *  window, and hold the manufacturer cooldown before the next one.
+     *
+     *  Refused -- zero bytes written, [DrawerState.UNKNOWN] -- when this model has no
+     *  drawer port, when its kick method is one this engine does not drive, or when the
+     *  electrical standard is [DrawerPortStandard.UNKNOWN]: RJ11/RJ12-looking drawer
+     *  connectors are not a universal electrical standard, and an unclassified port is
+     *  never energised.
+     *
+     *  [channel] is 1 for drive 1 (Epson pin 2) and 2 for drive 2 (pin 5), clamped to
+     *  what the profile documents; [pulseMs] 0 -> the profile's own default. */
+    suspend fun openDrawer(channel: Int = 1, pulseMs: Int = 0): DrawerResult =
+        withContext(Dispatchers.IO) {
+            driver.checkOpen()
+            DrawerResult.fromRaw(NativeBridge.drawerOpen(driver.handle, handle, channel, pulseMs))
+        }
+
+    /** Reads the drawer switch without firing anything. Safe on hardware [openDrawer]
+     *  refuses, which is what makes it the first half of the calibration procedure.
+     *  [timeoutMs] 0 -> the ABI's default (1500ms). */
+    suspend fun readDrawerSensor(timeoutMs: Int = 0): DrawerReading =
+        withContext(Dispatchers.IO) {
+            driver.checkOpen()
+            DrawerReading.fromRaw(
+                NativeBridge.drawerReadSensor(driver.handle, handle, timeoutMs)
+            )
+        }
+
+    /** Records which sense level means "open" for the drawer attached to this printer,
+     *  and persists it in the driver's storage directory. The procedure is an operator's:
+     *  ask for the drawer to be closed, read the sensor, ask for it to be opened, read
+     *  again, and pass the level observed while it was open. Returns false when it
+     *  applies to this process only. */
+    fun calibrateDrawerPolarity(highMeansOpen: Boolean): Boolean {
+        driver.checkOpen()
+        return NativeBridge.drawerCalibratePolarity(driver.handle, handle, highMeansOpen) == 1
+    }
+
+    /** Whether a polarity has been measured for this printer. Until it has, a sensor
+     *  reading carries a level and no interpretation. */
+    fun drawerPolarityCalibrated(): Boolean {
+        driver.checkOpen()
+        return NativeBridge.drawerPolarityCalibrated(driver.handle, handle) == 1
+    }
+
+    /** Meaningful only while [drawerPolarityCalibrated] is true. */
+    fun drawerHighMeansOpen(): Boolean {
+        driver.checkOpen()
+        return NativeBridge.drawerHighMeansOpen(driver.handle, handle) == 1
     }
 
     /** Blocks until this printer's queue is empty and its active job is terminal. */

@@ -188,9 +188,78 @@ public final class Printer: @unchecked Sendable {
     return trampoline.makeStream()
   }
 
-  /// Pulses the cash drawer.
+  /// Pulses the cash drawer and tells the caller nothing.
+  ///
+  /// Kept because it is ABI, and because a caller that genuinely does not want to wait is
+  /// entitled to say so. Everything new should use ``openDrawer(channel:pulseMilliseconds:)``,
+  /// which reports what actually happened.
   public func openCashDrawer() {
     pd_open_cash_drawer(core.handle, handle)
+  }
+
+  // MARK: - M14: cash drawer (docs/cash-drawer.md)
+
+  /// What this printer's drawer port is, and what is known about it.
+  public var drawerCapabilities: DrawerCapabilities {
+    DrawerCapabilities(pd_printer_drawer_capabilities(handle))
+  }
+
+  /// Fires the drawer and reports what was observed, never a boolean.
+  ///
+  /// The sequence: read the switch first (a drawer that is already out is not pulsed
+  /// again), take the printer's peripheral lane so the pulse cannot land inside a fenced
+  /// job, emit one queued pulse, watch the switch for the profile's verification window,
+  /// and hold the manufacturer cooldown before the next one.
+  ///
+  /// Refused — zero bytes written, ``DrawerState/unknown`` — when this model has no drawer
+  /// port, when its kick method is one this engine does not drive, or when the electrical
+  /// standard is ``DrawerPortStandard/unknown``. RJ11/RJ12-looking drawer connectors are
+  /// not a universal electrical standard, and an unclassified port is never energised.
+  ///
+  /// - Parameters:
+  ///   - channel: 1 for drive 1 (Epson pin 2), 2 for drive 2 (pin 5). Clamped to what the
+  ///     profile documents.
+  ///   - pulseMilliseconds: 0 uses the profile's own default, 200 ms on the documented
+  ///     24 V families.
+  /// - Important: Blocks the calling thread until the sequence reaches a verdict.
+  @discardableResult
+  public func openDrawer(channel: UInt8 = 1, pulseMilliseconds: UInt16 = 0) -> DrawerResult {
+    var request = pd_drawer_request(channel: channel, pulse_ms: pulseMilliseconds)
+    return DrawerResult(pd_drawer_open(core.handle, handle, &request))
+  }
+
+  /// Reads the drawer switch without firing anything.
+  ///
+  /// Safe on hardware ``openDrawer(channel:pulseMilliseconds:)`` refuses, which is what
+  /// makes it the first half of the calibration procedure.
+  ///
+  /// - Important: Blocks the calling thread.
+  public func readDrawerSensor(timeoutMilliseconds: UInt32 = 1500) -> DrawerReading {
+    DrawerReading(pd_drawer_read_sensor(core.handle, handle, timeoutMilliseconds))
+  }
+
+  /// Records which sense level means "open" for the drawer attached to this printer, and
+  /// persists it in the driver's storage directory.
+  ///
+  /// The procedure is an operator's: ask for the drawer to be closed, read the sensor, ask
+  /// for it to be opened, read again, and pass the level observed while it was open.
+  ///
+  /// - Returns: `true` when it was persisted; `false` when it applies to this process only
+  ///   (an in-memory driver, or a storage directory that cannot be written).
+  @discardableResult
+  public func calibrateDrawerPolarity(highMeansOpen: Bool) -> Bool {
+    pd_drawer_calibrate_polarity(core.handle, handle, highMeansOpen ? 1 : 0) == 1
+  }
+
+  /// Whether a polarity has been measured for this printer. Until it has, a sensor reading
+  /// carries a level and no interpretation.
+  public var isDrawerPolarityCalibrated: Bool {
+    pd_drawer_polarity_calibrated(core.handle, handle) == 1
+  }
+
+  /// Meaningful only while ``isDrawerPolarityCalibrated`` is true.
+  public var drawerHighMeansOpen: Bool {
+    pd_drawer_high_means_open(core.handle, handle) == 1
   }
 
   /// Waits until this printer's queue is empty and its active job is terminal.

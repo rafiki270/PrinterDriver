@@ -131,6 +131,47 @@ internal object NativeBridge {
 
     @JvmStatic external fun openCashDrawer(driverHandle: Long, printerHandle: Long)
 
+    // --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------
+
+    /** Returns the 18 pd_drawer_capabilities fields packed as
+     *  [present, standard, voltage, maxCurrentMa, channelCount, sensorPin, method,
+     *  defaultPulseMs, maxPulseMs, cooldownMs, canKickDuringPrint, statusAvailable,
+     *  statusMethod, sharedBetweenDrawers, sharedWithBuzzer, electricalProvenance,
+     *  commandsProvenance, kickable] -- see DrawerCapabilities.fromRaw. Never blocks. */
+    @JvmStatic external fun drawerCapabilities(printerHandle: Long): IntArray
+
+    /** Runs the verified opening sequence and returns the 5 pd_drawer_result fields as
+     *  [state, previousState, channel, pulseMs, elapsedMs] -- see DrawerResult.fromRaw.
+     *  Blocks until the sequence reaches a verdict; call from a background dispatcher
+     *  (Printer.openDrawer already does). */
+    @JvmStatic external fun drawerOpen(
+        driverHandle: Long,
+        printerHandle: Long,
+        channel: Int,
+        pulseMs: Int
+    ): IntArray
+
+    /** Reads the switch without firing anything. Returns the 5 pd_drawer_reading fields
+     *  as [available, answered, pinHigh, needsCalibration, state], with pinHigh carrying
+     *  the ABI's tri-state (-1 = PD_UNKNOWN). Blocks. */
+    @JvmStatic external fun drawerReadSensor(
+        driverHandle: Long,
+        printerHandle: Long,
+        timeoutMs: Int
+    ): IntArray
+
+    /** Records and persists which sense level means "open" for the attached drawer.
+     *  Returns 1 when persisted, 0 when it applies to this process only. */
+    @JvmStatic external fun drawerCalibratePolarity(
+        driverHandle: Long,
+        printerHandle: Long,
+        highMeansOpen: Boolean
+    ): Int
+
+    @JvmStatic external fun drawerPolarityCalibrated(driverHandle: Long, printerHandle: Long): Int
+
+    @JvmStatic external fun drawerHighMeansOpen(driverHandle: Long, printerHandle: Long): Int
+
     /** Blocks until the printer's queue is empty and its active job is terminal. */
     @JvmStatic external fun printerDrain(driverHandle: Long, printerHandle: Long)
 

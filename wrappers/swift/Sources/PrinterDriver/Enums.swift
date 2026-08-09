@@ -458,3 +458,99 @@ public enum Binarization: UInt32, ABIMirroredEnum {
   public static let abiTypeName = "Binarization"
   public static let unrecognizedFallback = Binarization.fixedThreshold
 }
+
+// MARK: - M14: cash drawer (docs/cash-drawer.md)
+
+/// What is known about a cash drawer — `pd_drawer_state`.
+///
+/// The drawer document rejects `{sent: true}` in its first paragraph, and this enum is
+/// why: sending `ESC p` and watching the microswitch change are different claims, and an
+/// operator standing at a till needs them apart. ``kickSentUnverified`` is a real answer
+/// rather than a softer success — through a cheap print server the pulse travels forward
+/// while the sensor response never comes back.
+public enum DrawerState: UInt32, ABIMirroredEnum {
+  case closed = 0
+  case open = 1
+  case opening = 2
+  case kickSentUnverified = 3
+  /// The only case that claims physical movement.
+  case openVerified = 4
+  case failedToOpen = 5
+  /// This port has no switch input wired or documented. Not an error.
+  case noSensor = 6
+  case unknown = 7
+
+  public static let abiTypeName = "DrawerState"
+  /// Understates by construction: an unrecognized state claims nothing at all, which is
+  /// the only substitution that cannot turn an unconfirmed pulse into a confirmed one.
+  public static let unrecognizedFallback = DrawerState.unknown
+
+  /// The core's own spelling, from `pd_drawer_state_name`.
+  public var abiName: String {
+    String(cString: pd_drawer_state_name(pd_drawer_state(rawValue)))
+  }
+}
+
+/// The electrical classification of a drawer port — `pd_drawer_port_standard`.
+///
+/// RJ11/RJ12-looking drawer connectors are not a universal electrical standard. Star's
+/// identical-looking 6P6C socket carries +24 V on pin 3 and the sense line on pin 6,
+/// precisely where Epson puts sense and signal ground, which is why printer-specific
+/// drawer cables exist for plugs that look the same.
+public enum DrawerPortStandard: UInt32, ABIMirroredEnum {
+  /// 1 FG, 2 kick 1, 3 sensor, 4 +24 V, 5 kick 2, 6 signal ground. Epson, Citizen, much
+  /// of Bixolon and many clones: one large interoperable ecosystem.
+  case epson24V6P6C = 0
+  case star24V6P6C = 1
+  case generic12V6P6C = 2
+  case unknown = 3
+
+  public static let abiTypeName = "DrawerPortStandard"
+  /// Nothing is fired on an unknown port, so this fallback can only ever refuse.
+  public static let unrecognizedFallback = DrawerPortStandard.unknown
+
+  /// The core's own spelling, from `pd_drawer_port_standard_name`.
+  public var abiName: String {
+    String(cString: pd_drawer_port_standard_name(pd_drawer_port_standard(rawValue)))
+  }
+}
+
+/// Which software path fires the drawer — `pd_drawer_kick_method`.
+///
+/// Independent of ``DrawerPortStandard``: two printers accepting the same "kick drawer 1"
+/// command may still wire the modular socket differently.
+public enum DrawerKickMethod: UInt32, ABIMirroredEnum {
+  case epsonEscP = 0
+  case epsonEpos = 1
+  case starPrnt = 2
+  case bixolonSdk = 3
+  case citizenEscP = 4
+  case snbcEscP = 5
+  case vendor = 6
+  case unsupported = 7
+
+  public static let abiTypeName = "DrawerKickMethod"
+  public static let unrecognizedFallback = DrawerKickMethod.unsupported
+
+  /// The core's own spelling, from `pd_drawer_kick_method_name`.
+  public var abiName: String {
+    String(cString: pd_drawer_kick_method_name(pd_drawer_kick_method(rawValue)))
+  }
+}
+
+/// How the drawer switch is read back — `pd_drawer_status_method`.
+public enum DrawerStatusMethod: UInt32, ABIMirroredEnum {
+  case gsR2 = 0
+  case asb = 1
+  case starSignal = 2
+  case vendorSdk = 3
+  case none = 4
+
+  public static let abiTypeName = "DrawerStatusMethod"
+  public static let unrecognizedFallback = DrawerStatusMethod.none
+
+  /// The core's own spelling, from `pd_drawer_status_method_name`.
+  public var abiName: String {
+    String(cString: pd_drawer_status_method_name(pd_drawer_status_method(rawValue)))
+  }
+}

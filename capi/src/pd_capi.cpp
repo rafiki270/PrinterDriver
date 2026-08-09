@@ -1051,3 +1051,198 @@ extern "C" pd_code_page pd_code_page_at(int32_t index) {
   }
   return kCodePages[index];
 }
+
+// ====================================================================================
+// M14 — CASH DRAWER (docs/cash-drawer.md)
+// ====================================================================================
+
+static_assert(PD_DRAWER_CLOSED == value_of(pd::DrawerState::Closed));
+static_assert(PD_DRAWER_OPEN == value_of(pd::DrawerState::Open));
+static_assert(PD_DRAWER_OPENING == value_of(pd::DrawerState::Opening));
+static_assert(PD_DRAWER_KICK_SENT_UNVERIFIED ==
+              value_of(pd::DrawerState::KickSentUnverified));
+static_assert(PD_DRAWER_OPEN_VERIFIED == value_of(pd::DrawerState::OpenVerified));
+static_assert(PD_DRAWER_FAILED_TO_OPEN == value_of(pd::DrawerState::FailedToOpen));
+static_assert(PD_DRAWER_NO_SENSOR == value_of(pd::DrawerState::NoSensor));
+static_assert(PD_DRAWER_UNKNOWN == value_of(pd::DrawerState::Unknown));
+static_assert(PD_DRAWER_STATE_COUNT == static_cast<int>(pd::kAllDrawerStates.size()));
+
+static_assert(PD_DRAWER_PORT_EPSON_24V_6P6C ==
+              value_of(pd::DrawerPortStandard::Epson24V6P6C));
+static_assert(PD_DRAWER_PORT_STAR_24V_6P6C ==
+              value_of(pd::DrawerPortStandard::Star24V6P6C));
+static_assert(PD_DRAWER_PORT_GENERIC_12V_6P6C ==
+              value_of(pd::DrawerPortStandard::Generic12V6P6C));
+static_assert(PD_DRAWER_PORT_UNKNOWN == value_of(pd::DrawerPortStandard::Unknown));
+static_assert(PD_DRAWER_PORT_STANDARD_COUNT ==
+              static_cast<int>(pd::kAllDrawerPortStandards.size()));
+
+static_assert(PD_DRAWER_KICK_EPSON_ESC_P == value_of(pd::DrawerKickMethod::EpsonEscP));
+static_assert(PD_DRAWER_KICK_EPSON_EPOS == value_of(pd::DrawerKickMethod::EpsonEpos));
+static_assert(PD_DRAWER_KICK_STAR_PRNT == value_of(pd::DrawerKickMethod::StarPrnt));
+static_assert(PD_DRAWER_KICK_BIXOLON_SDK == value_of(pd::DrawerKickMethod::BixolonSdk));
+static_assert(PD_DRAWER_KICK_CITIZEN_ESC_P ==
+              value_of(pd::DrawerKickMethod::CitizenEscP));
+static_assert(PD_DRAWER_KICK_SNBC_ESC_P == value_of(pd::DrawerKickMethod::SnbcEscP));
+static_assert(PD_DRAWER_KICK_VENDOR == value_of(pd::DrawerKickMethod::Vendor));
+static_assert(PD_DRAWER_KICK_UNSUPPORTED == value_of(pd::DrawerKickMethod::Unsupported));
+static_assert(PD_DRAWER_KICK_METHOD_COUNT ==
+              static_cast<int>(pd::kAllDrawerKickMethods.size()));
+
+static_assert(PD_DRAWER_STATUS_GS_R2 == value_of(pd::DrawerStatusMethod::GsR2));
+static_assert(PD_DRAWER_STATUS_ASB == value_of(pd::DrawerStatusMethod::Asb));
+static_assert(PD_DRAWER_STATUS_STAR_SIGNAL ==
+              value_of(pd::DrawerStatusMethod::StarSignal));
+static_assert(PD_DRAWER_STATUS_VENDOR_SDK == value_of(pd::DrawerStatusMethod::VendorSdk));
+static_assert(PD_DRAWER_STATUS_NONE == value_of(pd::DrawerStatusMethod::None));
+static_assert(PD_DRAWER_STATUS_METHOD_COUNT ==
+              static_cast<int>(pd::kAllDrawerStatusMethods.size()));
+
+namespace {
+
+const char* const kDrawerStateNames[PD_DRAWER_STATE_COUNT] = {
+    "Closed", "Open", "Opening", "KickSentUnverified",
+    "OpenVerified", "FailedToOpen", "NoSensor", "Unknown"};
+
+const char* const kDrawerPortStandardNames[PD_DRAWER_PORT_STANDARD_COUNT] = {
+    "Epson24V6P6C", "Star24V6P6C", "Generic12V6P6C", "Unknown"};
+
+const char* const kDrawerKickMethodNames[PD_DRAWER_KICK_METHOD_COUNT] = {
+    "EpsonEscP", "EpsonEpos", "StarPrnt",  "BixolonSdk",
+    "CitizenEscP", "SnbcEscP", "Vendor",   "Unsupported"};
+
+const char* const kDrawerStatusMethodNames[PD_DRAWER_STATUS_METHOD_COUNT] = {
+    "GsR2", "Asb", "StarSignal", "VendorSdk", "None"};
+
+pd_drawer_capabilities toDrawerCapabilities(const pd::DrawerCapabilities& caps) {
+  pd_drawer_capabilities out{};
+  out.present = caps.present ? PD_TRUE : PD_FALSE;
+  out.standard = static_cast<pd_drawer_port_standard>(caps.electrical.standard);
+  out.voltage = caps.electrical.voltage;
+  out.max_current_ma = caps.electrical.max_current_ma;
+  out.channel_count = caps.electrical.channel_count;
+  out.sensor_pin = caps.electrical.sensor_pin;
+  out.method = static_cast<pd_drawer_kick_method>(caps.kick.method);
+  out.default_pulse_ms = caps.kick.default_pulse_ms;
+  out.max_pulse_ms = caps.kick.max_pulse_ms;
+  out.cooldown_ms = caps.kick.cooldown_ms;
+  out.can_kick_during_print = caps.kick.can_kick_during_print ? PD_TRUE : PD_FALSE;
+  out.status_available = caps.status.available ? PD_TRUE : PD_FALSE;
+  out.status_method = static_cast<pd_drawer_status_method>(caps.status.method);
+  out.shared_between_drawers = caps.status.shared_between_drawers ? PD_TRUE : PD_FALSE;
+  out.shared_with_buzzer = caps.port.shared_with_buzzer ? PD_TRUE : PD_FALSE;
+  out.electrical_provenance = static_cast<pd_provenance>(caps.evidence.electrical);
+  out.commands_provenance = static_cast<pd_provenance>(caps.evidence.commands);
+  out.kickable = caps.kickable() ? PD_TRUE : PD_FALSE;
+  return out;
+}
+
+// A drawer facet nobody could look at: no port, unsupported method, unclassified
+// standard. Every zero here is the conservative answer, which is why an all-zeroes
+// struct is a safe one.
+pd_drawer_capabilities emptyDrawerCapabilities() {
+  pd_drawer_capabilities out{};
+  out.standard = PD_DRAWER_PORT_UNKNOWN;
+  out.method = PD_DRAWER_KICK_UNSUPPORTED;
+  out.status_method = PD_DRAWER_STATUS_NONE;
+  out.electrical_provenance = PD_PROVENANCE_UNVERIFIED;
+  out.commands_provenance = PD_PROVENANCE_UNVERIFIED;
+  return out;
+}
+
+pd_drawer_result toDrawerResult(const pd::DrawerOpenResult& result) {
+  pd_drawer_result out{};
+  out.state = static_cast<pd_drawer_state>(result.state);
+  out.previous_state = static_cast<pd_drawer_state>(result.previous_state);
+  out.channel = result.channel;
+  out.pulse_ms = result.pulse_ms;
+  out.elapsed_ms = result.elapsed_ms;
+  return out;
+}
+
+pd_drawer_reading toDrawerReading(const pd::DrawerReading& reading) {
+  pd_drawer_reading out{};
+  out.available = reading.available ? PD_TRUE : PD_FALSE;
+  out.answered = reading.answered ? PD_TRUE : PD_FALSE;
+  out.pin_high = reading.pin_high.has_value() ? (*reading.pin_high ? PD_TRUE : PD_FALSE)
+                                              : PD_UNKNOWN;
+  out.needs_calibration = reading.needs_calibration ? PD_TRUE : PD_FALSE;
+  out.state = static_cast<pd_drawer_state>(reading.state);
+  return out;
+}
+
+}  // namespace
+
+extern "C" pd_drawer_capabilities pd_printer_drawer_capabilities(pd_printer* printer) {
+  if (printer == nullptr || !printer->printer) {
+    return emptyDrawerCapabilities();
+  }
+  return toDrawerCapabilities(printer->printer->profile().drawer);
+}
+
+extern "C" pd_drawer_result pd_drawer_open(pd_driver* driver, pd_printer* printer,
+                                           const pd_drawer_request* request) {
+  if (!checkHandles(driver, printer)) {
+    pd_drawer_result out{};
+    out.state = PD_DRAWER_UNKNOWN;
+    out.previous_state = PD_DRAWER_UNKNOWN;
+    out.channel = 1;
+    return out;
+  }
+  pd::DrawerRequest wanted;
+  if (request != nullptr) {
+    wanted.channel = request->channel;
+    wanted.pulse_ms = request->pulse_ms;
+  }
+  return toDrawerResult(printer->printer->openDrawer(wanted));
+}
+
+extern "C" pd_drawer_reading pd_drawer_read_sensor(pd_driver* driver, pd_printer* printer,
+                                                   uint32_t timeout_ms) {
+  if (!checkHandles(driver, printer)) {
+    pd_drawer_reading out{};
+    out.pin_high = PD_UNKNOWN;
+    out.needs_calibration = PD_TRUE;
+    out.state = PD_DRAWER_UNKNOWN;
+    return out;
+  }
+  return toDrawerReading(printer->printer->readDrawerSensor(
+      std::chrono::milliseconds(timeout_ms != 0 ? timeout_ms : 1500)));
+}
+
+extern "C" int32_t pd_drawer_calibrate_polarity(pd_driver* driver, pd_printer* printer,
+                                                int32_t high_means_open) {
+  if (!checkHandles(driver, printer)) {
+    return 0;
+  }
+  return printer->printer->calibrateDrawerPolarity(high_means_open != 0) ? 1 : 0;
+}
+
+extern "C" int32_t pd_drawer_polarity_calibrated(pd_driver* driver, pd_printer* printer) {
+  if (!checkHandles(driver, printer)) {
+    return 0;
+  }
+  return printer->printer->drawerPolarity().calibrated ? 1 : 0;
+}
+
+extern "C" int32_t pd_drawer_high_means_open(pd_driver* driver, pd_printer* printer) {
+  if (!checkHandles(driver, printer)) {
+    return 0;
+  }
+  return printer->printer->drawerPolarity().high_means_open ? 1 : 0;
+}
+
+extern "C" const char* pd_drawer_state_name(pd_drawer_state value) {
+  return nameAt(kDrawerStateNames, value);
+}
+extern "C" const char* pd_drawer_port_standard_name(pd_drawer_port_standard value) {
+  return nameAt(kDrawerPortStandardNames, value);
+}
+extern "C" const char* pd_drawer_kick_method_name(pd_drawer_kick_method value) {
+  return nameAt(kDrawerKickMethodNames, value);
+}
+extern "C" const char* pd_drawer_status_method_name(pd_drawer_status_method value) {
+  return nameAt(kDrawerStatusMethodNames, value);
+}
+
+// ================================ end M14 ==========================================

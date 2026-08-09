@@ -369,6 +369,11 @@ static void test_enum_bridge_matches_pd_h(void) {
       {PD_TEST_ENUM_BINARIZATION, PD_BINARIZATION_COUNT},
       {PD_TEST_ENUM_CONFIDENCE_GRADE, PD_GRADE_COUNT},
       {PD_TEST_ENUM_COMPLETION_AUTHORITY, PD_AUTHORITY_COUNT},
+      /* M14 — docs/cash-drawer.md. */
+      {PD_TEST_ENUM_DRAWER_STATE, PD_DRAWER_STATE_COUNT},
+      {PD_TEST_ENUM_DRAWER_PORT_STANDARD, PD_DRAWER_PORT_STANDARD_COUNT},
+      {PD_TEST_ENUM_DRAWER_KICK_METHOD, PD_DRAWER_KICK_METHOD_COUNT},
+      {PD_TEST_ENUM_DRAWER_STATUS_METHOD, PD_DRAWER_STATUS_METHOD_COUNT},
   };
   const size_t table_size = sizeof(table) / sizeof(table[0]);
 
@@ -402,7 +407,11 @@ static void test_enum_bridge_matches_pd_h(void) {
     }
   }
 
-  /* The ten enums with a spelling on both sides: compare name for name. */
+  /* Every bridged id has to be in that table, or a new enum would simply never be
+   * checked by anything. */
+  CHECK_EQ((int)table_size, (int)PD_TEST_ENUM_TOTAL);
+
+  /* The fourteen enums with a spelling on both sides: compare name for name. */
   for (int i = 0; i < PD_JOB_STATE_COUNT; ++i) {
     CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_JOB_STATE, i),
                 pd_job_state_name((pd_job_state)i));
@@ -442,6 +451,22 @@ static void test_enum_bridge_matches_pd_h(void) {
   for (int i = 0; i < PD_AUTHORITY_COUNT; ++i) {
     CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_COMPLETION_AUTHORITY, i),
                 pd_completion_authority_name((pd_completion_authority)i));
+  }
+  for (int i = 0; i < PD_DRAWER_STATE_COUNT; ++i) {
+    CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_DRAWER_STATE, i),
+                pd_drawer_state_name((pd_drawer_state)i));
+  }
+  for (int i = 0; i < PD_DRAWER_PORT_STANDARD_COUNT; ++i) {
+    CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_DRAWER_PORT_STANDARD, i),
+                pd_drawer_port_standard_name((pd_drawer_port_standard)i));
+  }
+  for (int i = 0; i < PD_DRAWER_KICK_METHOD_COUNT; ++i) {
+    CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_DRAWER_KICK_METHOD, i),
+                pd_drawer_kick_method_name((pd_drawer_kick_method)i));
+  }
+  for (int i = 0; i < PD_DRAWER_STATUS_METHOD_COUNT; ++i) {
+    CHECK_STREQ(pd_test_cpp_enum_name(PD_TEST_ENUM_DRAWER_STATUS_METHOD, i),
+                pd_drawer_status_method_name((pd_drawer_status_method)i));
   }
 
   /* The remaining five have no C++ to_string, so the bridge must say so plainly rather
@@ -758,6 +783,154 @@ static void test_profile_ids_expose_the_whole_catalogue(void) {
   CHECK_EQ(saw_p20ii, 1);
 }
 
+/* --- M14. The cash drawer (docs/cash-drawer.md) ------------------------------------
+ *
+ * The ABI's whole claim is that a drawer answer is a state and not a boolean, so these
+ * three exercise the three answers a caller actually has to tell apart: the switch
+ * moved, the switch did not, and nothing was fired at all. */
+
+static void test_drawer_sequence_over_the_abi(void) {
+  pd_config config;
+  pd_driver* driver = NULL;
+  pd_printer* printer = NULL;
+  pd_drawer_capabilities caps;
+  pd_drawer_result result;
+  pd_drawer_request request;
+
+  memset(&config, 0, sizeof(config));
+  driver = pd_create(&config);
+  CHECK(driver != NULL);
+  printer = pd_add_printer_scripted(driver, "drawer-1", "drawer");
+  CHECK(printer != NULL);
+
+  caps = pd_printer_drawer_capabilities(printer);
+  CHECK_EQ(caps.present, PD_TRUE);
+  CHECK_EQ((int)caps.standard, (int)PD_DRAWER_PORT_EPSON_24V_6P6C);
+  CHECK_EQ((int)caps.method, (int)PD_DRAWER_KICK_EPSON_ESC_P);
+  CHECK_EQ((int)caps.voltage, 24);
+  CHECK_EQ((int)caps.sensor_pin, 3);
+  CHECK_EQ((int)caps.channel_count, 2);
+  CHECK_EQ(caps.kickable, PD_TRUE);
+  CHECK_EQ((int)caps.electrical_provenance, (int)PD_PROVENANCE_DOCUMENTED);
+
+  /* NULL request means the profile's own defaults. */
+  result = pd_drawer_open(driver, printer, NULL);
+  CHECK_EQ((int)result.previous_state, (int)PD_DRAWER_CLOSED);
+  CHECK_EQ((int)result.state, (int)PD_DRAWER_OPEN_VERIFIED);
+  CHECK_EQ((int)result.channel, 1);
+  CHECK_EQ((int)result.pulse_ms, 200);
+  CHECK_EQ(pd_test_drawer_is_open(printer), 1);
+  CHECK_EQ((int)pd_test_drawer_kicks(printer), 1);
+  CHECK_STREQ(pd_drawer_state_name(result.state), "OpenVerified");
+
+  /* Step 1 of the sequence: a drawer that is already out is never pulsed again. */
+  result = pd_drawer_open(driver, printer, NULL);
+  CHECK_EQ((int)result.state, (int)PD_DRAWER_OPEN);
+  CHECK_EQ((int)result.pulse_ms, 0);
+  CHECK_EQ((int)pd_test_drawer_kicks(printer), 1);
+
+  /* A locked drawer is a different printer, and a different answer. */
+  {
+    pd_printer* locked = pd_add_printer_scripted(driver, "drawer-2", "drawer-locked");
+    CHECK(locked != NULL);
+    memset(&request, 0, sizeof(request));
+    request.channel = 1;
+    request.pulse_ms = 120;
+    result = pd_drawer_open(driver, locked, &request);
+    CHECK_EQ((int)result.state, (int)PD_DRAWER_FAILED_TO_OPEN);
+    CHECK_EQ((int)result.pulse_ms, 120);
+    CHECK_EQ((int)pd_test_drawer_kicks(locked), 1);
+    CHECK_STREQ(pd_drawer_state_name(result.state), "FailedToOpen");
+  }
+
+  pd_destroy(driver);
+}
+
+static void test_drawer_refusals_write_no_bytes(void) {
+  pd_config config;
+  pd_driver* driver = NULL;
+  pd_printer* unclassified = NULL;
+  pd_printer* zebra = NULL;
+  pd_tcp_config tcp;
+  pd_drawer_result result;
+
+  memset(&config, 0, sizeof(config));
+  driver = pd_create(&config);
+  CHECK(driver != NULL);
+
+  /* The giant-letters rule: a 6P6C socket nobody has classified gets no current. */
+  unclassified = pd_add_printer_scripted(driver, "drawer-3", "drawer-unknown-port");
+  CHECK(unclassified != NULL);
+  CHECK_EQ(pd_printer_drawer_capabilities(unclassified).kickable, PD_FALSE);
+  CHECK_EQ((int)pd_printer_drawer_capabilities(unclassified).standard,
+           (int)PD_DRAWER_PORT_UNKNOWN);
+  result = pd_drawer_open(driver, unclassified, NULL);
+  CHECK_EQ((int)result.state, (int)PD_DRAWER_UNKNOWN);
+  CHECK_EQ((int)result.pulse_ms, 0);
+  CHECK_EQ((int)pd_test_drawer_kicks(unclassified), 0);
+
+  /* A label printer has no drawer port and does not speak ESC/POS either. */
+  memset(&tcp, 0, sizeof(tcp));
+  tcp.printer_id = "zebra-1";
+  tcp.host = "192.0.2.60";
+  tcp.profile_id = "zebra_zq600_plus";
+  zebra = pd_add_printer_tcp(driver, &tcp);
+  CHECK(zebra != NULL);
+  {
+    const pd_drawer_capabilities caps = pd_printer_drawer_capabilities(zebra);
+    CHECK_EQ(caps.present, PD_FALSE);
+    CHECK_EQ((int)caps.method, (int)PD_DRAWER_KICK_UNSUPPORTED);
+    CHECK_EQ(caps.kickable, PD_FALSE);
+  }
+  result = pd_drawer_open(driver, zebra, NULL);
+  CHECK_EQ((int)result.state, (int)PD_DRAWER_UNKNOWN);
+  CHECK_EQ((int)result.pulse_ms, 0);
+
+  pd_destroy(driver);
+}
+
+static void test_drawer_polarity_calibration_over_the_abi(void) {
+  pd_config config;
+  pd_driver* driver = NULL;
+  pd_printer* printer = NULL;
+  pd_drawer_reading shut;
+  pd_drawer_reading open;
+  pd_drawer_reading after;
+
+  memset(&config, 0, sizeof(config));
+  driver = pd_create(&config);
+  CHECK(driver != NULL);
+  printer = pd_add_printer_scripted(driver, "drawer-4", "drawer-uncalibrated");
+  CHECK(printer != NULL);
+  CHECK_EQ(pd_drawer_polarity_calibrated(driver, printer), 0);
+
+  /* The operator procedure: close it, read, open it, read, record which level meant
+   * open. Nothing here pulses anything. */
+  pd_test_set_drawer_open(printer, 0);
+  shut = pd_drawer_read_sensor(driver, printer, 500);
+  CHECK_EQ(shut.available, PD_TRUE);
+  CHECK_EQ(shut.answered, PD_TRUE);
+  CHECK_EQ(shut.needs_calibration, PD_TRUE);
+  /* A level, and deliberately not a state. */
+  CHECK_EQ((int)shut.state, (int)PD_DRAWER_UNKNOWN);
+  CHECK_EQ(shut.pin_high, PD_FALSE);
+
+  pd_test_set_drawer_open(printer, 1);
+  open = pd_drawer_read_sensor(driver, printer, 500);
+  CHECK_EQ(open.pin_high, PD_TRUE);
+  CHECK_EQ((int)pd_test_drawer_kicks(printer), 0);
+
+  CHECK_EQ(pd_drawer_calibrate_polarity(driver, printer, open.pin_high), 0 /* in-memory */);
+  CHECK_EQ(pd_drawer_polarity_calibrated(driver, printer), 1);
+  CHECK_EQ(pd_drawer_high_means_open(driver, printer), 1);
+
+  after = pd_drawer_read_sensor(driver, printer, 500);
+  CHECK_EQ(after.needs_calibration, PD_FALSE);
+  CHECK_EQ((int)after.state, (int)PD_DRAWER_OPEN);
+
+  pd_destroy(driver);
+}
+
 int main(void) {
   test_submit_reaches_terminal_done();
   test_verification_identifier_round_trip();
@@ -771,6 +944,9 @@ int main(void) {
   test_grade_hierarchy_gained_a_plus();
   test_provenance_is_readable_per_printer();
   test_profile_ids_expose_the_whole_catalogue();
+  test_drawer_sequence_over_the_abi();
+  test_drawer_refusals_write_no_bytes();
+  test_drawer_polarity_calibration_over_the_abi();
 
   if (g_failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", g_failures);

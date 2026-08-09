@@ -1,3 +1,4 @@
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -29,6 +30,9 @@ struct Fixture {
       std::make_shared<pdfake::MockTransport::Stats>();
   std::unique_ptr<Agent> agent;
   std::string error;
+  // M14. Applied to the scripted profile before the printer is attached, so a drawer
+  // test can pick a port classification without a second fixture.
+  std::function<void(pd::CapabilityProfile*)> adjust_profile;
 
   bool start(pd::CompletionMechanism mechanism = pd::CompletionMechanism::GsParenH,
              const std::string& store = {}) {
@@ -48,12 +52,16 @@ struct Fixture {
     agent = std::make_unique<Agent>(std::move(config));
     auto device_copy = device;
     auto stats_copy = stats;
+    auto adjust = adjust_profile;
     agent->setPrinterConfigHook(
-        [device_copy, stats_copy, mechanism](const PrinterSpec&,
-                                             pd::PrinterConfig* printer) {
+        [device_copy, stats_copy, mechanism, adjust](const PrinterSpec&,
+                                                     pd::PrinterConfig* printer) {
           // The database profiles carry production timeouts; the scripted device
           // answers from inside write(), so the suite uses budgets it can wait out.
           printer->profile = pdfake::fastProfile(mechanism);
+          if (adjust) {
+            adjust(&printer->profile);
+          }
           printer->transport = [device_copy, stats_copy]() {
             return std::unique_ptr<pd::Transport>(new pdfake::MockTransport(
                 device_copy, pdfake::MockBehaviour{}, stats_copy));
@@ -328,6 +336,10 @@ PD_TEST(unknown_routes_and_methods_are_declared_not_guessed) {
   CHECK_EQ(fixture.get("/jobs").status, 405);
   CHECK_EQ(fixture.post("/healthz", "{}").status, 405);
   CHECK_EQ(fixture.post("/jobs/abc", "{}").status, 405);
+  // M14. The drawer route exists on POST and on nothing else.
+  CHECK_EQ(fixture.get("/printers/kitchen/drawer").status, 405);
+  CHECK_EQ(fixture.post("/printers/kitchen/nonsense", "{}").status, 404);
+  CHECK_EQ(fixture.post("/printers/nosuch/drawer", "{}").status, 404);
 }
 
 PD_TEST(printers_are_listed_and_added_at_runtime_under_one_owner) {
@@ -561,4 +573,121 @@ PD_TEST(percent_decoding_and_query_parsing_do_what_the_routes_assume) {
   CHECK(found);
   request.queryValue("absent", &found);
   CHECK(!found);
+}
+
+// --- M14: the cash drawer (docs/cash-drawer.md) ---------------------------------------
+
+PD_TEST(the_drawer_endpoint_reports_a_state_and_never_a_boolean) {
+  Fixture fixture;
+  fixture.adjust_profile = [](pd::CapabilityProfile* profile) {
+    *profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+    profile->drawer.status.polarity.calibrated = true;
+    profile->drawer.status.polarity.high_means_open = true;
+  };
+  CHECK(fixture.start());
+
+  const HttpClientResult response = fixture.post("/printers/kitchen/drawer", "{}");
+  CHECK(response.ok);
+  CHECK_EQ(response.status, 200);
+
+  const Json body = parse(response.body);
+  // The document's own spelling of the states, not a success flag.
+  CHECK_EQ(field(body, "state"), std::string("OPEN_VERIFIED"));
+  CHECK_EQ(field(body, "previousState"), std::string("CLOSED"));
+  CHECK_EQ(field(body, "printerId"), std::string("kitchen"));
+  CHECK(flag(body, "verified"));
+  CHECK(!flag(body, "needsCalibration"));
+  CHECK_EQ(body.find("channel")->asInt(), 1LL);
+  CHECK_EQ(body.find("pulseMs")->asInt(), 200LL);
+  CHECK(body.find("elapsedMs") != nullptr);
+  CHECK_EQ(fixture.device->drawerKicks(), size_t{1});
+  CHECK(fixture.device->drawerOpen());
+
+  // The port and the commands are reported as two separate evidence columns.
+  const Json* drawer = body.find("drawer");
+  CHECK(drawer != nullptr && drawer->isObject());
+  if (drawer != nullptr) {
+    CHECK(flag(*drawer, "kickable"));
+    const Json* electrical = drawer->find("electrical");
+    CHECK(electrical != nullptr);
+    if (electrical != nullptr) {
+      CHECK_EQ(field(*electrical, "standard"), std::string("Epson24V6P6C"));
+      CHECK_EQ(electrical->find("voltage")->asInt(), 24LL);
+      CHECK_EQ(electrical->find("sensorPin")->asInt(), 3LL);
+    }
+    const Json* evidence = drawer->find("evidence");
+    CHECK(evidence != nullptr);
+    if (evidence != nullptr) {
+      CHECK_EQ(field(*evidence, "electrical"), std::string("Documented"));
+      CHECK_EQ(field(*evidence, "commands"), std::string("Documented"));
+    }
+  }
+
+  // A body of its own: an explicit channel and pulse are honoured, and a drawer that
+  // is already open is not pulsed a second time.
+  const HttpClientResult again =
+      fixture.post("/printers/kitchen/drawer", R"({"channel":1,"pulseMs":120})");
+  CHECK_EQ(again.status, 200);
+  const Json second = parse(again.body);
+  CHECK_EQ(field(second, "state"), std::string("OPEN"));
+  CHECK_EQ(second.find("pulseMs")->asInt(), 0LL);
+  CHECK_EQ(fixture.device->drawerKicks(), size_t{1});
+}
+
+PD_TEST(the_drawer_endpoint_refuses_an_unclassified_port_without_writing_a_byte) {
+  Fixture fixture;
+  fixture.adjust_profile = [](pd::CapabilityProfile* profile) {
+    *profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+    // Everything else is healthy; nobody has classified the socket.
+    profile->drawer.electrical.standard = pd::DrawerPortStandard::Unknown;
+  };
+  CHECK(fixture.start());
+
+  const HttpClientResult response = fixture.post("/printers/kitchen/drawer", "{}");
+  // Nothing is wrong with the request: the hardware, or what is known about it, is
+  // what forbids this.
+  CHECK_EQ(response.status, 409);
+  const Json body = parse(response.body);
+  CHECK(field(body, "error").find("electrical standard is unknown") != std::string::npos);
+  CHECK_EQ(fixture.device->drawerKicks(), size_t{0});
+  const Json* drawer = body.find("drawer");
+  CHECK(drawer != nullptr);
+  if (drawer != nullptr) {
+    CHECK(!flag(*drawer, "kickable"));
+  }
+}
+
+PD_TEST(the_drawer_endpoint_says_unverified_rather_than_claiming_an_open) {
+  Fixture fixture;
+  fixture.adjust_profile = [](pd::CapabilityProfile* profile) {
+    *profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+    // A port with no switch input: the pulse is real and the confirmation does not
+    // exist. 202, because nothing here settled.
+    profile->drawer.status.available = false;
+    profile->drawer.status.method = pd::DrawerStatusMethod::None;
+  };
+  CHECK(fixture.start());
+
+  const HttpClientResult response = fixture.post("/printers/kitchen/drawer", "{}");
+  CHECK_EQ(response.status, 202);
+  const Json body = parse(response.body);
+  CHECK_EQ(field(body, "state"), std::string("KICK_SENT_UNVERIFIED"));
+  CHECK_EQ(field(body, "previousState"), std::string("NO_SENSOR"));
+  CHECK(!flag(body, "verified"));
+  CHECK(flag(body, "needsCalibration"));
+  CHECK_EQ(fixture.device->drawerKicks(), size_t{1});
+}
+
+PD_TEST(the_drawer_endpoint_refuses_a_malformed_channel_or_pulse) {
+  Fixture fixture;
+  fixture.adjust_profile = [](pd::CapabilityProfile* profile) {
+    *profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+  };
+  CHECK(fixture.start());
+  CHECK_EQ(fixture.post("/printers/kitchen/drawer", "{").status, 400);
+  CHECK_EQ(fixture.post("/printers/kitchen/drawer", "[]").status, 400);
+  CHECK_EQ(fixture.post("/printers/kitchen/drawer", R"({"channel":0})").status, 400);
+  CHECK_EQ(fixture.post("/printers/kitchen/drawer", R"({"pulseMs":0})").status, 400);
+  CHECK_EQ(fixture.post("/printers/kitchen/drawer", R"({"pulseMs":90000})").status, 400);
+  CHECK_EQ(fixture.device->drawerKicks(), size_t{0});
 }

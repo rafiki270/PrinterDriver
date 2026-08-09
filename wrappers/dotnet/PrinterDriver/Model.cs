@@ -149,3 +149,145 @@ public sealed class PrinterDriverException : Exception
     /// <param name="inner">The underlying failure.</param>
     public PrinterDriverException(string message, Exception inner) : base(message, inner) { }
 }
+
+// --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------------
+
+/// <summary>
+/// What a printer's drawer port is, and what is known about it.
+/// </summary>
+/// <remarks>
+/// A separate peripheral facet, not part of the printer's own capabilities: the connector
+/// pinout, the drive voltage and the command the firmware implements are three independent
+/// facts, and none of them follows from anything the printer does with paper.
+/// </remarks>
+/// <param name="Present">This model has a drawer port at all.</param>
+/// <param name="PortStandard">
+/// The electrical classification. Nothing is ever fired on
+/// <see cref="DrawerPortStandard.Unknown"/>.
+/// </param>
+/// <param name="Voltage">Volts, or 0 where the manufacturer does not document it — which is not "low".</param>
+/// <param name="MaxCurrentMa">Milliamps, or 0 where undocumented.</param>
+/// <param name="ChannelCount">Drive outputs, typically 2.</param>
+/// <param name="SensorPin">3 on the Epson arrangement, 6 on Star's; 0 when unestablished.</param>
+/// <param name="KickMethod">Which software path fires it.</param>
+/// <param name="DefaultPulseMs">The profile's own pulse, 200 ms on the documented 24 V families.</param>
+/// <param name="MaxPulseMs">The ceiling a request is clamped to.</param>
+/// <param name="CooldownMs">Held between two pulses so a retry loop cannot keep a solenoid energised.</param>
+/// <param name="CanKickDuringPrint">
+/// False on models whose drawer output cannot fire while the mechanism prints; the pulse is
+/// then ordered strictly behind everything already queued.
+/// </param>
+/// <param name="StatusAvailable">There is a readable switch.</param>
+/// <param name="StatusMethod">How it is read.</param>
+/// <param name="SharedBetweenDrawers">
+/// Two drive outputs and one switch input: both channels kick independently while the only
+/// readable fact is that some attached drawer is open.
+/// </param>
+/// <param name="SharedWithBuzzer">
+/// Epson documents that with the optional external buzzer enabled the pulse sounds the
+/// buzzer instead of firing the drawer. Never assume both coexist.
+/// </param>
+/// <param name="ElectricalProvenance">
+/// Deliberately separate from <paramref name="CommandsProvenance"/>: the XP-S260M's
+/// DC 24 V / 1 A output is in Xprinter's own specification while nothing they publish
+/// proves the pulse command.
+/// </param>
+/// <param name="CommandsProvenance">Where the claim about the command set comes from.</param>
+/// <param name="Kickable">
+/// Whether this SDK may put a pulse on the wire: a method it can drive and an established
+/// electrical standard. A caller that reads nothing else should read this.
+/// </param>
+public sealed record DrawerCapabilities(
+    bool Present,
+    DrawerPortStandard PortStandard,
+    ushort Voltage,
+    ushort MaxCurrentMa,
+    byte ChannelCount,
+    byte SensorPin,
+    DrawerKickMethod KickMethod,
+    ushort DefaultPulseMs,
+    ushort MaxPulseMs,
+    ushort CooldownMs,
+    bool CanKickDuringPrint,
+    bool StatusAvailable,
+    DrawerStatusMethod StatusMethod,
+    bool SharedBetweenDrawers,
+    bool SharedWithBuzzer,
+    Provenance ElectricalProvenance,
+    Provenance CommandsProvenance,
+    bool Kickable)
+{
+    internal static DrawerCapabilities FromNative(in PdDrawerCapabilities native) =>
+        new(
+            native.Present == 1,
+            (DrawerPortStandard)native.Standard,
+            native.Voltage,
+            native.MaxCurrentMa,
+            native.ChannelCount,
+            native.SensorPin,
+            (DrawerKickMethod)native.Method,
+            native.DefaultPulseMs,
+            native.MaxPulseMs,
+            native.CooldownMs,
+            native.CanKickDuringPrint == 1,
+            native.StatusAvailable == 1,
+            (DrawerStatusMethod)native.StatusMethod,
+            native.SharedBetweenDrawers == 1,
+            native.SharedWithBuzzer == 1,
+            (Provenance)native.ElectricalProvenance,
+            (Provenance)native.CommandsProvenance,
+            native.Kickable == 1);
+}
+
+/// <summary>The outcome of one opening sequence — a state, never a boolean.</summary>
+/// <param name="State">What was established.</param>
+/// <param name="PreviousState">What the switch said before the pulse.</param>
+/// <param name="Channel">The output that was energised.</param>
+/// <param name="PulseMs">
+/// 0 when no pulse was emitted at all, which happens both when the drawer was already open
+/// and when the call was refused.
+/// </param>
+/// <param name="ElapsedMs">
+/// The interval between the pulse leaving for the link and the verdict — the "sensor
+/// changed 143 ms after kick" number. 0 when there was nothing to wait for.
+/// </param>
+public sealed record DrawerResult(
+    DrawerState State,
+    DrawerState PreviousState,
+    byte Channel,
+    ushort PulseMs,
+    uint ElapsedMs)
+{
+    /// <summary>The one thing worth branching on: the switch was seen changing.</summary>
+    public bool Verified => State == DrawerState.OpenVerified;
+
+    internal static DrawerResult FromNative(in PdDrawerResult native) =>
+        new((DrawerState)native.State, (DrawerState)native.PreviousState, native.Channel,
+            native.PulseMs, native.ElapsedMs);
+}
+
+/// <summary>One non-destructive read of the drawer switch.</summary>
+/// <param name="Available">The profile documents a readable switch on this port.</param>
+/// <param name="Answered">The device actually replied within the timeout.</param>
+/// <param name="PinHigh">The raw sense level, or null when nothing answered.</param>
+/// <param name="NeedsCalibration">
+/// True until this printer's polarity has been measured. While it is true
+/// <paramref name="State"/> stays <see cref="DrawerState.Unknown"/> however clear the
+/// level is: whether the line reads high or low when the drawer is open depends on the
+/// drawer that is plugged in, so this SDK measures it once instead of assuming.
+/// </param>
+/// <param name="State">The interpretation, where there is one.</param>
+public sealed record DrawerReading(
+    bool Available,
+    bool Answered,
+    bool? PinHigh,
+    bool NeedsCalibration,
+    DrawerState State)
+{
+    internal static DrawerReading FromNative(in PdDrawerReading native) =>
+        new(native.Available == 1,
+            native.Answered == 1,
+            native.PinHigh switch { 1 => true, 0 => false, _ => null },
+            native.NeedsCalibration == 1,
+            (DrawerState)native.State);
+}

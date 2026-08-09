@@ -158,6 +158,32 @@ CapabilityProfile xp_s260m() {
   profile.preflight_timeout_ms = 2000;
   profile.final_feed_lines = 3;
   profile.code_page = escpos::CodePage::PC852;
+  // --- M14: cash drawer (docs/cash-drawer.md §6) ---------------------------------
+  // The XP-S260M's own specification gives the drawer output as DC 24 V / 1 A, which
+  // classifies the port: electrically this is an ordinary Epson-compatible socket and
+  // a standard 24 V drawer cable is the correct one. The commands are a different
+  // question and Xprinter does not answer it — no manufacturer-hosted programmer
+  // reference proves `ESC p`, the drawer status read, or channel 2 — so the command
+  // half is Unverified even on this probed unit: the GS ( H finding that made this
+  // profile Probed was about the completion fence, and evidence does not generalise
+  // from one command family to another.
+  profile.drawer.present = true;
+  profile.drawer.electrical.standard = DrawerPortStandard::Epson24V6P6C;
+  profile.drawer.electrical.voltage = 24;
+  profile.drawer.electrical.max_current_ma = 1000;
+  profile.drawer.electrical.channel_count = 2;
+  profile.drawer.electrical.sensor_pin = 3;
+  profile.drawer.kick.method = DrawerKickMethod::EpsonEscP;
+  profile.drawer.kick.default_pulse_ms = 200;
+  profile.drawer.kick.max_pulse_ms = 500;
+  profile.drawer.kick.cooldown_ms = 500;
+  profile.drawer.evidence.electrical = Provenance::Documented;
+  profile.drawer.evidence.commands = Provenance::Unverified;
+  profile.drawer.note =
+      "Drawer output documented as DC 24 V / 1 A. ESC p, the drawer status read and "
+      "channel 2 are unproven on this brand: a pulse here honestly ends at "
+      "KickSentUnverified until `pdctl drawer test` establishes otherwise.";
+  // --- end M14 ---------------------------------------------------------------------
   return profile;
 }
 
@@ -184,6 +210,11 @@ CapabilityProfile generic_escpos() {
   // default pays for the paper (docs/sdk-spec.md §9).
   profile.final_feed_lines = 6;
   profile.code_page = escpos::CodePage::PC437;
+  // M14. The drawer facet is left default-constructed on purpose: present = false,
+  // method = Unsupported, standard = Unknown. "Generic" means UNKNOWN DEVICE, and the
+  // one thing docs/cash-drawer.md prints in giant letters is that an unknown drawer
+  // port never gets a pulse. A caller who knows the installation supplies a profile
+  // that says so, which is a deliberate act with a name attached to it.
   return profile;
 }
 

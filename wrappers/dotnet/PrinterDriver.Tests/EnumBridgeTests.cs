@@ -52,6 +52,12 @@ public sealed class EnumBridgeTests
         new(BridgedEnum.Binarization, 2, typeof(Binarization), false),
         new(BridgedEnum.ConfidenceGrade, 6, typeof(ConfidenceGrade), false),
         new(BridgedEnum.CompletionAuthority, 5, typeof(CompletionAuthority), true),
+        // M14 -- docs/cash-drawer.md. All four have a to_string in the core, so all four
+        // are name-comparable rather than value-only.
+        new(BridgedEnum.DrawerState, 8, typeof(DrawerState), true),
+        new(BridgedEnum.DrawerPortStandard, 4, typeof(DrawerPortStandard), true),
+        new(BridgedEnum.DrawerKickMethod, 8, typeof(DrawerKickMethod), true),
+        new(BridgedEnum.DrawerStatusMethod, 5, typeof(DrawerStatusMethod), true),
     ];
 
     public EnumBridgeTests() => NativeFixture.Bind();
@@ -59,9 +65,9 @@ public sealed class EnumBridgeTests
     [Fact]
     public void EveryBridgedEnumIsMirrored()
     {
-        // PD_TEST_ENUM_TOTAL is 15: if the bridge grows an entry and this table does not,
+        // PD_TEST_ENUM_TOTAL is 19: if the bridge grows an entry and this table does not,
         // the new enum would simply never be checked.
-        Assert.Equal(15, Mirrors.Length);
+        Assert.Equal(19, Mirrors.Length);
         Assert.Equal(Mirrors.Length, Mirrors.Select(m => m.Bridge).Distinct().Count());
     }
 
@@ -142,6 +148,12 @@ public sealed class EnumBridgeTests
         // application takes when it puts a grade or a language in front of a person.
         AssertNames<Provenance>(NativeMethods.pd_provenance_name);
         AssertNames<CommandLanguage>(NativeMethods.pd_command_language_name);
+
+        // M14 -- docs/cash-drawer.md.
+        AssertNames<DrawerState>(NativeMethods.pd_drawer_state_name);
+        AssertNames<DrawerPortStandard>(NativeMethods.pd_drawer_port_standard_name);
+        AssertNames<DrawerKickMethod>(NativeMethods.pd_drawer_kick_method_name);
+        AssertNames<DrawerStatusMethod>(NativeMethods.pd_drawer_status_method_name);
     }
 
     [Fact]
@@ -229,6 +241,12 @@ public sealed class AbiLayoutTests
         Assert.Equal(24, Marshal.SizeOf<PdDocument>());        // ptr, size_t, int+pad
         Assert.Equal(16, Marshal.SizeOf<PdRaw>());             // ptr, size_t
         Assert.Equal(40, Marshal.SizeOf<PdPayload>());         // int+pad, then the union
+        // M14 -- docs/cash-drawer.md. The drawer facet is flat by design: no strings, so
+        // no pointer alignment to get wrong on one platform and not another.
+        Assert.Equal(60, Marshal.SizeOf<PdDrawerCapabilities>()); // 2 int, 2 u16, 2 u8, int, 3 u16, 8 int
+        Assert.Equal(4, Marshal.SizeOf<PdDrawerRequest>());       // u8+pad, u16
+        Assert.Equal(16, Marshal.SizeOf<PdDrawerResult>());       // 2 int, u8+pad, u16, u32
+        Assert.Equal(20, Marshal.SizeOf<PdDrawerReading>());      // 5 x int
     }
 
     [Fact]

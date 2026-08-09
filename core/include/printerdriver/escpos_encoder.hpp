@@ -114,6 +114,24 @@ Bytes asbDisable();
 Bytes gsIdentity(PrinterInfoKind kind);
 Bytes gsIdentity(uint8_t n);
 
+// --- M14: cash drawer (docs/cash-drawer.md §1) ------------------------------------
+// Free functions rather than Encoder members for the same reason the fence primitives
+// above are: the drawer sequence in the engine drives them one at a time and waits
+// between them, so they are never part of a document being built.
+
+// GS r 2 — 1D 72 02. Queued drawer-kick-out connector status: the answer arrives after
+// preceding print data has been processed, so it cannot overtake a receipt in the
+// buffer. Bit 0 of the single answer byte is the sense pin (pd::drawerPinHigh).
+Bytes gsDrawerStatus();
+
+// ESC p m t1 t2 — 1B 70 m t1 t2, with the pulse given in milliseconds instead of
+// Epson's 2 ms programming units. `channel` is 1 for drive 1 (m = 0, Epson pin 2) and 2
+// for drive 2 (m = 1, pin 5). The OFF time is emitted as twice the ON time, which is
+// the shape of Epson's own worked example (1B 70 00 64 C8 = 200 ms on, 400 ms off);
+// both operands saturate at 255 units rather than wrapping.
+Bytes drawerKick(uint8_t channel, uint16_t pulse_ms);
+// --- end M14 -----------------------------------------------------------------------
+
 // --- Deliberate operator commands -------------------------------------------------
 // None of these are ever emitted by the engine or by the automatic capability probe.
 // DLE ENQ resumes or discards a partly printed ticket and DLE DC4 can power the device

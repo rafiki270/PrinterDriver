@@ -394,6 +394,21 @@ typedef _PdSubscribeJobNative = Void Function(Pointer<PdDriver>, Pointer<PdJob>,
 typedef _PdJobAwaitNative = Int32 Function(
     Pointer<PdDriver>, Pointer<PdJob>, Uint32, Pointer<PdJobResult>);
 
+// M14 — cash drawer (docs/cash-drawer.md).
+typedef _PdPrinterDrawerCapabilitiesNative = PdDrawerCapabilities Function(
+    Pointer<PdPrinter>);
+typedef _PdDrawerOpenNative = PdDrawerResult Function(
+    Pointer<PdDriver>, Pointer<PdPrinter>, Pointer<PdDrawerRequest>);
+typedef _PdDrawerReadSensorNative = PdDrawerReading Function(
+    Pointer<PdDriver>, Pointer<PdPrinter>, Uint32);
+typedef _PdDrawerCalibrateNative = Int32 Function(
+    Pointer<PdDriver>, Pointer<PdPrinter>, Int32);
+typedef _PdDrawerFlagNative = Int32 Function(
+    Pointer<PdDriver>, Pointer<PdPrinter>);
+typedef _PdTestDrawerCountNative = Size Function(Pointer<PdPrinter>);
+typedef _PdTestDrawerFlagNative = Int Function(Pointer<PdPrinter>);
+typedef _PdTestSetDrawerOpenNative = Void Function(Pointer<PdPrinter>, Int);
+
 typedef _PdEnumNameNative = Pointer<Char> Function(Int32);
 typedef _PdCodePageAtNative = Int32 Function(Int32);
 
@@ -418,6 +433,126 @@ typedef _PdTestCppEnumNameNative = Pointer<Char> Function(Int32, Int);
 typedef _PdTestCppEnumValueNative = Int Function(Int32, Int);
 typedef _PdTestEnumLabelNative = Pointer<Char> Function(Int32);
 
+// --- M14: cash drawer (docs/cash-drawer.md) ---------------------------------------
+//
+// Flat by design: no strings anywhere in these, so there is no pointer alignment to get
+// wrong on one platform and right on another. Sizes are pinned in
+// test/abi_layout_test.dart.
+
+/// `pd_drawer_capabilities` — the drawer facet of a printer's capability profile.
+final class PdDrawerCapabilities extends Struct {
+  @Int32()
+  external int present;
+
+  /// `pd_drawer_port_standard`. Nothing is ever fired on the unknown member.
+  @Int32()
+  external int standard;
+
+  /// Volts, or 0 where the manufacturer does not document it — not the same as "low".
+  @Uint16()
+  external int voltage;
+
+  @Uint16()
+  external int maxCurrentMa;
+
+  @Uint8()
+  external int channelCount;
+
+  /// 3 on the Epson arrangement, 6 on Star's; 0 when unestablished.
+  @Uint8()
+  external int sensorPin;
+
+  /// `pd_drawer_kick_method`.
+  @Int32()
+  external int method;
+
+  @Uint16()
+  external int defaultPulseMs;
+
+  @Uint16()
+  external int maxPulseMs;
+
+  @Uint16()
+  external int cooldownMs;
+
+  @Int32()
+  external int canKickDuringPrint;
+
+  @Int32()
+  external int statusAvailable;
+
+  /// `pd_drawer_status_method`.
+  @Int32()
+  external int statusMethod;
+
+  /// Two drive outputs, one switch input.
+  @Int32()
+  external int sharedBetweenDrawers;
+
+  @Int32()
+  external int sharedWithBuzzer;
+
+  /// Two columns, never one flag: a documented 24 V port can sit beside an unproven
+  /// pulse command, and the XP-S260M is exactly that case.
+  @Int32()
+  external int electricalProvenance;
+
+  @Int32()
+  external int commandsProvenance;
+
+  /// Whether this engine may put a pulse on the wire at all.
+  @Int32()
+  external int kickable;
+}
+
+/// `pd_drawer_request` — 0 in either field asks for the profile's own default.
+final class PdDrawerRequest extends Struct {
+  @Uint8()
+  external int channel;
+
+  @Uint16()
+  external int pulseMs;
+}
+
+/// `pd_drawer_result` — a state and never a boolean.
+final class PdDrawerResult extends Struct {
+  @Int32()
+  external int state;
+
+  @Int32()
+  external int previousState;
+
+  @Uint8()
+  external int channel;
+
+  /// 0 when no pulse was emitted: already open, or refused.
+  @Uint16()
+  external int pulseMs;
+
+  /// Pulse to verdict — the "sensor changed 143 ms after kick" number.
+  @Uint32()
+  external int elapsedMs;
+}
+
+/// `pd_drawer_reading` — one non-destructive read of the drawer switch.
+final class PdDrawerReading extends Struct {
+  @Int32()
+  external int available;
+
+  @Int32()
+  external int answered;
+
+  /// Tri-state: `PD_UNKNOWN`, `PD_FALSE` or `PD_TRUE`.
+  @Int32()
+  external int pinHigh;
+
+  @Int32()
+  external int needsCalibration;
+
+  @Int32()
+  external int state;
+}
+
 /// `pd_test_enum` — the enum-bridge ids of `pd_test_support.h`.
 enum PdTestEnum {
   jobState(0),
@@ -434,14 +569,19 @@ enum PdTestEnum {
   codePage(11),
   binarization(12),
   confidenceGrade(13),
-  completionAuthority(14);
+  completionAuthority(14),
+  // M14 — docs/cash-drawer.md.
+  drawerState(15),
+  drawerPortStandard(16),
+  drawerKickMethod(17),
+  drawerStatusMethod(18);
 
   const PdTestEnum(this.nativeValue);
 
   final int nativeValue;
 
   /// `PD_TEST_ENUM_TOTAL`: the sentinel, not a member.
-  static const int total = 15;
+  static const int total = 19;
 }
 
 /// Every `pd_*` entry point of pd.h, resolved from one [DynamicLibrary].
@@ -669,6 +809,95 @@ final class PrinterDriverBindings {
   final Pointer<Char> Function(int) completionMechanismName;
   final Pointer<Char> Function(int) cutVariantName;
   final int Function(int) codePageAt;
+
+  // --- M14: cash drawer (docs/cash-drawer.md) --------------------------------------
+  //
+  // Resolved lazily rather than in the constructor above, so that adding the drawer
+  // surface did not reorder a single existing lookup. They are ordinary shipped
+  // symbols, unlike the test-support block further down.
+
+  /// `pd_printer_drawer_capabilities`
+  late final PdDrawerCapabilities Function(Pointer<PdPrinter>)
+      printerDrawerCapabilities = _library.lookupFunction<
+          _PdPrinterDrawerCapabilitiesNative,
+          PdDrawerCapabilities Function(Pointer<PdPrinter>)>(
+    'pd_printer_drawer_capabilities',
+  );
+
+  /// `pd_drawer_open` — the verified opening sequence.
+  late final PdDrawerResult Function(
+          Pointer<PdDriver>, Pointer<PdPrinter>, Pointer<PdDrawerRequest>)
+      drawerOpen = _library.lookupFunction<
+          _PdDrawerOpenNative,
+          PdDrawerResult Function(Pointer<PdDriver>, Pointer<PdPrinter>,
+              Pointer<PdDrawerRequest>)>('pd_drawer_open');
+
+  /// `pd_drawer_read_sensor` — never pulses.
+  late final PdDrawerReading Function(Pointer<PdDriver>, Pointer<PdPrinter>, int)
+      drawerReadSensor = _library.lookupFunction<
+          _PdDrawerReadSensorNative,
+          PdDrawerReading Function(
+              Pointer<PdDriver>, Pointer<PdPrinter>, int)>('pd_drawer_read_sensor');
+
+  /// `pd_drawer_calibrate_polarity`
+  late final int Function(Pointer<PdDriver>, Pointer<PdPrinter>, int)
+      drawerCalibratePolarity = _library.lookupFunction<
+          _PdDrawerCalibrateNative,
+          int Function(Pointer<PdDriver>, Pointer<PdPrinter>,
+              int)>('pd_drawer_calibrate_polarity');
+
+  /// `pd_drawer_polarity_calibrated`
+  late final int Function(Pointer<PdDriver>, Pointer<PdPrinter>)
+      drawerPolarityCalibrated = _library.lookupFunction<_PdDrawerFlagNative,
+          int Function(Pointer<PdDriver>, Pointer<PdPrinter>)>(
+    'pd_drawer_polarity_calibrated',
+  );
+
+  /// `pd_drawer_high_means_open`
+  late final int Function(Pointer<PdDriver>, Pointer<PdPrinter>)
+      drawerHighMeansOpen = _library.lookupFunction<_PdDrawerFlagNative,
+          int Function(Pointer<PdDriver>, Pointer<PdPrinter>)>(
+    'pd_drawer_high_means_open',
+  );
+
+  /// `pd_drawer_state_name`
+  late final Pointer<Char> Function(int) drawerStateName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_drawer_state_name',
+  );
+
+  /// `pd_drawer_port_standard_name`
+  late final Pointer<Char> Function(int) drawerPortStandardName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_drawer_port_standard_name',
+  );
+
+  /// `pd_drawer_kick_method_name`
+  late final Pointer<Char> Function(int) drawerKickMethodName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_drawer_kick_method_name',
+  );
+
+  /// `pd_drawer_status_method_name`
+  late final Pointer<Char> Function(int) drawerStatusMethodName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_drawer_status_method_name',
+  );
+
+  /// `pd_test_drawer_kicks` — pulses that reached the scripted device. Test-only.
+  late final int Function(Pointer<PdPrinter>) testDrawerKicks =
+      _library.lookupFunction<_PdTestDrawerCountNative,
+          int Function(Pointer<PdPrinter>)>('pd_test_drawer_kicks');
+
+  /// `pd_test_drawer_is_open` — where the scripted microswitch sits. Test-only.
+  late final int Function(Pointer<PdPrinter>) testDrawerIsOpen =
+      _library.lookupFunction<_PdTestDrawerFlagNative,
+          int Function(Pointer<PdPrinter>)>('pd_test_drawer_is_open');
+
+  /// `pd_test_set_drawer_open` — an operator's hand on the drawer. Test-only.
+  late final void Function(Pointer<PdPrinter>, int) testSetDrawerOpen =
+      _library.lookupFunction<_PdTestSetDrawerOpenNative,
+          void Function(Pointer<PdPrinter>, int)>('pd_test_set_drawer_open');
 
   /// Whether this library carries `capi/tests/pd_test_support.h`, i.e. whether it was
   /// built from the `printerdriver_capi_testing` target.

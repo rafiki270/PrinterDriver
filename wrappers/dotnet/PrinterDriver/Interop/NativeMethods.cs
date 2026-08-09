@@ -124,6 +124,41 @@ internal static class NativeMethods
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void pd_printer_drain(nint driver, nint printer);
 
+    // --- M14: cash drawer (docs/cash-drawer.md) --------------------------------------
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern PdDrawerCapabilities pd_printer_drawer_capabilities(nint printer);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern PdDrawerResult pd_drawer_open(nint driver, nint printer,
+                                                          in PdDrawerRequest request);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern PdDrawerReading pd_drawer_read_sensor(nint driver, nint printer,
+                                                                 uint timeoutMs);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_drawer_calibrate_polarity(nint driver, nint printer,
+                                                             int highMeansOpen);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_drawer_polarity_calibrated(nint driver, nint printer);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_drawer_high_means_open(nint driver, nint printer);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_drawer_state_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_drawer_port_standard_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_drawer_kick_method_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_drawer_status_method_name(int value);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void pd_subscribe_device(nint driver, nint printer,
                                                     DeviceEventCallback callback, nint context);
@@ -278,6 +313,58 @@ internal struct PdJobOptions
     public uint TopFeedDots;
     public uint BottomFeedDots;
     public int SuppressVerificationId;
+}
+
+// --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------------
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDrawerCapabilities
+{
+    public int Present;
+    public int Standard;
+    public ushort Voltage;
+    public ushort MaxCurrentMa;
+    public byte ChannelCount;
+    public byte SensorPin;
+    public int Method;
+    public ushort DefaultPulseMs;
+    public ushort MaxPulseMs;
+    public ushort CooldownMs;
+    public int CanKickDuringPrint;
+    public int StatusAvailable;
+    public int StatusMethod;
+    public int SharedBetweenDrawers;
+    public int SharedWithBuzzer;
+    public int ElectricalProvenance;
+    public int CommandsProvenance;
+    public int Kickable;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDrawerRequest
+{
+    public byte Channel;
+    public ushort PulseMs;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDrawerResult
+{
+    public int State;
+    public int PreviousState;
+    public byte Channel;
+    public ushort PulseMs;
+    public uint ElapsedMs;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDrawerReading
+{
+    public int Available;
+    public int Answered;
+    public int PinHigh;
+    public int NeedsCalibration;
+    public int State;
 }
 
 [StructLayout(LayoutKind.Sequential)]

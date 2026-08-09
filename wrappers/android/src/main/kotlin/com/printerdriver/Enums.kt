@@ -400,3 +400,129 @@ enum class CommandLanguage(internal val raw: Int) {
         }
     }
 }
+
+// --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------------
+//
+// The drawer is a separate printer peripheral: its own electrical profile, its own
+// command method, its own feedback method, none of them derivable from the others.
+
+/**
+ * What is known about a cash drawer -- pd_drawer_state.
+ *
+ * Deliberately not a boolean. Sending `ESC p` and watching the microswitch change are
+ * different claims, and an operator at a till needs them apart: [KICK_SENT_UNVERIFIED]
+ * is a real answer rather than a softer success, because through a cheap print server
+ * the pulse travels forward while the sensor response never comes back.
+ */
+enum class DrawerState(internal val raw: Int) {
+    /** The switch answered and, with a calibrated polarity, says the drawer is shut. */
+    CLOSED(0),
+
+    /** Already open. Reading this before a pulse is what stops a redundant kick. */
+    OPEN(1),
+
+    /** A pulse is on the wire and the verification window has not closed. */
+    OPENING(2),
+
+    /** Accepted by the link, and nothing can confirm what happened next. */
+    KICK_SENT_UNVERIFIED(3),
+
+    /** The switch was seen changing. The only member that claims physical movement. */
+    OPEN_VERIFIED(4),
+
+    /** The pulse went out and the switch never moved: locked, jammed, wrong channel,
+     *  wrong cable -- one observation from this side of the connector. */
+    FAILED_TO_OPEN(5),
+
+    /** No switch input wired or documented on this port. Not an error. */
+    NO_SENSOR(6),
+
+    UNKNOWN(7),
+    UNRECOGNIZED(-1);
+
+    companion object {
+        internal fun fromRaw(raw: Int): DrawerState = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_drawer_state raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}
+
+/**
+ * The electrical classification of a drawer port -- pd_drawer_port_standard.
+ *
+ * RJ11/RJ12-looking drawer connectors are not a universal electrical standard: Star's
+ * identical-looking 6P6C socket carries +24 V on pin 3 and the sense line on pin 6,
+ * precisely where Epson puts sense and signal ground.
+ */
+enum class DrawerPortStandard(internal val raw: Int) {
+    /** 1 FG, 2 kick 1, 3 sensor, 4 +24 V, 5 kick 2, 6 signal ground. */
+    EPSON_24V_6P6C(0),
+
+    /** The same plug with +24 V on pin 3 and the sense line on pin 6. */
+    STAR_24V_6P6C(1),
+
+    /** The 12 V exceptions, common on 58 mm hardware. */
+    GENERIC_12V_6P6C(2),
+
+    /** Unclassified. Nothing is ever energised on one of these. */
+    UNKNOWN(3),
+    UNRECOGNIZED(-1);
+
+    companion object {
+        internal fun fromRaw(raw: Int): DrawerPortStandard = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_drawer_port_standard raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}
+
+/**
+ * Which software path fires the drawer -- pd_drawer_kick_method. Independent of
+ * [DrawerPortStandard]: two printers accepting the same "kick drawer 1" command may still
+ * wire the modular socket differently.
+ */
+enum class DrawerKickMethod(internal val raw: Int) {
+    EPSON_ESC_P(0),
+    EPSON_EPOS(1),
+    STAR_PRNT(2),
+    BIXOLON_SDK(3),
+    CITIZEN_ESC_P(4),
+    SNBC_ESC_P(5),
+    VENDOR(6),
+    UNSUPPORTED(7),
+    UNRECOGNIZED(-1);
+
+    companion object {
+        internal fun fromRaw(raw: Int): DrawerKickMethod = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_drawer_kick_method raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}
+
+/** How the drawer switch is read back -- pd_drawer_status_method. */
+enum class DrawerStatusMethod(internal val raw: Int) {
+    /** `GS r 2` / `GS r 50` -- queued drawer-kick-out connector status. */
+    GS_R2(0),
+
+    /** The drawer bit inside an automatic status back frame. */
+    ASB(1),
+
+    /** Star's drawerOpenCloseSignal. */
+    STAR_SIGNAL(2),
+
+    /** The vendor SDK's own drawer status call. */
+    VENDOR_SDK(3),
+
+    /** No readable switch. */
+    NONE(4),
+    UNRECOGNIZED(-1);
+
+    companion object {
+        internal fun fromRaw(raw: Int): DrawerStatusMethod = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_drawer_status_method raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}

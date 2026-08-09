@@ -156,7 +156,7 @@ JVM host must still confirm.
 ## .NET package
 
 [wrappers/dotnet/](wrappers/dotnet/) is a NuGet-ready C# wrapper (`PrinterDriver`,
-net8.0, MIT) over the same C ABI: P/Invoke, the thirteen enums mirrored and asserted
+net8.0, MIT) over the same C ABI: P/Invoke, the twenty-one enums mirrored and asserted
 against the core's own member counts, a closed `Done`/`Failed`/`Unknown` record with no
 boolean anywhere in it, `IAsyncEnumerable` event streams and `GCHandle`-rooted native
 callbacks.
@@ -235,7 +235,27 @@ build/pdctl recover    <host> --resume|--clear   # DLE ENQ 1 / DLE ENQ 2
 build/pdctl counters   <host>                    # GS g 2 maintenance counters
 build/pdctl test-print <host>                    # GS ( A, consumes paper
 build/pdctl settings   <host>                    # GS ( E fn 4 / fn 6 readback
+build/pdctl drawer test <host> [--channel 1|2] [--pulse 200]  # opens the cash drawer
 ```
+
+The cash drawer splits the same way, for a reason
+[docs/cash-drawer.md](docs/cash-drawer.md) prints in giant letters: **RJ11/RJ12-looking
+drawer connectors are not a universal electrical standard.** Star's identical-looking
+6P6C socket carries +24 V on pin 3 and the sense line on pin 6, exactly where Epson puts
+sense and signal ground, and 12 V outputs exist alongside the common 24 V ones. So
+`drawer-probe` is read-only and safe on hardware nobody has classified, and `drawer test`
+refuses outright on an unclassified port:
+
+```sh
+build/pdctl drawer-probe <host> [--profile <name>]   # never fires an output
+```
+
+It prints the documented port (standard, voltage, current, channels, sense pin) and the
+software provenance as two separate columns, then runs a non-destructive switch test —
+close the drawer, read; open it by hand, read — and persists which level means OPEN,
+because Star documents that the meaning of that signal depends on the drawer that is
+plugged in. Until that calibration exists, a sensor reading reports a level and no
+interpretation.
 
 ## Layout
 
@@ -258,6 +278,9 @@ core/include/printerdriver/   public headers
   transport.hpp               Transport interface, the TCP implementation, and the
                               embedder-owned custom transport Bluetooth arrives through
   transport_bluez.hpp         Linux BlueZ RFCOMM (syntax-checked only)
+  cash_drawer.hpp             the drawer as a separate peripheral: electrical
+                              classification, kick and status methods, the drawer state
+                              machine, and the persisted polarity calibration
   driver.hpp                  PrinterDriver / Printer / PrintJob — the public API
 core/src/                     implementation
 core/tests/                   test harness, scriptable fake printer, test binaries
@@ -329,12 +352,17 @@ MIT — see [LICENSE](LICENSE).
   margins, cut control, declared degradation; `pdctl render` preview
 - ✅ Wrappers: Swift (iOS+macOS), Dart (pub-ready), .NET (NuGet-packed); Kotlin/Android
   scaffold (CI-pending); iOS example app (ReceiptStudio)
+- ✅ Cash drawer as a separate peripheral capability: electrical classification
+  (Epson/Star/12 V/unknown 6P6C), per-family kick method and cooldown, the verified
+  opening sequence (`GS r 2` → `ESC p` → watch the switch) reporting `OPEN_VERIFIED` /
+  `FAILED_TO_OPEN` / `KICK_SENT_UNVERIFIED`, persisted polarity calibration, and a
+  refusal — zero bytes — on any port nobody has classified
 - ✅ pdctl: status · probe · identify · print · verify · render · counters · settings ·
-  test-print · recover
+  test-print · recover · drawer-probe · drawer test
 - 🔄 Provenance-in-code, A+ grade, Bluetooth custom-transport ABI, expanded catalogue
   (M12) · pd-agent daemon, LAN discovery, DSL barcodes (M13a)
 - 📋 ePOS A+ transport, Star raw (ETB / ESC GS ETX / CloudPRNT), serial, probe-path,
-  BLE heuristics (M13b) · cash drawers with OPEN_VERIFIED (M14) · Windows native CI
+  BLE heuristics (M13b) · Windows native CI
 
 ## Supported printers
 

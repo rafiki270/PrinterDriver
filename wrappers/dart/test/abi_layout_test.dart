@@ -20,6 +20,16 @@ void main() {
       // outcome, confidence, reason, grade, authority (5 x int32), then the method
       // pointer on its own 8-byte boundary.
       expect(sizeOf<PdJobResult>(), 32);
+      // M14 — docs/cash-drawer.md. Flat by design: no strings, so no pointer alignment
+      // to get right on one platform and wrong on another.
+      // 2 int32, 2 uint16, 2 uint8 (+2 pad), int32, 3 uint16 (+2 pad), 8 int32.
+      expect(sizeOf<PdDrawerCapabilities>(), 60);
+      // uint8 (+1 pad), uint16.
+      expect(sizeOf<PdDrawerRequest>(), 4);
+      // 2 int32, uint8 (+1 pad), uint16, uint32.
+      expect(sizeOf<PdDrawerResult>(), 16);
+      // 5 x int32.
+      expect(sizeOf<PdDrawerReading>(), 20);
       expect(sizeOf<PdDeviceStatus>(), 36);
       expect(sizeOf<PdRasterRgba8>(), 32);
       expect(sizeOf<PdOp>(), 24);

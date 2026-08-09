@@ -236,4 +236,111 @@ class EnumMappingTest {
         assertEquals(3, Provenance.entries.size - 1)             // PD_PROVENANCE_COUNT
         assertEquals(8, CommandLanguage.entries.size - 1)        // PD_LANGUAGE_COUNT
     }
+
+    // --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------
+
+    @Test
+    fun `DrawerState fromRaw matches every pd_drawer_state value from pd h`() {
+        assertEquals(DrawerState.CLOSED, DrawerState.fromRaw(0))
+        assertEquals(DrawerState.OPEN, DrawerState.fromRaw(1))
+        assertEquals(DrawerState.OPENING, DrawerState.fromRaw(2))
+        assertEquals(DrawerState.KICK_SENT_UNVERIFIED, DrawerState.fromRaw(3))
+        assertEquals(DrawerState.OPEN_VERIFIED, DrawerState.fromRaw(4))
+        assertEquals(DrawerState.FAILED_TO_OPEN, DrawerState.fromRaw(5))
+        assertEquals(DrawerState.NO_SENSOR, DrawerState.fromRaw(6))
+        assertEquals(DrawerState.UNKNOWN, DrawerState.fromRaw(7))
+    }
+
+    @Test
+    fun `DrawerState fromRaw degrades unknown raw ints to UNRECOGNIZED rather than claiming an open`() {
+        // PD_DRAWER_STATE_COUNT is 8. The substitution has to be the one that claims
+        // least: an unrecognized state must never become a verified open.
+        assertEquals(DrawerState.UNRECOGNIZED, DrawerState.fromRaw(8))
+        assertEquals(DrawerState.UNRECOGNIZED, DrawerState.fromRaw(-1))
+        assertEquals(DrawerState.UNRECOGNIZED, DrawerState.fromRaw(9999))
+    }
+
+    @Test
+    fun `DrawerPortStandard fromRaw matches every pd_drawer_port_standard value from pd h`() {
+        assertEquals(DrawerPortStandard.EPSON_24V_6P6C, DrawerPortStandard.fromRaw(0))
+        assertEquals(DrawerPortStandard.STAR_24V_6P6C, DrawerPortStandard.fromRaw(1))
+        assertEquals(DrawerPortStandard.GENERIC_12V_6P6C, DrawerPortStandard.fromRaw(2))
+        assertEquals(DrawerPortStandard.UNKNOWN, DrawerPortStandard.fromRaw(3))
+    }
+
+    @Test
+    fun `DrawerPortStandard fromRaw degrades unknown raw ints to UNRECOGNIZED`() {
+        assertEquals(DrawerPortStandard.UNRECOGNIZED, DrawerPortStandard.fromRaw(4))
+        assertEquals(DrawerPortStandard.UNRECOGNIZED, DrawerPortStandard.fromRaw(-1))
+    }
+
+    @Test
+    fun `DrawerKickMethod fromRaw matches every pd_drawer_kick_method value from pd h`() {
+        assertEquals(DrawerKickMethod.EPSON_ESC_P, DrawerKickMethod.fromRaw(0))
+        assertEquals(DrawerKickMethod.EPSON_EPOS, DrawerKickMethod.fromRaw(1))
+        assertEquals(DrawerKickMethod.STAR_PRNT, DrawerKickMethod.fromRaw(2))
+        assertEquals(DrawerKickMethod.BIXOLON_SDK, DrawerKickMethod.fromRaw(3))
+        assertEquals(DrawerKickMethod.CITIZEN_ESC_P, DrawerKickMethod.fromRaw(4))
+        assertEquals(DrawerKickMethod.SNBC_ESC_P, DrawerKickMethod.fromRaw(5))
+        assertEquals(DrawerKickMethod.VENDOR, DrawerKickMethod.fromRaw(6))
+        assertEquals(DrawerKickMethod.UNSUPPORTED, DrawerKickMethod.fromRaw(7))
+    }
+
+    @Test
+    fun `DrawerKickMethod fromRaw degrades unknown raw ints to UNRECOGNIZED`() {
+        assertEquals(DrawerKickMethod.UNRECOGNIZED, DrawerKickMethod.fromRaw(8))
+        assertEquals(DrawerKickMethod.UNRECOGNIZED, DrawerKickMethod.fromRaw(-1))
+    }
+
+    @Test
+    fun `DrawerStatusMethod fromRaw matches every pd_drawer_status_method value from pd h`() {
+        assertEquals(DrawerStatusMethod.GS_R2, DrawerStatusMethod.fromRaw(0))
+        assertEquals(DrawerStatusMethod.ASB, DrawerStatusMethod.fromRaw(1))
+        assertEquals(DrawerStatusMethod.STAR_SIGNAL, DrawerStatusMethod.fromRaw(2))
+        assertEquals(DrawerStatusMethod.VENDOR_SDK, DrawerStatusMethod.fromRaw(3))
+        assertEquals(DrawerStatusMethod.NONE, DrawerStatusMethod.fromRaw(4))
+    }
+
+    @Test
+    fun `DrawerStatusMethod fromRaw degrades unknown raw ints to UNRECOGNIZED`() {
+        assertEquals(DrawerStatusMethod.UNRECOGNIZED, DrawerStatusMethod.fromRaw(5))
+        assertEquals(DrawerStatusMethod.UNRECOGNIZED, DrawerStatusMethod.fromRaw(-1))
+    }
+
+    @Test
+    fun `drawer models unpack the int arrays the JNI bridge packs`() {
+        // The field order is pd_drawer_capabilities', which is what printerdriver_jni.cpp
+        // packs: a documented Epson-style 24 V port with the switch on pin 3.
+        val caps = DrawerCapabilities.fromRaw(
+            intArrayOf(1, 0, 24, 1000, 2, 3, 0, 200, 500, 500, 1, 1, 0, 1, 1, 0, 0, 1)
+        )
+        assertEquals(true, caps.present)
+        assertEquals(DrawerPortStandard.EPSON_24V_6P6C, caps.portStandard)
+        assertEquals(24, caps.voltage)
+        assertEquals(3, caps.sensorPin)
+        assertEquals(DrawerKickMethod.EPSON_ESC_P, caps.kickMethod)
+        assertEquals(DrawerStatusMethod.GS_R2, caps.statusMethod)
+        assertEquals(Provenance.DOCUMENTED, caps.electricalProvenance)
+        assertEquals(true, caps.kickable)
+
+        val result = DrawerResult.fromRaw(intArrayOf(4, 0, 1, 200, 143))
+        assertEquals(DrawerState.OPEN_VERIFIED, result.state)
+        assertEquals(DrawerState.CLOSED, result.previousState)
+        assertEquals(143, result.elapsedMs)
+        assertEquals(true, result.verified)
+
+        // KICK_SENT_UNVERIFIED is not a success, and `verified` is the flag that says so.
+        assertEquals(false, DrawerResult.fromRaw(intArrayOf(3, 6, 1, 200, 0)).verified)
+
+        // pin_high keeps the ABI's tri-state: -1 is "nothing answered", not "low".
+        val silent = DrawerReading.fromRaw(intArrayOf(1, 0, -1, 1, 7))
+        assertEquals(null, silent.pinHigh)
+        assertEquals(true, silent.needsCalibration)
+        assertEquals(DrawerState.UNKNOWN, silent.state)
+
+        val calibrated = DrawerReading.fromRaw(intArrayOf(1, 1, 1, 0, 1))
+        assertEquals(true, calibrated.pinHigh)
+        assertEquals(DrawerState.OPEN, calibrated.state)
+    }
 }
+
