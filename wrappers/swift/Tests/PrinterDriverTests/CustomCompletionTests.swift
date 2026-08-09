@@ -174,4 +174,71 @@ final class CustomCompletionTests: XCTestCase {
     // A duplicate id is refused.
     XCTAssertThrowsError(try driver.register(completionMethod: acmeIdle()))
   }
+
+  // MARK: - The other four registration points (docs/api.md §16)
+
+  func testAProbeStepMustNotBeAbleToPrint() throws {
+    let driver = try PrinterDriver(fsyncDisabled: true)
+    let classify: @Sendable ([UInt8]) -> ProbeFinding = { bytes in
+      ProbeFinding(answered: !bytes.isEmpty, label: "acme-probe")
+    }
+    // "Hi" is printable, so auto-detection could cost a venue a roll of paper. Refused at
+    // registration, which is the only place it can be refused before it costs anything.
+    XCTAssertThrowsError(
+      try driver.register(
+        probeStep: ProbeStep(
+          id: "acme.printing-probe", requestBytes: Array("Hi".utf8), classify: classify)))
+    // ESC ENQ: every byte below 0x20, so nothing it can do will mark paper.
+    try driver.register(
+      probeStep: ProbeStep(
+        id: "acme.silent-probe", requestBytes: [0x1B, 0x05], classify: classify))
+    XCTAssertThrowsError(
+      try driver.register(
+        probeStep: ProbeStep(
+          id: "acme.silent-probe", requestBytes: [0x1B, 0x05], classify: classify)),
+      "a duplicate id must be refused")
+  }
+
+  func testABlockHandlerAndFormatterRegister() throws {
+    let driver = try PrinterDriver(fsyncDisabled: true)
+    try driver.register(
+      blockHandler: BlockHandler(kind: "acme.stamp") { _, _ in .ops([0x1B, 0x64, 0x01]) })
+    XCTAssertThrowsError(
+      try driver.register(
+        blockHandler: BlockHandler(kind: "acme.stamp") { _, _ in .degraded("no") }),
+      "a duplicate kind must be refused")
+
+    try driver.register(
+      formatter: TemplateFormatter(name: "acme.upper") { value, _, _ in value.uppercased() })
+    XCTAssertThrowsError(
+      try driver.register(
+        formatter: TemplateFormatter(name: "acme.upper") { value, _, _ in value }),
+      "a duplicate name must be refused")
+  }
+
+  func testADrawerKickMethodRegistersAndDeclaresWhetherItCanBeVerified() throws {
+    let driver = try PrinterDriver(fsyncDisabled: true)
+    // No status pair: the method has no readable switch, which pd.h answers with
+    // kickSentUnverified rather than a verified open.
+    try driver.register(
+      drawerKick: DrawerKick(id: "acme.kick") { channel, pulseMs in
+        [0x1B, 0x70, channel, UInt8(clamping: pulseMs / 2), UInt8(clamping: pulseMs / 2)]
+      })
+    // The readable variant: both halves supplied, as pd.h requires them to be.
+    try driver.register(
+      drawerKick: DrawerKick(
+        id: "acme.kick-sensed",
+        kickBytes: { channel, _ in [0x1B, 0x70, channel] },
+        statusRequest: { [0x1D, 0x72, 0x02] },
+        statusParse: { bytes in bytes.first.map { $0 & 0x01 != 0 } }))
+    XCTAssertThrowsError(
+      try driver.register(drawerKick: DrawerKick(id: "acme.kick") { _, _ in [] }),
+      "a duplicate id must be refused")
+  }
+
+  func testTheMatchVerdictCarriesTheCoresOwnSpelling() {
+    XCTAssertEqual(CompletionMatch.matched("AB12").abiName, "Matched")
+    XCTAssertEqual(CompletionMatch.notMine.abiName, "NotMine")
+    XCTAssertEqual(CompletionMatch.needMore.abiName, "NeedMore")
+  }
 }

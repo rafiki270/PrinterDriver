@@ -55,7 +55,8 @@ public abstract record JobResult
 
     /// <summary>
     /// It may or may not have printed. Resubmitting the same key does nothing;
-    /// <see cref="Printer.ForceReprint"/> is the deliberate duplicate, and it prints a
+    /// <see cref="Printer.ForceReprint(string, JobOptions?)"/> is the deliberate
+    /// duplicate, and it prints a
     /// reprint banner.
     /// </summary>
     /// <param name="Confidence">Evidence backing the claim.</param>

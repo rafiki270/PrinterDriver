@@ -28,6 +28,11 @@ public enum DrainOrder: UInt32, Sendable {
   case fifo = 0
   /// Higher ``QueueOptions/priority`` first, submission order within equal priorities.
   case priority = 1
+
+  /// The core's own spelling, from `pd_drain_order_name`.
+  public var abiName: String {
+    String(cString: pd_drain_order_name(pd_drain_order(rawValue)))
+  }
 }
 
 /// What the queue does with a job it cannot send yet.

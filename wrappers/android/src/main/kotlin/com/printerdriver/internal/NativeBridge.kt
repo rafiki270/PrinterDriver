@@ -119,6 +119,16 @@ internal object NativeBridge {
     @JvmStatic external fun printerWidthDots(printerHandle: Long): Int
     @JvmStatic external fun printerCompletionMechanism(printerHandle: Long): Int
 
+    /** pd_printer_completion_provenance: what the fence [printerCompletionMechanism]
+     *  reports is actually worth (docs/compatibility-brief.md section 28). Not a
+     *  confidence level and it changes nothing a job reports; it answers "should I trust
+     *  this printer's fence before anything has been printed?". */
+    @JvmStatic external fun printerCompletionProvenance(printerHandle: Long): Int
+
+    /** pd_printer_language: the language this printer's profile is driven in. Anything
+     *  but ESC/POS is refused with UNSUPPORTED before a byte is written. */
+    @JvmStatic external fun printerLanguage(printerHandle: Long): Int
+
     /** Returns the 9 pd_device_status fields packed as
      *  [connected, observed, online, coverOpen, paperOut, paperNearEnd, cutterError,
      *  unrecoverableError, recoverableError] -- see DeviceStatus.fromRaw. Never blocks
@@ -453,6 +463,67 @@ internal object NativeBridge {
      *  bounded interval instead, for coroutine-cancellation responsiveness -- see
      *  PrintJob.kt). */
     @JvmStatic external fun jobAwait(driverHandle: Long, jobHandle: Long, timeoutMs: Int): IntArray?
+
+    // --- The core's own spelling of a mirrored enum ------------------------------
+    //
+    // One entry point rather than sixteen: [family] selects which pd_*_name function the
+    // glue calls, and the public surface is an `abiName` property on each enum (Enums.kt).
+    // The families are listed in [AbiEnum]; every pd_*_name in pd.h is reachable here.
+
+    /** The core's own spelling of a member, or "" for an unknown family. Never null. */
+    @JvmStatic external fun abiEnumName(family: Int, value: Int): String
+
+    // --- M16: custom method registration (docs/api.md section 16) -----------------
+    //
+    // Each of these returns false when the core refused the registration (a bad or
+    // duplicate id, a missing callback method, a probe request that could print); the
+    // reason is in [driverLastError]. Every callback object is retained for the life of
+    // the driver, because pd.h has no unregister call.
+
+    /** pd_register_completion_method. [grade] and [authority] are the raw enum values
+     *  this method claims when it confirms a job; both are attributed to [id] in the
+     *  result and in `pdctl verify`. */
+    @JvmStatic external fun registerCompletionMethod(
+        driverHandle: Long,
+        id: String,
+        methodName: String,
+        grade: Int,
+        authority: Int,
+        callback: NativeCompletionMethodCallback
+    ): Boolean
+
+    /** pd_register_probe_step. [requestBytes] MUST be non-printing: a request with a
+     *  printable run is refused here, because auto-detection must never cost a venue a
+     *  roll of paper. */
+    @JvmStatic external fun registerProbeStep(
+        driverHandle: Long,
+        id: String,
+        requestBytes: ByteArray,
+        callback: NativeProbeStepCallback
+    ): Boolean
+
+    /** pd_register_block_handler. A handler registered for a kind always owns it. */
+    @JvmStatic external fun registerBlockHandler(
+        driverHandle: Long,
+        kind: String,
+        callback: NativeBlockHandlerCallback
+    ): Boolean
+
+    /** pd_register_formatter. Checked before the built-in formatter table. */
+    @JvmStatic external fun registerFormatter(
+        driverHandle: Long,
+        name: String,
+        callback: NativeFormatterCallback
+    ): Boolean
+
+    /** pd_register_drawer_kick. [readableSwitch] false registers the kick alone, so a
+     *  pulse reports KICK_SENT_UNVERIFIED rather than a verified open. */
+    @JvmStatic external fun registerDrawerKick(
+        driverHandle: Long,
+        id: String,
+        readableSwitch: Boolean,
+        callback: NativeDrawerKickCallback
+    ): Boolean
 
     /** `pd_job_result.method` for a job [jobAwait] has already settled: the command
      *  behind the claim, e.g. "GS(H) fn48". A separate call because the value is a

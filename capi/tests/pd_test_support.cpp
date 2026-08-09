@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -580,4 +581,48 @@ extern "C" const char* pd_test_enum_label(pd_test_enum which) {
     case PD_TEST_ENUM_TOTAL: break;
   }
   return "UnknownEnum";
+}
+
+// --- M16: the "acme.x-idle" reference completion method -------------------------------
+//
+// The same scheme test_capi.c registers inline, exported so a wrapper whose runtime cannot
+// serve a synchronous value-returning callback from a core thread can register it too. See
+// the header for why that is not a hypothetical.
+
+extern "C" size_t pd_test_acme_fence_bytes(void* ctx, const char* job_token, uint8_t* out,
+                                           size_t cap) {
+  (void)ctx;
+  if (job_token == nullptr || std::strlen(job_token) != 4 || out == nullptr || cap < 6) {
+    // Over cap or malformed: the core fails the job Unknown rather than truncating a fence.
+    return cap + 1;
+  }
+  out[0] = 0x1B;  // ESC
+  out[1] = 0x78;  // 'x'
+  std::memcpy(out + 2, job_token, 4);
+  return 6;
+}
+
+extern "C" pd_match_result pd_test_acme_matcher(void* ctx, const uint8_t* data,
+                                                size_t size) {
+  pd_match_result result;
+  std::memset(&result, 0, sizeof(result));
+  (void)ctx;
+  for (size_t i = 0; data != nullptr && i + 1 < size; ++i) {
+    if (data[i] == 0x1B && data[i + 1] == 0x79) {  // ESC 'y' ack
+      if (i + 6 > size) {
+        result.kind = PD_MATCH_NEED_MORE;  // the four token bytes are still in flight
+        return result;
+      }
+      result.kind = PD_MATCH_MATCHED;
+      std::memcpy(result.token, data + i + 2, 4);
+      result.token[4] = '\0';
+      return result;
+    }
+  }
+  if (data != nullptr && size > 0 && data[size - 1] == 0x1B) {
+    result.kind = PD_MATCH_NEED_MORE;  // a lone trailing ESC may begin an ack
+    return result;
+  }
+  result.kind = PD_MATCH_NOT_MINE;
+  return result;
 }

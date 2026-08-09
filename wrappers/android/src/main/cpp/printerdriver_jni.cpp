@@ -142,6 +142,20 @@ struct CustomTransportContext {
   jmethodID closeMethod = nullptr;
 };
 
+// M16 (docs/api.md §16). One per pd_register_* call, holding the Kotlin object the core
+// will call back into and the method IDs resolved once at registration -- the same
+// arrangement as CustomTransportContext, and for the same reason: these run on core
+// threads, some of them on the byte path of every receipt. pd.h has no unregister call,
+// so like every other context here they live until driverDestroy.
+struct RegistrationContext {
+  JavaVM* jvm = nullptr;
+  jobject callbackGlobalRef = nullptr;
+  jclass callbackClassGlobalRef = nullptr;
+  jmethodID methodA = nullptr;
+  jmethodID methodB = nullptr;
+  jmethodID methodC = nullptr;
+};
+
 struct JniDriverHandle {
   pd_driver* driver = nullptr;
   JavaVM* jvm = nullptr;
@@ -151,6 +165,7 @@ struct JniDriverHandle {
   std::vector<std::unique_ptr<JobCallbackContext>> jobCallbacks;
   std::vector<std::unique_ptr<DeviceCallbackContext>> deviceCallbacks;
   std::vector<std::unique_ptr<CustomTransportContext>> transportCallbacks;
+  std::vector<std::unique_ptr<RegistrationContext>> registrationCallbacks;
 
   // Guards pd_transport_feed_bytes / pd_transport_link_dropped against pd_destroy.
   // Those two are the only pd_* entry points this wrapper calls from a thread it does
@@ -457,6 +472,420 @@ void BuildJobOptions(JNIEnv* env, jstring key, jint cut, jboolean openDrawer, ji
   outOptions->suppress_verification_id = suppressVerificationId != JNI_FALSE ? 1 : 0;
 }
 
+// --- M16: custom method registration (docs/api.md §16) --------------------------------
+//
+// Every callback below is invoked BY THE CORE, on a printer's worker thread, on the
+// transport reader path or on whatever thread renders a document -- so each one attaches
+// exactly like the transport vtable does and, like it, calls no pd_* function. Where a
+// callback cannot be served (the JVM is unreachable, the Kotlin side threw) the answer is
+// the registration's own "I could not": a fence that does not fit, a matcher that does not
+// recognise the bytes, a formatter that declines. None of them invents a completion.
+
+// Copies a jbyteArray into `out`, returning what pd.h wants: the byte count, or a value
+// larger than `cap` when the answer does not fit, which the core treats as the
+// registration's error rather than truncating it.
+size_t CopyByteArray(JNIEnv* env, jbyteArray array, uint8_t* out, size_t cap) {
+  if (array == nullptr || out == nullptr) {
+    return 0;
+  }
+  const jsize length = env->GetArrayLength(array);
+  if (static_cast<size_t>(length) > cap) {
+    return cap + 1;
+  }
+  env->GetByteArrayRegion(array, 0, length, reinterpret_cast<jbyte*>(out));
+  return static_cast<size_t>(length);
+}
+
+jbyteArray NewByteArray(JNIEnv* env, const uint8_t* data, size_t size) {
+  jbyteArray array = env->NewByteArray(static_cast<jsize>(size));
+  if (array != nullptr && data != nullptr && size > 0) {
+    env->SetByteArrayRegion(array, 0, static_cast<jsize>(size),
+                            reinterpret_cast<const jbyte*>(data));
+  }
+  return array;
+}
+
+size_t CompletionFenceTrampoline(void* ctx, const char* job_token, uint8_t* out,
+                                 size_t cap) {
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr || out == nullptr) {
+    return cap + 1; // Cannot produce a fence: the job ends Unknown, never Done.
+  }
+
+  size_t written = cap + 1;
+  jstring token = StdToJString(env, job_token);
+  if (registration->methodA != nullptr) {
+    auto bytes = static_cast<jbyteArray>(env->CallObjectMethod(
+        registration->callbackGlobalRef, registration->methodA, token));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    } else {
+      written = CopyByteArray(env, bytes, out, cap);
+    }
+    if (bytes != nullptr) {
+      env->DeleteLocalRef(bytes);
+    }
+  }
+  if (token != nullptr) {
+    env->DeleteLocalRef(token);
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return written;
+}
+
+pd_match_result CompletionMatcherTrampoline(void* ctx, const uint8_t* data, size_t size) {
+  pd_match_result result{};
+  result.kind = PD_MATCH_NOT_MINE;
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr) {
+    return result;
+  }
+
+  jbyteArray buffer = NewByteArray(env, data, size);
+  if (buffer != nullptr && registration->methodB != nullptr) {
+    // The verdict crosses as one nullable String so that a matcher answers in a single
+    // call and nothing has to be remembered between two: null is NotMine, "" is NeedMore,
+    // anything else is the matched token. See NativeCompletionMethodCallback.
+    auto verdict = static_cast<jstring>(env->CallObjectMethod(
+        registration->callbackGlobalRef, registration->methodB, buffer));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    } else if (verdict == nullptr) {
+      result.kind = PD_MATCH_NOT_MINE;
+    } else {
+      const std::string token = JStringToStd(env, verdict);
+      if (token.empty()) {
+        result.kind = PD_MATCH_NEED_MORE;
+      } else {
+        result.kind = PD_MATCH_MATCHED;
+        const size_t copied = token.size() < sizeof(result.token) - 1
+                                  ? token.size()
+                                  : sizeof(result.token) - 1;
+        for (size_t i = 0; i < copied; ++i) {
+          result.token[i] = token[i];
+        }
+        result.token[copied] = '\0';
+      }
+    }
+    if (verdict != nullptr) {
+      env->DeleteLocalRef(verdict);
+    }
+  }
+  if (buffer != nullptr) {
+    env->DeleteLocalRef(buffer);
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return result;
+}
+
+pd_probe_finding ProbeClassifyTrampoline(void* ctx, const uint8_t* response, size_t size) {
+  pd_probe_finding finding{};
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr) {
+    return finding;
+  }
+
+  jbyteArray buffer = NewByteArray(env, response, size);
+  if (buffer != nullptr && registration->methodA != nullptr) {
+    // null means the device did not answer this step; any string means it did, and is
+    // the label. See NativeProbeStepCallback.
+    auto label = static_cast<jstring>(env->CallObjectMethod(
+        registration->callbackGlobalRef, registration->methodA, buffer));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    } else if (label != nullptr) {
+      finding.answered = 1;
+      const std::string text = JStringToStd(env, label);
+      const size_t copied =
+          text.size() < sizeof(finding.label) - 1 ? text.size() : sizeof(finding.label) - 1;
+      for (size_t i = 0; i < copied; ++i) {
+        finding.label[i] = text[i];
+      }
+      finding.label[copied] = '\0';
+    }
+    if (label != nullptr) {
+      env->DeleteLocalRef(label);
+    }
+  }
+  if (buffer != nullptr) {
+    env->DeleteLocalRef(buffer);
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return finding;
+}
+
+size_t BlockHandlerTrampoline(void* ctx, const char* block_json, const char* profile_json,
+                              uint8_t* out, size_t cap, int32_t* ok, char* detail,
+                              size_t detail_cap) {
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  if (ok == nullptr || out == nullptr) {
+    return 0;
+  }
+  *ok = 0;
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr) {
+    return 0;
+  }
+
+  size_t written = 0;
+  jstring block = StdToJString(env, block_json);
+  jstring profile = StdToJString(env, profile_json);
+  if (registration->methodA != nullptr) {
+    // One tagged answer rather than two calls, so a concurrent render cannot pick up the
+    // other one's reason: first byte 1 -> ESC/POS ops follow; first byte 0 -> a UTF-8
+    // degradation reason follows. See NativeBlockHandlerCallback.
+    auto answer = static_cast<jbyteArray>(env->CallObjectMethod(
+        registration->callbackGlobalRef, registration->methodA, block, profile));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    } else if (answer != nullptr) {
+      const jsize length = env->GetArrayLength(answer);
+      if (length > 0) {
+        std::vector<jbyte> bytes(static_cast<size_t>(length));
+        env->GetByteArrayRegion(answer, 0, length, bytes.data());
+        const size_t payload = static_cast<size_t>(length) - 1;
+        if (bytes[0] != 0) {
+          if (payload > cap) {
+            written = cap + 1; // Never truncated: half a block is not a receipt.
+          } else {
+            *ok = 1;
+            for (size_t i = 0; i < payload; ++i) {
+              out[i] = static_cast<uint8_t>(bytes[i + 1]);
+            }
+            written = payload;
+          }
+        } else if (detail != nullptr && detail_cap > 0) {
+          const size_t copied = payload < detail_cap - 1 ? payload : detail_cap - 1;
+          for (size_t i = 0; i < copied; ++i) {
+            detail[i] = static_cast<char>(bytes[i + 1]);
+          }
+          detail[copied] = '\0';
+        }
+      }
+    }
+    if (answer != nullptr) {
+      env->DeleteLocalRef(answer);
+    }
+  }
+  if (block != nullptr) {
+    env->DeleteLocalRef(block);
+  }
+  if (profile != nullptr) {
+    env->DeleteLocalRef(profile);
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return written;
+}
+
+size_t FormatterTrampoline(void* ctx, const char* value, const char* args,
+                           const char* locale, char* out, size_t cap, int32_t* handled) {
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  if (handled == nullptr || out == nullptr) {
+    return 0;
+  }
+  *handled = 0;
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr) {
+    return 0; // Declines, so the built-in table answers instead.
+  }
+
+  size_t written = 0;
+  jstring jvalue = StdToJString(env, value);
+  jstring jargs = StdToJString(env, args);
+  jstring jlocale = StdToJString(env, locale);
+  if (registration->methodA != nullptr) {
+    auto text = static_cast<jstring>(
+        env->CallObjectMethod(registration->callbackGlobalRef, registration->methodA,
+                              jvalue, jargs, jlocale));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    } else if (text != nullptr) {
+      const std::string formatted = JStringToStd(env, text);
+      if (formatted.size() > cap) {
+        written = cap + 1;
+      } else {
+        *handled = 1;
+        for (size_t i = 0; i < formatted.size(); ++i) {
+          out[i] = formatted[i];
+        }
+        written = formatted.size();
+      }
+    }
+    if (text != nullptr) {
+      env->DeleteLocalRef(text);
+    }
+  }
+  if (jvalue != nullptr) {
+    env->DeleteLocalRef(jvalue);
+  }
+  if (jargs != nullptr) {
+    env->DeleteLocalRef(jargs);
+  }
+  if (jlocale != nullptr) {
+    env->DeleteLocalRef(jlocale);
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return written;
+}
+
+size_t DrawerKickBytesTrampoline(void* ctx, uint8_t channel, uint16_t pulse_ms,
+                                 uint8_t* out, size_t cap) {
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr || out == nullptr) {
+    return 0; // No pulse bytes: nothing is written, which is the safe answer.
+  }
+
+  size_t written = 0;
+  if (registration->methodA != nullptr) {
+    auto bytes = static_cast<jbyteArray>(
+        env->CallObjectMethod(registration->callbackGlobalRef, registration->methodA,
+                              static_cast<jint>(channel), static_cast<jint>(pulse_ms)));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    } else {
+      written = CopyByteArray(env, bytes, out, cap);
+    }
+    if (bytes != nullptr) {
+      env->DeleteLocalRef(bytes);
+    }
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return written;
+}
+
+size_t DrawerStatusRequestTrampoline(void* ctx, uint8_t* out, size_t cap) {
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr || out == nullptr) {
+    return 0;
+  }
+
+  size_t written = 0;
+  if (registration->methodB != nullptr) {
+    auto bytes = static_cast<jbyteArray>(
+        env->CallObjectMethod(registration->callbackGlobalRef, registration->methodB));
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    } else {
+      written = CopyByteArray(env, bytes, out, cap);
+    }
+    if (bytes != nullptr) {
+      env->DeleteLocalRef(bytes);
+    }
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return written;
+}
+
+int32_t DrawerStatusParseTrampoline(void* ctx, const uint8_t* response, size_t size) {
+  auto* registration = static_cast<RegistrationContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(registration->jvm, &didAttach);
+  if (env == nullptr) {
+    return PD_UNKNOWN;
+  }
+
+  jint level = PD_UNKNOWN;
+  jbyteArray buffer = NewByteArray(env, response, size);
+  if (buffer != nullptr && registration->methodC != nullptr) {
+    level = env->CallIntMethod(registration->callbackGlobalRef, registration->methodC,
+                               buffer);
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+      level = PD_UNKNOWN; // A level nobody read is unknown, never "closed".
+    }
+    env->DeleteLocalRef(buffer);
+  }
+
+  if (didAttach) {
+    registration->jvm->DetachCurrentThread();
+  }
+  return static_cast<int32_t>(level);
+}
+
+// Builds the context every pd_register_* shares: a global ref to the Kotlin object, one
+// to its class (which is what keeps the cached method IDs valid), and up to three method
+// IDs. Returns nullptr when a method is missing, so a registration is refused here rather
+// than failing on a worker thread later.
+RegistrationContext* MakeRegistration(JNIEnv* env, JniDriverHandle* handle,
+                                      jobject callback, const char* nameA,
+                                      const char* signatureA, const char* nameB,
+                                      const char* signatureB, const char* nameC,
+                                      const char* signatureC) {
+  auto context = std::make_unique<RegistrationContext>();
+  context->jvm = handle->jvm;
+  context->callbackGlobalRef = env->NewGlobalRef(callback);
+  jclass localClass = env->GetObjectClass(callback);
+  context->callbackClassGlobalRef = static_cast<jclass>(env->NewGlobalRef(localClass));
+  bool ok = true;
+  if (nameA != nullptr) {
+    context->methodA = env->GetMethodID(localClass, nameA, signatureA);
+    ok = ok && context->methodA != nullptr;
+  }
+  if (nameB != nullptr) {
+    context->methodB = env->GetMethodID(localClass, nameB, signatureB);
+    ok = ok && context->methodB != nullptr;
+  }
+  if (nameC != nullptr) {
+    context->methodC = env->GetMethodID(localClass, nameC, signatureC);
+    ok = ok && context->methodC != nullptr;
+  }
+  env->DeleteLocalRef(localClass);
+  if (!ok) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+                         "a registration callback method was not found -- check "
+                         "consumer-rules.pro keep rules if R8 is enabled");
+    env->ExceptionClear();
+    env->DeleteGlobalRef(context->callbackGlobalRef);
+    env->DeleteGlobalRef(context->callbackClassGlobalRef);
+    return nullptr;
+  }
+  RegistrationContext* raw = context.get();
+  std::lock_guard<std::mutex> lock(handle->callbacksMutex);
+  handle->registrationCallbacks.push_back(std::move(context));
+  return raw;
+}
+
 } // namespace
 
 extern "C" {
@@ -523,6 +952,10 @@ JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_driverDestro
   for (auto& transport : handle->transportCallbacks) {
     env->DeleteGlobalRef(transport->callbackGlobalRef);
     env->DeleteGlobalRef(transport->callbackClassGlobalRef);
+  }
+  for (auto& registration : handle->registrationCallbacks) {
+    env->DeleteGlobalRef(registration->callbackGlobalRef);
+    env->DeleteGlobalRef(registration->callbackClassGlobalRef);
   }
   if (handle->logCallbackGlobalRef != nullptr) {
     env->DeleteGlobalRef(handle->logCallbackGlobalRef);
@@ -1609,6 +2042,208 @@ JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_localSubn
     return StdToJString(env, "");
   }
   return StdToJString(env, pd_local_subnet(handle->driver));
+}
+
+// --- Printer facts the wrapper had not surfaced ---------------------------------------
+
+JNIEXPORT jint JNICALL
+Java_com_printerdriver_internal_NativeBridge_printerCompletionProvenance(
+    JNIEnv*, jclass, jlong printerHandle) {
+  return static_cast<jint>(pd_printer_completion_provenance(AsPrinter(printerHandle)));
+}
+
+JNIEXPORT jint JNICALL Java_com_printerdriver_internal_NativeBridge_printerLanguage(
+    JNIEnv*, jclass, jlong printerHandle) {
+  return static_cast<jint>(pd_printer_language(AsPrinter(printerHandle)));
+}
+
+// --- The core's own spelling of a mirrored enum ---------------------------------------
+//
+// One entry point rather than sixteen: the family selector below is an implementation
+// detail of com.printerdriver.internal.AbiEnum, and the Kotlin surface is an `abiName`
+// property on each enum. Every pd_*_name function in pd.h is reachable through it.
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_abiEnumName(
+    JNIEnv* env, jclass, jint family, jint value) {
+  const char* name = "";
+  switch (family) {
+    case 0: name = pd_job_state_name(static_cast<pd_job_state>(value)); break;
+    case 1: name = pd_confidence_level_name(static_cast<pd_confidence_level>(value)); break;
+    case 2: name = pd_device_event_name(static_cast<pd_device_event>(value)); break;
+    case 3: name = pd_failure_reason_name(static_cast<pd_failure_reason>(value)); break;
+    case 4: name = pd_job_outcome_name(static_cast<pd_job_outcome>(value)); break;
+    case 5: name = pd_confidence_grade_name(static_cast<pd_confidence_grade>(value)); break;
+    case 6:
+      name = pd_completion_authority_name(static_cast<pd_completion_authority>(value));
+      break;
+    case 7: name = pd_provenance_name(static_cast<pd_provenance>(value)); break;
+    case 8: name = pd_command_language_name(static_cast<pd_command_language>(value)); break;
+    case 9: name = pd_payload_kind_name(static_cast<pd_payload_kind>(value)); break;
+    case 10:
+      name = pd_completion_mechanism_name(static_cast<pd_completion_mechanism>(value));
+      break;
+    case 11: name = pd_cut_variant_name(static_cast<pd_cut_variant>(value)); break;
+    case 12: name = pd_drawer_state_name(static_cast<pd_drawer_state>(value)); break;
+    case 13:
+      name = pd_drawer_port_standard_name(static_cast<pd_drawer_port_standard>(value));
+      break;
+    case 14:
+      name = pd_drawer_kick_method_name(static_cast<pd_drawer_kick_method>(value));
+      break;
+    case 15:
+      name = pd_drawer_status_method_name(static_cast<pd_drawer_status_method>(value));
+      break;
+    case 16:
+      name = pd_profile_selection_name(static_cast<pd_profile_selection>(value));
+      break;
+    case 17: name = pd_detection_status_name(static_cast<pd_detection_status>(value)); break;
+    case 18: name = pd_drain_order_name(static_cast<pd_drain_order>(value)); break;
+    case 19: name = pd_match_kind_name(static_cast<pd_match_kind>(value)); break;
+    case 20:
+      // Not a member name: the letter a report tabulates ("A+", "A".."E").
+      name = pd_confidence_grade_letter(static_cast<pd_confidence_grade>(value));
+      break;
+    default: name = ""; break;
+  }
+  return StdToJString(env, name);
+}
+
+// --- M16: custom method registration (docs/api.md §16) --------------------------------
+
+JNIEXPORT jboolean JNICALL
+Java_com_printerdriver_internal_NativeBridge_registerCompletionMethod(
+    JNIEnv* env, jclass, jlong driverHandle, jstring id, jstring methodName, jint grade,
+    jint authority, jobject callback) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr || callback == nullptr) {
+    return JNI_FALSE;
+  }
+  RegistrationContext* context =
+      MakeRegistration(env, handle, callback, "fenceBytes", "(Ljava/lang/String;)[B",
+                       "match", "([B)Ljava/lang/String;", nullptr, nullptr);
+  if (context == nullptr) {
+    return JNI_FALSE;
+  }
+
+  const std::string idStorage = JStringToStd(env, id);
+  const std::string nameStorage = JStringToStd(env, methodName);
+  pd_completion_method method{};
+  method.id = idStorage.c_str();
+  method.fence_bytes = &CompletionFenceTrampoline;
+  method.matcher = &CompletionMatcherTrampoline;
+  method.ctx = context;
+  method.grade = static_cast<pd_confidence_grade>(grade);
+  method.authority = static_cast<pd_completion_authority>(authority);
+  method.method_name = nameStorage.c_str();
+  return pd_register_completion_method(handle->driver, &method) == 1 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_printerdriver_internal_NativeBridge_registerProbeStep(
+    JNIEnv* env, jclass, jlong driverHandle, jstring id, jbyteArray requestBytes,
+    jobject callback) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr || callback == nullptr) {
+    return JNI_FALSE;
+  }
+  RegistrationContext* context =
+      MakeRegistration(env, handle, callback, "classify", "([B)Ljava/lang/String;",
+                       nullptr, nullptr, nullptr, nullptr);
+  if (context == nullptr) {
+    return JNI_FALSE;
+  }
+
+  std::vector<uint8_t> request;
+  if (requestBytes != nullptr) {
+    const jsize length = env->GetArrayLength(requestBytes);
+    request.resize(static_cast<size_t>(length));
+    if (length > 0) {
+      env->GetByteArrayRegion(requestBytes, 0, length,
+                              reinterpret_cast<jbyte*>(request.data()));
+    }
+  }
+
+  const std::string idStorage = JStringToStd(env, id);
+  pd_probe_step step{};
+  step.id = idStorage.c_str();
+  step.request_bytes = request.empty() ? nullptr : request.data();
+  step.request_size = request.size();
+  step.classify = &ProbeClassifyTrampoline;
+  step.ctx = context;
+  // The core copies request_bytes before returning (pd.h), and refuses a step whose
+  // bytes could print -- which is why this can be a local vector.
+  return pd_register_probe_step(handle->driver, &step) == 1 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_printerdriver_internal_NativeBridge_registerBlockHandler(
+    JNIEnv* env, jclass, jlong driverHandle, jstring kind, jobject callback) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr || callback == nullptr) {
+    return JNI_FALSE;
+  }
+  RegistrationContext* context = MakeRegistration(
+      env, handle, callback, "render", "(Ljava/lang/String;Ljava/lang/String;)[B", nullptr,
+      nullptr, nullptr, nullptr);
+  if (context == nullptr) {
+    return JNI_FALSE;
+  }
+
+  const std::string kindStorage = JStringToStd(env, kind);
+  pd_block_handler blockHandler{};
+  blockHandler.kind = kindStorage.c_str();
+  blockHandler.handler = &BlockHandlerTrampoline;
+  blockHandler.ctx = context;
+  return pd_register_block_handler(handle->driver, &blockHandler) == 1 ? JNI_TRUE
+                                                                       : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_printerdriver_internal_NativeBridge_registerFormatter(
+    JNIEnv* env, jclass, jlong driverHandle, jstring name, jobject callback) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr || callback == nullptr) {
+    return JNI_FALSE;
+  }
+  RegistrationContext* context = MakeRegistration(
+      env, handle, callback, "format",
+      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+      nullptr, nullptr, nullptr, nullptr);
+  if (context == nullptr) {
+    return JNI_FALSE;
+  }
+
+  const std::string nameStorage = JStringToStd(env, name);
+  pd_formatter formatter{};
+  formatter.name = nameStorage.c_str();
+  formatter.formatter = &FormatterTrampoline;
+  formatter.ctx = context;
+  return pd_register_formatter(handle->driver, &formatter) == 1 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_printerdriver_internal_NativeBridge_registerDrawerKick(
+    JNIEnv* env, jclass, jlong driverHandle, jstring id, jboolean readableSwitch,
+    jobject callback) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr || callback == nullptr) {
+    return JNI_FALSE;
+  }
+  RegistrationContext* context =
+      MakeRegistration(env, handle, callback, "kickBytes", "(II)[B", "statusRequest",
+                       "()[B", "statusParse", "([B)I");
+  if (context == nullptr) {
+    return JNI_FALSE;
+  }
+
+  const std::string idStorage = JStringToStd(env, id);
+  pd_drawer_kick_reg reg{};
+  reg.id = idStorage.c_str();
+  reg.kick_bytes = &DrawerKickBytesTrampoline;
+  // Both halves or neither, as pd.h requires: no readable switch means a kick reports
+  // KICK_SENT_UNVERIFIED rather than claiming a verified open.
+  reg.status_request = readableSwitch ? &DrawerStatusRequestTrampoline : nullptr;
+  reg.status_parse = readableSwitch ? &DrawerStatusParseTrampoline : nullptr;
+  reg.ctx = context;
+  return pd_register_drawer_kick(handle->driver, &reg) == 1 ? JNI_TRUE : JNI_FALSE;
 }
 
 } // extern "C"

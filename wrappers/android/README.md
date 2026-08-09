@@ -25,6 +25,17 @@ What was actually checked, and with what:
 | JVM unit tests (`src/test/kotlin`) | Written, pure-Kotlin logic only (no native calls). **Never executed.** |
 | GitHub Actions workflow (`.github-ci-example.yml`) | Written, inert (lives outside `.github/workflows/`). **Never run.** |
 
+M17 (docs/api.md §17) closed this wrapper's remaining gaps against the C ABI, and every
+line of it lands in the two rows above that say "not compiled": the five `pd_register_*`
+extension points of §16 (`CustomMethods.kt`), the `abiName` properties that ask the core
+for its own spelling of a mirrored enum (`AbiNames.kt`), and `Printer.completionProvenance`
+/ `Printer.language`. Their JNI half **is** type-checked, and every `external fun` is
+proven to have a native definition — which is the mismatch that would otherwise become an
+`UnsatisfiedLinkError` at a till — but no Kotlin here has been compiled or run, and the new
+callback interfaces in `internal/NativeCallbacks.kt` are looked up by name and signature at
+registration time, so they need the same `consumer-rules.pro` keep rules as the transport
+one if R8 is enabled.
+
 ### Syntax confidence without a JVM
 
 This machine has no JVM, Gradle, or Android SDK/NDK -- there is no `javac`, `kotlinc`,
@@ -308,6 +319,13 @@ mapping, `JobResult.fromRaw`, `DeviceStatus` tri-state decoding), nothing that c
 `System.loadLibrary`. Run with `gradle testDebugUnitTest` (see
 `.github-ci-example.yml`'s `test` job). There is no `src/androidTest` in this
 scaffold -- instrumented tests against a real/emulated device are out of scope here.
+
+## Parity with the other wrappers
+
+`scripts/check_parity.sh` (docs/api.md §17) asserts that this wrapper references every
+public `pd_*` function in `capi/include/printerdriver/pd.h`, and that anything it covers
+through a higher-level member instead is named in `scripts/parity_allowlist.txt`. **No
+wrapper is a subset**: a `pd_` function added to the ABI without a binding here fails CI.
 
 ## Continuous integration
 

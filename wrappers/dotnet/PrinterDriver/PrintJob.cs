@@ -44,6 +44,36 @@ public sealed class PrintJob
     public bool IsTerminal => NativeMethods.pd_job_is_terminal(_handle) != 0;
 
     /// <summary>
+    /// The verification identifier this job's ticket printed as <c>V:</c> — the wire token
+    /// its print fence carried, promoted to paper (docs/api.md §14).
+    /// </summary>
+    /// <remarks>
+    /// Null on a printer whose completion mechanism is not <c>GS ( H</c> (there is no wire
+    /// token to promote) and until the job reaches a worker. Once non-null it never
+    /// changes, and <see cref="PrinterDriver.JobByToken(string)"/> resolves it back to this
+    /// job, including after a restart.
+    /// </remarks>
+    public string? PrintToken
+    {
+        get
+        {
+            var token = NativeMethods.ReadUtf8(NativeMethods.pd_job_print_token(_handle));
+            return token.Length == 0 ? null : token;
+        }
+    }
+
+    /// <summary>The identifier this job's cut fence carried. Same rules as
+    /// <see cref="PrintToken"/>.</summary>
+    public string? CutToken
+    {
+        get
+        {
+            var token = NativeMethods.ReadUtf8(NativeMethods.pd_job_cut_token(_handle));
+            return token.Length == 0 ? null : token;
+        }
+    }
+
+    /// <summary>
     /// The job's full event stream: every event recorded so far, replayed on the calling
     /// thread, then the rest as the printer's worker thread produces them. The last event
     /// a job ever emits is always a terminal one, which is what ends the enumeration.

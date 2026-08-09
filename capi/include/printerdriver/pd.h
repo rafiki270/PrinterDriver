@@ -1379,6 +1379,16 @@ const char* pd_detection_status_name(pd_detection_status value);
  *   pd_register_formatter — backs {{ v | name:args }}, checked before the built-in table.
  *   pd_register_drawer_kick — fills PD_DRAWER_KICK_VENDOR for a profile.
  *
+ * -- Which of the five fire through THIS header (docs/api.md §17.1) -------------------
+ * The completion method, the probe step and the drawer kick are driven by the engine every
+ * pd_print goes through, so a registration made here is called here. The block handler and
+ * the formatter are consulted by the receipt-DSL render path, and that path has no entry
+ * point in this ABI yet: the document tier below is a flat pd_op array, and the only C call
+ * that renders a DSL document is pd_self_test, which lays out one fixed ticket. Both are
+ * accepted and stored — they are how the C++ embedder, the agent and pdctl extend rendering
+ * — but a caller reaching the core only through pd.h should expect them not to be invoked
+ * until a pd_render_document entry point exists. Said here rather than discovered there.
+ *
  * -- Callback threads --------------------------------------------------------------
  * Every callback below is invoked on a CORE thread, never the caller's — the same
  * contract the custom-transport vtable documents above:

@@ -92,6 +92,9 @@ class _JNIEnv {
   void CallVoidMethod(jobject obj, jmethodID methodID, ...);
   jboolean CallBooleanMethod(jobject obj, jmethodID methodID, ...);
   jint CallIntMethod(jobject obj, jmethodID methodID, ...);
+  // Returns jobject in the real header too, so every caller has to cast to the array or
+  // string type it asked for -- which is exactly the mistake worth catching here.
+  jobject CallObjectMethod(jobject obj, jmethodID methodID, ...);
 
   jobject NewGlobalRef(jobject obj);
   void DeleteGlobalRef(jobject globalRef);
@@ -109,6 +112,7 @@ class _JNIEnv {
   jbyte* GetByteArrayElements(jbyteArray array, jboolean* isCopy);
   void ReleaseByteArrayElements(jbyteArray array, jbyte* elems, jint mode);
   void SetByteArrayRegion(jbyteArray array, jsize start, jsize len, const jbyte* buf);
+  void GetByteArrayRegion(jbyteArray array, jsize start, jsize len, jbyte* buf);
 
   jint* GetIntArrayElements(jintArray array, jboolean* isCopy);
   void ReleaseIntArrayElements(jintArray array, jint* elems, jint mode);

@@ -29,6 +29,7 @@ import 'dart:ffi';
 
 import 'src/allocation.dart';
 import 'src/bindings.dart';
+import 'src/custom_methods.dart';
 import 'src/enums.dart';
 import 'src/library_loader.dart';
 import 'src/transport.dart';
@@ -42,6 +43,7 @@ export 'src/bindings.dart'
         PdTransportCloseNative,
         PdTransportConnectNative,
         PdTransportWriteNative;
+export 'src/custom_methods.dart';
 export 'src/enums.dart';
 export 'src/library_loader.dart'
     show
@@ -444,6 +446,153 @@ final class PrinterDriver {
     _checkAlive();
     final value = readNativeString(_bindings.localSubnet(_handle));
     return value.isEmpty ? null : value;
+  }
+
+  // --- M16: custom method registration (docs/api.md §16) ----------------------------
+  //
+  // The five extension points, each taking native callbacks for the reason
+  // src/custom_methods.dart opens with. A registration lives for the life of the driver:
+  // pd.h has no unregister call, and the code the pointers name must stay loaded until
+  // [dispose].
+
+  /// Registers a custom completion mechanism.
+  ///
+  /// Throws [PrinterDriverException] on a bad or duplicate id, or a record the core
+  /// refused.
+  void registerCompletionMethod(CustomCompletionMethod method) {
+    _checkAlive();
+    final ok = Arena.using((arena) {
+      final native = arena.allocate<PdCompletionMethod>(sizeOf<PdCompletionMethod>());
+      native.ref
+        ..id = arena.string(method.id)
+        ..fenceBytes = method.fenceBytes
+        ..matcher = method.matcher
+        ..ctx = method.ctx
+        ..grade = method.grade.nativeValue
+        ..authority = method.authority.nativeValue
+        ..methodName = arena.string(method.methodName ?? method.id);
+      return _bindings.registerCompletionMethod(_handle, native);
+    });
+    if (ok != 1) {
+      throw PrinterDriverException(lastError);
+    }
+  }
+
+  /// Registers an extra fingerprinting step for `probe` and [autoDetect].
+  ///
+  /// Throws [PrinterDriverException] on a bad or duplicate id — and on a request whose
+  /// bytes could print, which the core refuses at registration rather than at a venue.
+  void registerProbeStep(CustomProbeStep step) {
+    _checkAlive();
+    final ok = Arena.using((arena) {
+      final native = arena.allocate<PdProbeStep>(sizeOf<PdProbeStep>());
+      native.ref
+        ..id = arena.string(step.id)
+        ..requestBytes = arena.bytes(step.requestBytes)
+        ..requestSize = step.requestBytes.length
+        ..classify = step.classify
+        ..ctx = step.ctx;
+      return _bindings.registerProbeStep(_handle, native);
+    });
+    if (ok != 1) {
+      throw PrinterDriverException(lastError);
+    }
+  }
+
+  /// Registers a renderer for a new DSL block kind.
+  void registerBlockHandler(CustomBlockHandler handler) {
+    _checkAlive();
+    final ok = Arena.using((arena) {
+      final native = arena.allocate<PdBlockHandler>(sizeOf<PdBlockHandler>());
+      native.ref
+        ..kind = arena.string(handler.kind)
+        ..handler = handler.handler
+        ..ctx = handler.ctx;
+      return _bindings.registerBlockHandler(_handle, native);
+    });
+    if (ok != 1) {
+      throw PrinterDriverException(lastError);
+    }
+  }
+
+  /// Registers a template formatter, checked before the built-in table.
+  void registerFormatter(CustomFormatter formatter) {
+    _checkAlive();
+    final ok = Arena.using((arena) {
+      final native = arena.allocate<PdFormatter>(sizeOf<PdFormatter>());
+      native.ref
+        ..name = arena.string(formatter.name)
+        ..formatter = formatter.formatter
+        ..ctx = formatter.ctx;
+      return _bindings.registerFormatter(_handle, native);
+    });
+    if (ok != 1) {
+      throw PrinterDriverException(lastError);
+    }
+  }
+
+  /// Registers a vendor drawer-kick method.
+  void registerDrawerKick(CustomDrawerKick kick) {
+    _checkAlive();
+    final ok = Arena.using((arena) {
+      final native = arena.allocate<PdDrawerKickReg>(sizeOf<PdDrawerKickReg>());
+      native.ref
+        ..id = arena.string(kick.id)
+        ..kickBytes = kick.kickBytes
+        ..statusRequest = kick.statusRequest
+        ..statusParse = kick.statusParse
+        ..ctx = kick.ctx;
+      return _bindings.registerDrawerKick(_handle, native);
+    });
+    if (ok != 1) {
+      throw PrinterDriverException(lastError);
+    }
+  }
+
+  // --- The core's own spelling of a mirrored enum -----------------------------------
+
+  /// The core's own spelling of any mirrored enum value — `pd_job_state_name` and its
+  /// fourteen relatives, in one call.
+  ///
+  /// Not [Enum.name]: that is this package's spelling of a member, and this is the one the
+  /// journal records, `pdctl` prints and a support engineer greps for six months later.
+  /// Rendering a diagnostic with one and searching the journal for the other is a wasted
+  /// afternoon.
+  ///
+  /// Throws [ArgumentError] for a value that is not one of the ABI's mirrored enums.
+  String abiName(Object value) {
+    _checkAlive();
+    final Pointer<Char> name = switch (value) {
+      JobState v => _bindings.jobStateName(v.nativeValue),
+      ConfidenceLevel v => _bindings.confidenceLevelName(v.nativeValue),
+      DeviceEvent v => _bindings.deviceEventName(v.nativeValue),
+      FailureReason v => _bindings.failureReasonName(v.nativeValue),
+      JobResult v => _bindings.jobOutcomeName(v.nativeOutcome),
+      PayloadKind v => _bindings.payloadKindName(v.nativeValue),
+      ConfidenceGrade v => _bindings.confidenceGradeName(v.nativeValue),
+      CompletionAuthority v => _bindings.completionAuthorityName(v.nativeValue),
+      Provenance v => _bindings.provenanceName(v.nativeValue),
+      CommandLanguage v => _bindings.commandLanguageName(v.nativeValue),
+      CompletionMechanism v => _bindings.completionMechanismName(v.nativeValue),
+      CutVariant v => _bindings.cutVariantName(v.nativeValue),
+      DrawerState v => _bindings.drawerStateName(v.nativeValue),
+      DrawerPortStandard v => _bindings.drawerPortStandardName(v.nativeValue),
+      DrawerKickMethod v => _bindings.drawerKickMethodName(v.nativeValue),
+      DrawerStatusMethod v => _bindings.drawerStatusMethodName(v.nativeValue),
+      ProfileSelection v => _bindings.profileSelectionName(v.nativeValue),
+      DetectionStatus v => _bindings.detectionStatusName(v.nativeValue),
+      DrainOrder v => _bindings.drainOrderName(v.nativeValue),
+      CompletionMatchKind v => _bindings.matchKindName(v.nativeValue),
+      _ => throw ArgumentError.value(value, 'value', 'is not a mirrored ABI enum'),
+    };
+    return readNativeString(name);
+  }
+
+  /// `pd_confidence_grade_letter` — "A+", "A".."E", the letter a report tabulates where
+  /// the member name is too long.
+  String gradeLetter(ConfidenceGrade grade) {
+    _checkAlive();
+    return readNativeString(_bindings.confidenceGradeLetter(grade.nativeValue));
   }
 
   /// A NULL-terminated `char*` array inside [arena], or `nullptr` when empty.

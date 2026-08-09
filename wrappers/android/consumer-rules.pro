@@ -20,6 +20,16 @@
 # silently no-ops -- addPrinterCustom refuses the registration outright and the printer
 # never exists. Louder than the others, and still a keep rule worth having.
 -keep,includedescriptorclasses class com.printerdriver.internal.NativeTransportCallback { *; }
+
+# M16 (docs/api.md §16) -- the five custom-method registration points. Same mechanism,
+# same consequence: each of these is found by GetMethodID(name, signature) at
+# registration time, so a renamed method registers a fence or a matcher the core can
+# never call, and the job it was meant to confirm ends Unknown.
+-keep,includedescriptorclasses class com.printerdriver.internal.NativeCompletionMethodCallback { *; }
+-keep,includedescriptorclasses class com.printerdriver.internal.NativeProbeStepCallback { *; }
+-keep,includedescriptorclasses class com.printerdriver.internal.NativeBlockHandlerCallback { *; }
+-keep,includedescriptorclasses class com.printerdriver.internal.NativeFormatterCallback { *; }
+-keep,includedescriptorclasses class com.printerdriver.internal.NativeDrawerKickCallback { *; }
 -keep,includedescriptorclasses class com.printerdriver.BluetoothSppTransport { *; }
 
 # Lambdas/anonymous classes implementing the callback interfaces above (from
@@ -30,6 +40,11 @@
 -keepclassmembers class * implements com.printerdriver.internal.NativeDeviceEventCallback { *; }
 -keepclassmembers class * implements com.printerdriver.internal.NativeLogCallback { *; }
 -keepclassmembers class * implements com.printerdriver.internal.NativeTransportCallback { *; }
+-keepclassmembers class * implements com.printerdriver.internal.NativeCompletionMethodCallback { *; }
+-keepclassmembers class * implements com.printerdriver.internal.NativeProbeStepCallback { *; }
+-keepclassmembers class * implements com.printerdriver.internal.NativeBlockHandlerCallback { *; }
+-keepclassmembers class * implements com.printerdriver.internal.NativeFormatterCallback { *; }
+-keepclassmembers class * implements com.printerdriver.internal.NativeDrawerKickCallback { *; }
 
 # Note: PrinterDriverException does NOT need a keep rule. Native functions signal
 # failure with a 0L sentinel handle; the corresponding `throw PrinterDriverException(...)`

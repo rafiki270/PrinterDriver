@@ -1,0 +1,37 @@
+# Wrapper parity exemptions -- docs/api.md §17, enforced by scripts/check_parity.sh.
+#
+# An entry says: this wrapper does not call this C function, and here is the member that
+# delivers the capability anyway. That is the only kind of exemption there is. "Not needed
+# yet", "the tests cover it" and "nobody asked for it" are not exemptions; they are gaps,
+# and the check exists to keep them visible.
+#
+# Format, whitespace-separated:
+#
+#   <wrapper|*>   <pd_function>   <covering member> -- <why it is equivalent>
+#
+# where <wrapper> is one of swift, dart, dotnet, kotlin, or * for all four. Every field is
+# required: an entry with no covering member fails the check, and so does one naming a
+# function pd.h does not declare, so this file cannot rot into a list of excuses.
+
+# --- Index readers for the detection sweeps ---------------------------------------------
+#
+# pd_detected_at and pd_discovered_at exist for FFI runtimes that cannot service a native
+# callback while blocked inside the call that fires it -- pd.h says so in the comment above
+# them, naming Dart. A runtime that CAN service the callback receives every candidate as it
+# is found, which is strictly more than the index reader offers (it also carries progress),
+# so binding the reader as well would add a second, worse path to the same data.
+#
+# Dart and Kotlin bind the readers, because they are why the readers exist.
+
+swift    pd_detected_at      Detection.autoDetect(...) -> AsyncStream<DetectedPrinter> -- serves pd_auto_detect's own callback, so every candidate arrives as it is found
+swift    pd_discovered_at    Detection.discover(...) -> AsyncStream<DiscoveredDevice> -- serves pd_discover's own callback
+dotnet   pd_detected_at      PrinterDriver.AutoDetectAsync(...) -> IAsyncEnumerable<DetectedPrinter> -- serves pd_auto_detect's DetectedCallback directly
+dotnet   pd_discovered_at    PrinterDriver.DiscoverAsync(...) -> IAsyncEnumerable<DiscoveredDevice> -- serves pd_discover's DiscoveredCallback directly
+
+# --- Reprint with the default banner ------------------------------------------------------
+#
+# pd.h: "pd_force_reprint is exactly this call with an all-zeroes pd_reprint_options, i.e.
+# with the banner on." A wrapper that exposes the banner as a defaulted parameter covers
+# both entry points with one member, and cannot express the two inconsistently.
+
+swift    pd_force_reprint    Printer.forceReprint(key:options:) taking ReprintOptions -- pd_force_reprint_opts with the banner defaulted on, which pd.h defines pd_force_reprint to be
