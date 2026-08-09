@@ -105,6 +105,11 @@ class PrinterDriver private constructor(internal val handle: Long) : AutoCloseab
         // learns there is nothing to feed.
         transport.attachTo(handle, printerHandle)
         if (printerHandle == 0L) {
+            // Nothing will ever be registered to shut this one down, so do it here. The
+            // core can in principle have connected already (see attachTo), which would
+            // otherwise leave an RFCOMM channel open against a printer that commonly
+            // accepts exactly one.
+            transport.shutdown()
             throw PrinterDriverException("pd_add_printer_custom failed: $lastError")
         }
         bluetoothTransports[printerHandle] = transport
@@ -112,9 +117,8 @@ class PrinterDriver private constructor(internal val handle: Long) : AutoCloseab
     }
 
     /** [addPrinterBluetooth] with the adapter taken from the system service, which is
-     *  the supported way to get one on the [minSdk][android.os.Build.VERSION_CODES.O]
-     *  this library targets. Throws [PrinterDriverException] on a device with no
-     *  Bluetooth hardware. */
+     *  the supported way to get one on the minSdk 26 this library targets. Throws
+     *  [PrinterDriverException] on a device with no Bluetooth hardware. */
     fun addPrinterBluetooth(context: Context, config: BluetoothPrinterConfig): Printer {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val adapter = manager?.adapter

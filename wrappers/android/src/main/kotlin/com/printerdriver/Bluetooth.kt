@@ -134,6 +134,15 @@ data class BluetoothPrinterConfig(
  * before `pd_destroy` frees the printer handle it feeds. The public surface is
  * [BluetoothPrinterConfig] going in and [Printer.bluetoothTransportKind] coming out.
  *
+ * On the visibility, which matters here in a way it usually does not: Kotlin mangles the
+ * compiled names of `internal` members, and `connect`/`write`/`close` are looked up by
+ * literal name through `GetMethodID` (see NativeCallbacks.kt's header for the full
+ * argument). The three below are safe because they are `override`s -- an override cannot
+ * be mangled without breaking the override itself, which is why an internal Kotlin class
+ * can implement `java.lang.Runnable` and still produce a callable `run()`. None of the
+ * three is marked `internal` individually, and none should be. Confirmed by reasoning,
+ * not by reading `javap` output -- README.md "What a real CI run must confirm", item 5.
+ *
  * See this file's header for what has and has not been verified. In short: nothing here
  * has ever executed.
  */
@@ -255,9 +264,11 @@ internal class BluetoothSppTransport(
             // all-or-throw per call, so a single write(data) could only ever report
             // data.size or -1 -- and the difference between "zero bytes out" (a known
             // failure, safe to resubmit) and "some bytes out" (Unknown, ask the
-            // operator) is precisely what pd.h §4 turns into an operator decision.
-            // Sized to localise a failure, not for throughput: RFCOMM's own MTU is far
-            // smaller than this anyway.
+            // operator) is precisely what pd.h §4 turns into an operator decision. The
+            // chunk size therefore buys failure resolution, not throughput, and it does
+            // not control RFCOMM framing: the count reported is bytes accepted by the
+            // OS, which is the same claim a TCP send() makes and is not a claim about
+            // what the printer received.
             while (written < data.size) {
                 val chunk = minOf(WRITE_CHUNK_BYTES, data.size - written)
                 output.write(data, written, chunk)
@@ -382,20 +393,28 @@ internal class BluetoothSppTransport(
         }
     }
 
-    internal companion object {
-        /** The Serial Port Profile UUID. Every Classic SPP receipt printer in
-         *  docs/compatibility-brief.md §26 advertises this well-known record; it is not
-         *  a per-vendor value. */
-        internal val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+    private companion object {
+        /**
+         * The Serial Port Profile UUID. Every Classic SPP receipt printer in
+         * docs/compatibility-brief.md §26 advertises this well-known record; it is not a
+         * per-vendor value.
+         *
+         * `8000` in the third group, not `0000`: this is the 16-bit SPP identifier
+         * `0x1101` expanded through the Bluetooth Base UUID
+         * `00000000-0000-1000-8000-00805F9B34FB`. The transcription that drops the
+         * `8000` is a common one and produces a UUID no device advertises, so it fails
+         * as an SDP lookup miss rather than as anything that names the real mistake.
+         */
+        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-        private const val WRITE_CHUNK_BYTES = 512
+        const val WRITE_CHUNK_BYTES = 512
 
         /** How long a reader waits to be told its printer handle. Generous by orders of
          *  magnitude -- the publication happens microseconds after
          *  pd_add_printer_custom returns -- so exceeding it means the registration
          *  failed in a way nobody reported, which is worth a log line. */
-        private const val HANDLE_WAIT_MS = 5_000L
+        const val HANDLE_WAIT_MS = 5_000L
 
-        private const val READER_JOIN_MS = 2_000L
+        const val READER_JOIN_MS = 2_000L
     }
 }

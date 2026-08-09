@@ -34,6 +34,14 @@ import 'src/library_loader.dart';
 import 'src/transport.dart';
 import 'src/types.dart';
 
+// The vtable signatures only. They are part of the custom-transport API — a caller
+// naming its own `connect` symbol has to spell the type — while the rest of the
+// bindings stay internal.
+export 'src/bindings.dart'
+    show
+        PdTransportCloseNative,
+        PdTransportConnectNative,
+        PdTransportWriteNative;
 export 'src/enums.dart';
 export 'src/library_loader.dart'
     show
@@ -356,12 +364,23 @@ final class PrinterDriver {
     _jobs.clear();
     _printers.clear();
     _logCallback?.close();
-    // After pd_destroy, which has already closed every link: a close hook released
-    // while the core could still invoke it is a call into a freed trampoline.
-    for (final transport in _transports) {
-      transport.release();
-    }
+
+    // Deliberately a turn later. pd_destroy closes every link on its way out, so the
+    // last thing a custom transport's close hook ever sees is this call — and that hook
+    // is a listener, whose message is queued for this isolate rather than run on the
+    // spot. Releasing the trampoline here, synchronously, would throw that queued
+    // message away and lose the one notification an application uses to hand its
+    // CoreBluetooth peripheral or MFi session back. The core can no longer call any of
+    // them, so waiting costs nothing but the turn.
+    final transports = List<CustomTransport>.of(_transports);
     _transports.clear();
+    if (transports.isNotEmpty) {
+      Timer.run(() {
+        for (final transport in transports) {
+          transport.release();
+        }
+      });
+    }
   }
 
   Printer _internPrinter(Pointer<PdPrinter> handle) =>

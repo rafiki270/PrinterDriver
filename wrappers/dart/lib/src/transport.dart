@@ -142,6 +142,10 @@ final class CustomTransport {
   /// still be open for a moment after the core believes it closed it; on the Epson
   /// portables, whose single connection slot is exactly what a close frees, prefer a
   /// native close.
+  ///
+  /// In practice the core closes a still-connected link exactly once, on
+  /// `PrinterDriver.dispose`, so [onClose] usually runs one turn of the event loop
+  /// after that call returns.
   factory CustomTransport.withDartClose({
     required Pointer<NativeFunction<PdTransportConnectNative>> connect,
     required Pointer<NativeFunction<PdTransportWriteNative>> write,

@@ -125,13 +125,14 @@ wrappers/dotnet/
 ├── README.md                    <- this file; also packed as the NuGet readme
 ├── PrinterDriver/
 │   ├── PrinterDriver.csproj     <- net8.0, LangVersion latest, PackageId PrinterDriver
-│   ├── Enums.cs                 <- the thirteen mirrored enums
+│   ├── Enums.cs                 <- the fifteen mirrored enums
 │   ├── JobResult.cs             <- the closed Done/Failed/Unknown hierarchy
 │   ├── Model.cs                 <- JobEvent, DeviceStatus, the config records
 │   ├── Payload.cs               <- the three payload tiers and their marshalling
 │   ├── PrinterDriver.cs         <- the driver: handles, interning, disposal order
 │   ├── Printer.cs               <- print, force-reprint, status, device events
 │   ├── PrintJob.cs              <- state, events, the tri-state await
+│   ├── CustomTransport.cs       <- caller-owned links: Bluetooth and anything else
 │   ├── CallbackRoots.cs         <- GCHandle lifetime for native callbacks
 │   └── Interop/
 │       ├── NativeMethods.cs         <- P/Invoke over pd.h, and the struct layouts
@@ -142,6 +143,7 @@ wrappers/dotnet/
     ├── PayloadTierTests.cs      <- document and raster tiers
     ├── JobResultTests.cs        <- the tri-state contract, asserted structurally
     ├── EnumBridgeTests.cs       <- enums and struct layouts vs the core
+    ├── CustomTransportTests.cs  <- a scripted printer behind a C# transport
     └── CallbackLifetimeTests.cs <- forced GCs across live subscriptions
 ```
 
@@ -238,6 +240,41 @@ kitchen.Print(new Payload.Document([
 kitchen.Print(new Payload.Raster(rgba8Pixels, width, height));
 ```
 
+## Printers on a link you own
+
+Bluetooth is not in the core and should not be: on Windows it is the WinRT `Rfcomm` stack,
+on Android a `BluetoothSocket`, on Apple CoreBluetooth or ExternalAccessory — platform
+frameworks with their own permissions, pairing UI and threading. So **the platform owns the
+socket, the core owns the protocol** (`docs/compatibility-brief.md` §25). Implement three
+operations and push received bytes back in:
+
+```csharp
+sealed class SppTransport(Stream link) : IPrinterTransport
+{
+    public bool Connect() => link.CanWrite;
+    public long Write(ReadOnlySpan<byte> data) { link.Write(data); return data.Length; }
+    public void Close() => link.Dispose();
+}
+
+var handheld = driver.AddPrinterCustom(new SppTransport(stream), new CustomPrinterConfig(
+    Description: "bt-spp:00:11:22:33:44:55", ProfileId: "epson_tm_p20ii"));
+
+// The RX loop, on its own thread -- never from inside Connect/Write/Close.
+int n;
+while ((n = stream.Read(buffer)) > 0) handheld.FeedBytes(buffer.AsSpan(0, n));
+// ...and when the peer goes out of range:
+handheld.LinkDropped("out of range");
+
+await handheld.Printer.SendAsync(Payload.FromText("TABLE 14\n"));
+```
+
+The ordered fence, the `GS ( H` correlation token, preflight, the journal and the
+confidence grading all stay on the core's side, so a job over Bluetooth reports exactly what
+the same job over TCP would — grade `A`, authority `PhysicalPrinter`, method `GS(H) fn48` on
+a printer that answers. A transport cannot weaken a completion guarantee by accident,
+because it never makes one. `CustomTransportTests` proves that end to end against a scripted
+printer written in C#.
+
 ## Threading contract
 
 Straight from `pd.h`, unchanged by this wrapper:
@@ -254,6 +291,15 @@ Straight from `pd.h`, unchanged by this wrapper:
 - **A callback must not block, and must not call back into any `pd_*` function on the same
   driver.** Nothing in this wrapper's trampolines does: they write to a `Channel` and
   return.
+- **`IPrinterTransport.Connect`/`Write`/`Close`** are invoked on the core's worker thread
+  for that printer, one at a time and never concurrently with each other.
+  `CustomTransportPrinter.FeedBytes` may be called from any thread, *including while a
+  `Write` is in flight* -- that is the normal case, because a status answer arrives while
+  the next chunk goes out -- but never from inside one of the three, which is the thread
+  that would have to service the delivery. That case throws `InvalidOperationException`
+  rather than parking a worker thread on itself. An exception thrown out of a transport
+  callback is turned into the ABI's own vocabulary for failure (`false` from `Connect`, a
+  negative from `Write`): letting one unwind into a native frame terminates the process.
 - **`PrintJob.GetResultAsync`** polls `pd_job_await` with a 100 ms timeout in a loop rather
   than waiting indefinitely in one native call, so a cancelled token is noticed within one
   poll interval. `pd_job_await` has no cancellation hook, and a thread parked inside it
