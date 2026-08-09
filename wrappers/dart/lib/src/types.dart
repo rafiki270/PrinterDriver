@@ -551,3 +551,172 @@ final class RawPayload extends Payload {
     raw.size = bytes.length;
   }
 }
+
+// --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------------
+
+/// What a printer's drawer port is, and what is known about it.
+///
+/// A separate peripheral facet, not part of [DeviceStatus] and not part of the printer's
+/// own capabilities: the connector pinout, the drive voltage and the command the firmware
+/// implements are three independent facts, and none follows from anything the printer does
+/// with paper.
+final class DrawerCapabilities {
+  const DrawerCapabilities({
+    required this.present,
+    required this.portStandard,
+    required this.voltage,
+    required this.maxCurrentMa,
+    required this.channelCount,
+    required this.sensorPin,
+    required this.kickMethod,
+    required this.defaultPulseMs,
+    required this.maxPulseMs,
+    required this.cooldownMs,
+    required this.canKickDuringPrint,
+    required this.statusAvailable,
+    required this.statusMethod,
+    required this.sharedBetweenDrawers,
+    required this.sharedWithBuzzer,
+    required this.electricalProvenance,
+    required this.commandsProvenance,
+    required this.kickable,
+  });
+
+  factory DrawerCapabilities.fromNative(PdDrawerCapabilities native) =>
+      DrawerCapabilities(
+        present: native.present == 1,
+        portStandard: DrawerPortStandard.fromNative(native.standard),
+        voltage: native.voltage,
+        maxCurrentMa: native.maxCurrentMa,
+        channelCount: native.channelCount,
+        sensorPin: native.sensorPin,
+        kickMethod: DrawerKickMethod.fromNative(native.method),
+        defaultPulseMs: native.defaultPulseMs,
+        maxPulseMs: native.maxPulseMs,
+        cooldownMs: native.cooldownMs,
+        canKickDuringPrint: native.canKickDuringPrint == 1,
+        statusAvailable: native.statusAvailable == 1,
+        statusMethod: DrawerStatusMethod.fromNative(native.statusMethod),
+        sharedBetweenDrawers: native.sharedBetweenDrawers == 1,
+        sharedWithBuzzer: native.sharedWithBuzzer == 1,
+        electricalProvenance: Provenance.fromNative(native.electricalProvenance),
+        commandsProvenance: Provenance.fromNative(native.commandsProvenance),
+        kickable: native.kickable == 1,
+      );
+
+  /// This model has a drawer port at all.
+  final bool present;
+
+  /// The electrical classification. Nothing is ever fired on
+  /// [DrawerPortStandard.unknown].
+  final DrawerPortStandard portStandard;
+
+  /// Volts, or 0 where the manufacturer does not document it — not the same as "low".
+  final int voltage;
+  final int maxCurrentMa;
+  final int channelCount;
+
+  /// 3 on the Epson arrangement, 6 on Star's; 0 when unestablished.
+  final int sensorPin;
+
+  final DrawerKickMethod kickMethod;
+  final int defaultPulseMs;
+  final int maxPulseMs;
+
+  /// Held between two pulses so a retry loop cannot keep a solenoid energised.
+  final int cooldownMs;
+
+  /// False on models whose drawer output cannot fire while the mechanism prints; the
+  /// pulse is then ordered strictly behind everything already queued.
+  final bool canKickDuringPrint;
+
+  final bool statusAvailable;
+  final DrawerStatusMethod statusMethod;
+
+  /// Two drive outputs and one switch input: both channels kick independently while the
+  /// only readable fact is that *some* attached drawer is open.
+  final bool sharedBetweenDrawers;
+
+  /// With the optional external buzzer enabled, the pulse that would fire the drawer
+  /// sounds the buzzer instead. Never assume both coexist.
+  final bool sharedWithBuzzer;
+
+  /// Deliberately two columns: the XP-S260M's DC 24 V / 1 A output is in Xprinter's own
+  /// specification while nothing they publish proves the pulse command.
+  final Provenance electricalProvenance;
+  final Provenance commandsProvenance;
+
+  /// Whether this SDK may put a pulse on the wire: a method it can drive **and** an
+  /// established electrical standard. A caller that reads nothing else should read this.
+  final bool kickable;
+}
+
+/// The outcome of one opening sequence — a state, never a boolean.
+final class DrawerResult {
+  const DrawerResult({
+    required this.state,
+    required this.previousState,
+    required this.channel,
+    required this.pulseMs,
+    required this.elapsedMs,
+  });
+
+  factory DrawerResult.fromNative(PdDrawerResult native) => DrawerResult(
+        state: DrawerState.fromNative(native.state),
+        previousState: DrawerState.fromNative(native.previousState),
+        channel: native.channel,
+        pulseMs: native.pulseMs,
+        elapsedMs: native.elapsedMs,
+      );
+
+  final DrawerState state;
+  final DrawerState previousState;
+  final int channel;
+
+  /// 0 when no pulse was emitted at all: the drawer was already open, or the call was
+  /// refused.
+  final int pulseMs;
+
+  /// Pulse to verdict — the "sensor changed 143 ms after kick" number. 0 when there was
+  /// nothing to wait for.
+  final int elapsedMs;
+
+  /// The one thing worth branching on: the switch was seen changing.
+  bool get verified => state == DrawerState.openVerified;
+}
+
+/// One non-destructive read of the drawer switch.
+final class DrawerReading {
+  const DrawerReading({
+    required this.available,
+    required this.answered,
+    required this.pinHigh,
+    required this.needsCalibration,
+    required this.state,
+  });
+
+  factory DrawerReading.fromNative(PdDrawerReading native) => DrawerReading(
+        available: native.available == 1,
+        answered: native.answered == 1,
+        pinHigh: switch (native.pinHigh) { 1 => true, 0 => false, _ => null },
+        needsCalibration: native.needsCalibration == 1,
+        state: DrawerState.fromNative(native.state),
+      );
+
+  /// The profile documents a readable switch on this port.
+  final bool available;
+
+  /// The device actually replied within the timeout.
+  final bool answered;
+
+  /// The raw sense level, or null when nothing answered.
+  final bool? pinHigh;
+
+  /// True until this printer's polarity has been measured. While it is true, [state]
+  /// stays [DrawerState.unknown] however clear the level is: whether the line reads high
+  /// or low when the drawer is open depends on the drawer that is plugged in.
+  final bool needsCalibration;
+
+  /// The interpretation, where there is one.
+  final DrawerState state;
+}

@@ -132,6 +132,25 @@ Bytes gsIdentity(PrinterInfoKind kind) {
 
 Bytes dleEnq(uint8_t n) { return Bytes{kDle, kEnq, n}; }
 
+// --- M14: cash drawer (docs/cash-drawer.md §1) ------------------------------------
+
+Bytes gsDrawerStatus() { return Bytes{kGs, 0x72, 0x02}; }
+
+Bytes drawerKick(uint8_t channel, uint16_t pulse_ms) {
+  if (channel != 1 && channel != 2) {
+    throw EncodingError("ESC p channel must be 1 (drive 1) or 2 (drive 2)");
+  }
+  // 2 ms units, saturating. A caller that asks for more than 510 ms of ON time gets
+  // 510, never a wrapped byte that would silently become a 2 ms tap.
+  const uint32_t on_units = std::min<uint32_t>(pulse_ms / 2u, 255u);
+  const uint32_t off_units = std::min<uint32_t>(on_units * 2u, 255u);
+  return Bytes{kEsc, 0x70, static_cast<uint8_t>(channel - 1),
+               static_cast<uint8_t>(on_units == 0 ? 1u : on_units),
+               static_cast<uint8_t>(off_units == 0 ? 1u : off_units)};
+}
+
+// --- end M14 -----------------------------------------------------------------------
+
 Bytes gsMaintenanceCounter(uint16_t counter) {
   // GS g 2 m nL nH, m = 0.
   return Bytes{kGs, 0x67, 0x32, 0x00, static_cast<uint8_t>(counter & 0xFF),

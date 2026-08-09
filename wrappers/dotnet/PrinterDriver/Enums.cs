@@ -428,3 +428,120 @@ public enum Binarization
     /// <summary>Floyd-Steinberg error diffusion.</summary>
     FloydSteinberg = 1,
 }
+
+// --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------------
+//
+// The drawer is a separate printer peripheral: its own electrical profile, its own
+// command method, its own feedback method, none of them derivable from the others. The
+// four enums below are the closed sets that describe it.
+
+/// <summary>
+/// What is known about a cash drawer.
+/// </summary>
+/// <remarks>
+/// Deliberately not a boolean. Sending <c>ESC p</c> and watching the microswitch change
+/// are different claims, and an operator at a till needs them apart:
+/// <see cref="DrawerState.KickSentUnverified"/> is a real answer rather than a softer
+/// success. Through a cheap print server the pulse travels forward while the sensor
+/// response never comes back, and that path can only ever produce it.
+/// </remarks>
+public enum DrawerState
+{
+    /// <summary>The switch answered and, with a calibrated polarity, says the drawer is shut.</summary>
+    Closed = 0,
+
+    /// <summary>Already open. Reading this before a pulse is what stops a redundant kick.</summary>
+    Open = 1,
+
+    /// <summary>A pulse is on the wire and the verification window has not closed.</summary>
+    Opening = 2,
+
+    /// <summary>The pulse was accepted by the link and nothing can confirm what happened next.</summary>
+    KickSentUnverified = 3,
+
+    /// <summary>The switch was seen changing. The only member that claims physical movement.</summary>
+    OpenVerified = 4,
+
+    /// <summary>The pulse went out and the switch never moved: locked, jammed, wrong channel, wrong cable.</summary>
+    FailedToOpen = 5,
+
+    /// <summary>This port has no switch input wired or documented. Not an error.</summary>
+    NoSensor = 6,
+
+    /// <summary>Nothing is known — unclassified port, unsupported method, or an uncalibrated polarity.</summary>
+    Unknown = 7,
+}
+
+/// <summary>
+/// The electrical classification of a drawer port.
+/// </summary>
+/// <remarks>
+/// RJ11/RJ12-looking drawer connectors are not a universal electrical standard. Star's
+/// identical-looking 6P6C socket carries +24 V on pin 3 and the sense line on pin 6,
+/// precisely where Epson puts sense and signal ground — which is why printer-specific
+/// drawer cables exist for plugs that look the same.
+/// </remarks>
+public enum DrawerPortStandard
+{
+    /// <summary>1 FG, 2 kick 1, 3 sensor, 4 +24 V, 5 kick 2, 6 signal ground.</summary>
+    Epson24V6P6C = 0,
+
+    /// <summary>The same plug with +24 V on pin 3 and the sense line on pin 6.</summary>
+    Star24V6P6C = 1,
+
+    /// <summary>The 12 V exceptions, common on 58 mm hardware.</summary>
+    Generic12V6P6C = 2,
+
+    /// <summary>Unclassified. Nothing is ever energised on one of these.</summary>
+    Unknown = 3,
+}
+
+/// <summary>
+/// Which software path fires the drawer. Independent of the cable pinout: two printers
+/// accepting the same "kick drawer 1" command may still wire the socket differently.
+/// </summary>
+public enum DrawerKickMethod
+{
+    /// <summary><c>ESC p m t1 t2</c>, queued behind print data.</summary>
+    EpsonEscP = 0,
+
+    /// <summary>The ePOS peripheral API — never raw bytes smuggled into print XML.</summary>
+    EpsonEpos = 1,
+
+    /// <summary>StarPRNT <c>appendPeripheral(...)</c>.</summary>
+    StarPrnt = 2,
+
+    /// <summary>The Bixolon SDK's <c>makeDKout</c>.</summary>
+    BixolonSdk = 3,
+
+    /// <summary><c>ESC p</c>, with the "cannot fire while printing" serialisation quirk.</summary>
+    CitizenEscP = 4,
+
+    /// <summary><c>ESC p</c>; the realtime <c>DLE DC4</c> variant exists and is not preferred.</summary>
+    SnbcEscP = 5,
+
+    /// <summary>Documented, vendor-specific, not implemented here.</summary>
+    Vendor = 6,
+
+    /// <summary>No drawer path on this device, or none this engine may use.</summary>
+    Unsupported = 7,
+}
+
+/// <summary>How the drawer switch is read back.</summary>
+public enum DrawerStatusMethod
+{
+    /// <summary><c>GS r 2</c> / <c>GS r 50</c> — queued drawer-kick-out connector status.</summary>
+    GsR2 = 0,
+
+    /// <summary>The drawer bit inside an automatic status back frame.</summary>
+    Asb = 1,
+
+    /// <summary>Star's <c>drawerOpenCloseSignal</c>.</summary>
+    StarSignal = 2,
+
+    /// <summary>The vendor SDK's own drawer status call.</summary>
+    VendorSdk = 3,
+
+    /// <summary>No readable switch.</summary>
+    None = 4,
+}

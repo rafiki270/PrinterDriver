@@ -55,6 +55,9 @@ add_library(printerdriver_core STATIC
   core/src/escpos_encoder.cpp
   core/src/response_parser.cpp
   core/src/capability_profile.cpp
+  # M14 — the cash-drawer peripheral facet, its state machine and the persisted
+  # polarity calibration (docs/cash-drawer.md).
+  core/src/cash_drawer.cpp
   core/src/device_profiles.cpp
   core/src/identity.cpp
   core/src/capability_probe.cpp
@@ -236,7 +239,10 @@ set(printerdriver_tests
   test_star        # docs/wire-protocols.md §2: fences, counter packing, transcoding
   test_epos        # docs/wire-protocols.md §1: envelopes, parsing, spooler discipline
   test_serial      # RS-232 over a pty pair, driving the same scripted device
-  test_probe_path) # docs/compatibility-brief.md §19-§23: PRINT_SERVER_ONLY
+  test_probe_path  # docs/compatibility-brief.md §19-§23: PRINT_SERVER_ONLY
+  # M14 — docs/cash-drawer.md: the fleet's drawer facets, the state machine and the
+  # verified opening sequence against the scripted device.
+  test_drawer)
 
 foreach(test_name IN LISTS printerdriver_tests)
   add_executable(${test_name}

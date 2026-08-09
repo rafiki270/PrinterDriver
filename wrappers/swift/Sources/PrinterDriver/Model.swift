@@ -332,3 +332,135 @@ public struct DeviceStatus: Hashable, Sendable {
     }
   }
 }
+
+// MARK: - M14: cash drawer (docs/cash-drawer.md)
+
+/// What a printer's drawer port is, and what is known about it — `pd_drawer_capabilities`.
+///
+/// A separate peripheral facet, not part of ``DeviceStatus`` and not part of the printer's
+/// own capabilities: the connector pinout, the drive voltage and the command the firmware
+/// implements are three independent facts, and none of them follows from anything the
+/// printer does with paper.
+public struct DrawerCapabilities: Hashable, Sendable {
+  /// This model has a drawer port at all.
+  public let isPresent: Bool
+
+  /// The electrical classification. Nothing is ever fired on ``DrawerPortStandard/unknown``.
+  public let portStandard: DrawerPortStandard
+
+  /// Volts, or 0 where the manufacturer does not document it — which is not the same as
+  /// "low".
+  public let voltage: UInt16
+  public let maxCurrentMilliamps: UInt16
+  public let channelCount: UInt8
+
+  /// 3 on the Epson arrangement, 6 on Star's. 0 when nobody has established it.
+  public let sensorPin: UInt8
+
+  public let kickMethod: DrawerKickMethod
+  public let defaultPulseMilliseconds: UInt16
+  public let maxPulseMilliseconds: UInt16
+
+  /// Held between two pulses so a retry loop cannot keep a solenoid energised.
+  public let cooldownMilliseconds: UInt16
+
+  /// False on the models whose drawer output cannot fire while the mechanism prints; the
+  /// pulse is then ordered strictly behind everything already queued.
+  public let canKickDuringPrint: Bool
+
+  public let isStatusAvailable: Bool
+  public let statusMethod: DrawerStatusMethod
+
+  /// Two drive outputs and one switch input: both channels kick independently while the
+  /// only readable fact is that *some* attached drawer is open.
+  public let isStatusSharedBetweenDrawers: Bool
+
+  /// Epson documents that with the optional external buzzer enabled, the pulse that would
+  /// fire the drawer sounds the buzzer instead. Never assume both coexist.
+  public let isPortSharedWithBuzzer: Bool
+
+  /// Deliberately two columns. The XP-S260M's DC 24 V / 1 A drawer output is in Xprinter's
+  /// own specification while nothing they publish proves the pulse command, and collapsing
+  /// those into one flag is the mistake the provenance system exists to prevent.
+  public let electricalProvenance: Provenance
+  public let commandsProvenance: Provenance
+
+  /// Whether this SDK may put a pulse on the wire: a method it can drive **and** an
+  /// established electrical standard. A caller that reads nothing else should read this.
+  public let isKickable: Bool
+
+  init(_ caps: pd_drawer_capabilities) {
+    isPresent = caps.present == PD_TRUE
+    portStandard = DrawerPortStandard(bridging: caps.standard.rawValue)
+    voltage = caps.voltage
+    maxCurrentMilliamps = caps.max_current_ma
+    channelCount = caps.channel_count
+    sensorPin = caps.sensor_pin
+    kickMethod = DrawerKickMethod(bridging: caps.method.rawValue)
+    defaultPulseMilliseconds = caps.default_pulse_ms
+    maxPulseMilliseconds = caps.max_pulse_ms
+    cooldownMilliseconds = caps.cooldown_ms
+    canKickDuringPrint = caps.can_kick_during_print == PD_TRUE
+    isStatusAvailable = caps.status_available == PD_TRUE
+    statusMethod = DrawerStatusMethod(bridging: caps.status_method.rawValue)
+    isStatusSharedBetweenDrawers = caps.shared_between_drawers == PD_TRUE
+    isPortSharedWithBuzzer = caps.shared_with_buzzer == PD_TRUE
+    electricalProvenance = Provenance(bridging: caps.electrical_provenance.rawValue)
+    commandsProvenance = Provenance(bridging: caps.commands_provenance.rawValue)
+    isKickable = caps.kickable == PD_TRUE
+  }
+}
+
+/// The outcome of one opening sequence — `pd_drawer_result`.
+///
+/// A state and never a boolean. ``elapsedMilliseconds`` is the interval between the pulse
+/// leaving for the link and the verdict — the "sensor changed 143 ms after kick" number —
+/// and is 0 when there was nothing to wait for. ``pulseMilliseconds`` is 0 when no pulse
+/// was emitted at all, which happens both when the drawer was already open and when the
+/// call was refused.
+public struct DrawerResult: Hashable, Sendable {
+  public let state: DrawerState
+  public let previousState: DrawerState
+  public let channel: UInt8
+  public let pulseMilliseconds: UInt16
+  public let elapsedMilliseconds: UInt32
+
+  /// The one thing worth branching on: the switch was seen changing.
+  public var isVerified: Bool { state == .openVerified }
+
+  init(_ result: pd_drawer_result) {
+    state = DrawerState(bridging: result.state.rawValue)
+    previousState = DrawerState(bridging: result.previous_state.rawValue)
+    channel = result.channel
+    pulseMilliseconds = result.pulse_ms
+    elapsedMilliseconds = result.elapsed_ms
+  }
+}
+
+/// One non-destructive read of the drawer switch — `pd_drawer_reading`.
+///
+/// ``pinHigh`` is the raw fact and ``state`` is the interpretation. While
+/// ``needsCalibration`` is true there is no interpretation: Star documents that whether
+/// the sense line reads high or low when the drawer is open depends on the drawer that is
+/// plugged in, so this SDK measures it once and persists it instead of assuming.
+public struct DrawerReading: Hashable, Sendable {
+  /// The profile documents a readable switch on this port.
+  public let isAvailable: Bool
+  /// The device actually replied within the timeout.
+  public let didAnswer: Bool
+  public let pinHigh: Bool?
+  public let needsCalibration: Bool
+  public let state: DrawerState
+
+  init(_ reading: pd_drawer_reading) {
+    isAvailable = reading.available == PD_TRUE
+    didAnswer = reading.answered == PD_TRUE
+    switch reading.pin_high {
+    case PD_TRUE: pinHigh = true
+    case PD_FALSE: pinHigh = false
+    default: pinHigh = nil
+    }
+    needsCalibration = reading.needs_calibration == PD_TRUE
+    state = DrawerState(bridging: reading.state.rawValue)
+  }
+}

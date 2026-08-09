@@ -740,6 +740,133 @@ JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_openCashDraw
   }
 }
 
+// --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------------
+//
+// Packed as flat int arrays, exactly like pd_device_status above: the JNI boundary carries
+// numbers and the Kotlin side names them (JobModels.kt). `pin_high` keeps the ABI's
+// tri-state (-1 = PD_UNKNOWN) rather than being flattened, because "the switch did not
+// answer" and "the switch reads low" are different facts.
+
+JNIEXPORT jintArray JNICALL Java_com_printerdriver_internal_NativeBridge_drawerCapabilities(
+    JNIEnv* env, jclass, jlong printerHandle) {
+  pd_printer* printer = AsPrinter(printerHandle);
+  pd_drawer_capabilities caps{};
+  if (printer != nullptr) {
+    caps = pd_printer_drawer_capabilities(printer);
+  } else {
+    // The safe answer for a handle that is not there: no port, unsupported, unclassified.
+    caps.standard = PD_DRAWER_PORT_UNKNOWN;
+    caps.method = PD_DRAWER_KICK_UNSUPPORTED;
+    caps.status_method = PD_DRAWER_STATUS_NONE;
+  }
+  const jint values[18] = {
+      static_cast<jint>(caps.present),
+      static_cast<jint>(caps.standard),
+      static_cast<jint>(caps.voltage),
+      static_cast<jint>(caps.max_current_ma),
+      static_cast<jint>(caps.channel_count),
+      static_cast<jint>(caps.sensor_pin),
+      static_cast<jint>(caps.method),
+      static_cast<jint>(caps.default_pulse_ms),
+      static_cast<jint>(caps.max_pulse_ms),
+      static_cast<jint>(caps.cooldown_ms),
+      static_cast<jint>(caps.can_kick_during_print),
+      static_cast<jint>(caps.status_available),
+      static_cast<jint>(caps.status_method),
+      static_cast<jint>(caps.shared_between_drawers),
+      static_cast<jint>(caps.shared_with_buzzer),
+      static_cast<jint>(caps.electrical_provenance),
+      static_cast<jint>(caps.commands_provenance),
+      static_cast<jint>(caps.kickable)};
+  jintArray result = env->NewIntArray(18);
+  if (result != nullptr) {
+    env->SetIntArrayRegion(result, 0, 18, values);
+  }
+  return result;
+}
+
+JNIEXPORT jintArray JNICALL Java_com_printerdriver_internal_NativeBridge_drawerOpen(
+    JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jint channel,
+    jint pulseMs) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  pd_drawer_result outcome{};
+  outcome.state = PD_DRAWER_UNKNOWN;
+  outcome.previous_state = PD_DRAWER_UNKNOWN;
+  outcome.channel = 1;
+  if (handle != nullptr && printer != nullptr) {
+    pd_drawer_request request{};
+    request.channel = static_cast<uint8_t>(channel);
+    request.pulse_ms = static_cast<uint16_t>(pulseMs);
+    outcome = pd_drawer_open(handle->driver, printer, &request);
+  }
+  const jint values[5] = {
+      static_cast<jint>(outcome.state), static_cast<jint>(outcome.previous_state),
+      static_cast<jint>(outcome.channel), static_cast<jint>(outcome.pulse_ms),
+      static_cast<jint>(outcome.elapsed_ms)};
+  jintArray result = env->NewIntArray(5);
+  if (result != nullptr) {
+    env->SetIntArrayRegion(result, 0, 5, values);
+  }
+  return result;
+}
+
+JNIEXPORT jintArray JNICALL Java_com_printerdriver_internal_NativeBridge_drawerReadSensor(
+    JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jint timeoutMs) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  pd_drawer_reading reading{};
+  reading.pin_high = PD_UNKNOWN;
+  reading.needs_calibration = PD_TRUE;
+  reading.state = PD_DRAWER_UNKNOWN;
+  if (handle != nullptr && printer != nullptr) {
+    reading = pd_drawer_read_sensor(handle->driver, printer,
+                                    static_cast<uint32_t>(timeoutMs));
+  }
+  const jint values[5] = {
+      static_cast<jint>(reading.available), static_cast<jint>(reading.answered),
+      static_cast<jint>(reading.pin_high), static_cast<jint>(reading.needs_calibration),
+      static_cast<jint>(reading.state)};
+  jintArray result = env->NewIntArray(5);
+  if (result != nullptr) {
+    env->SetIntArrayRegion(result, 0, 5, values);
+  }
+  return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_printerdriver_internal_NativeBridge_drawerCalibratePolarity(
+    JNIEnv*, jclass, jlong driverHandle, jlong printerHandle, jboolean highMeansOpen) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr) {
+    return 0;
+  }
+  return pd_drawer_calibrate_polarity(handle->driver, printer,
+                                      highMeansOpen != JNI_FALSE ? 1 : 0);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_printerdriver_internal_NativeBridge_drawerPolarityCalibrated(
+    JNIEnv*, jclass, jlong driverHandle, jlong printerHandle) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr) {
+    return 0;
+  }
+  return pd_drawer_polarity_calibrated(handle->driver, printer);
+}
+
+JNIEXPORT jint JNICALL Java_com_printerdriver_internal_NativeBridge_drawerHighMeansOpen(
+    JNIEnv*, jclass, jlong driverHandle, jlong printerHandle) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr) {
+    return 0;
+  }
+  return pd_drawer_high_means_open(handle->driver, printer);
+}
+
 JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_printerDrain(
     JNIEnv*, jclass, jlong driverHandle, jlong printerHandle) {
   JniDriverHandle* handle = AsDriverHandle(driverHandle);

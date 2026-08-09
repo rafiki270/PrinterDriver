@@ -28,6 +28,19 @@ extern "C" {
  *   "silent"   — accepts bytes, never answers the completion marker: jobs end Unknown.
  *   "paperout" — reports paper out, so strict preflight refuses before any payload byte.
  *   "refuse"   — the connection itself fails.
+ *
+ * M14 — docs/cash-drawer.md. A drawer is a solenoid latch plus a microswitch, and each
+ * id below holds one of the document's cases still:
+ *   "drawer"              — documented Epson-style 24 V port, working switch, polarity
+ *                           already calibrated. The whole sequence reaches
+ *                           PD_DRAWER_OPEN_VERIFIED.
+ *   "drawer-uncalibrated" — the same hardware before anybody measured which level
+ *                           means open, so a reading carries the needs-calibration
+ *                           marker instead of a state.
+ *   "drawer-locked"       — the pulse goes out and the switch never moves:
+ *                           PD_DRAWER_FAILED_TO_OPEN.
+ *   "drawer-unknown-port" — an unclassified 6P6C socket. Every pulse is refused with
+ *                           zero bytes written.
  * Returns NULL for an unknown id.
  */
 pd_printer* pd_add_printer_scripted(pd_driver* driver, const char* printer_id,
@@ -37,6 +50,12 @@ pd_printer* pd_add_printer_scripted(pd_driver* driver, const char* printer_id,
 size_t pd_test_print_data_bytes(pd_printer* printer);
 size_t pd_test_cuts(pd_printer* printer);
 int pd_test_received_contains(pd_printer* printer, const char* needle);
+
+/* M14. Pulses that reached the device, the microswitch's position, and an operator's
+ * hand moving the drawer without the printer's help. */
+size_t pd_test_drawer_kicks(pd_printer* printer);
+int pd_test_drawer_is_open(pd_printer* printer);
+void pd_test_set_drawer_open(pd_printer* printer, int open);
 
 /* --- Scripted link behind a caller-supplied transport vtable ---------------------- */
 
@@ -99,7 +118,12 @@ typedef enum pd_test_enum {
   PD_TEST_ENUM_BINARIZATION = 12,
   PD_TEST_ENUM_CONFIDENCE_GRADE = 13,
   PD_TEST_ENUM_COMPLETION_AUTHORITY = 14,
-  PD_TEST_ENUM_TOTAL = 15
+  /* M14 — docs/cash-drawer.md. */
+  PD_TEST_ENUM_DRAWER_STATE = 15,
+  PD_TEST_ENUM_DRAWER_PORT_STANDARD = 16,
+  PD_TEST_ENUM_DRAWER_KICK_METHOD = 17,
+  PD_TEST_ENUM_DRAWER_STATUS_METHOD = 18,
+  PD_TEST_ENUM_TOTAL = 19
 } pd_test_enum;
 
 /* Number of members the C++ enum has, straight from the core's kAll* arrays or from a

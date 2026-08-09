@@ -156,3 +156,134 @@ data class ReprintOptions(
     val job: JobOptions = JobOptions(),
     val banner: Boolean = true
 )
+
+// --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------------
+
+/**
+ * What a printer's drawer port is, and what is known about it (pd_drawer_capabilities).
+ *
+ * A separate peripheral facet, not part of [DeviceStatus] and not part of the printer's
+ * own capabilities: the connector pinout, the drive voltage and the command the firmware
+ * implements are three independent facts, and none follows from anything the printer does
+ * with paper.
+ */
+data class DrawerCapabilities(
+    /** This model has a drawer port at all. */
+    val present: Boolean,
+    /** The electrical classification. Nothing is ever fired on
+     *  [DrawerPortStandard.UNKNOWN]. */
+    val portStandard: DrawerPortStandard,
+    /** Volts, or 0 where the manufacturer does not document it -- not the same as "low". */
+    val voltage: Int,
+    val maxCurrentMa: Int,
+    val channelCount: Int,
+    /** 3 on the Epson arrangement, 6 on Star's; 0 when unestablished. */
+    val sensorPin: Int,
+    val kickMethod: DrawerKickMethod,
+    val defaultPulseMs: Int,
+    val maxPulseMs: Int,
+    /** Held between two pulses so a retry loop cannot keep a solenoid energised. */
+    val cooldownMs: Int,
+    /** False on models whose drawer output cannot fire while the mechanism prints; the
+     *  pulse is then ordered strictly behind everything already queued. */
+    val canKickDuringPrint: Boolean,
+    val statusAvailable: Boolean,
+    val statusMethod: DrawerStatusMethod,
+    /** Two drive outputs and one switch input: both channels kick independently while
+     *  the only readable fact is that *some* attached drawer is open. */
+    val sharedBetweenDrawers: Boolean,
+    /** With the optional external buzzer enabled, the pulse that would fire the drawer
+     *  sounds the buzzer instead. Never assume both coexist. */
+    val sharedWithBuzzer: Boolean,
+    /** Deliberately two columns: a documented 24 V port can sit beside an unproven pulse
+     *  command, and the XP-S260M is exactly that case. */
+    val electricalProvenance: Provenance,
+    val commandsProvenance: Provenance,
+    /** Whether this SDK may put a pulse on the wire: a method it can drive **and** an
+     *  established electrical standard. A caller that reads nothing else reads this. */
+    val kickable: Boolean
+) {
+    internal companion object {
+        /** Builds one from the 18-element int array NativeBridge.drawerCapabilities
+         *  returns, in the exact field order pd_drawer_capabilities declares them. */
+        fun fromRaw(raw: IntArray): DrawerCapabilities {
+            require(raw.size == 18) { "expected 18 pd_drawer_capabilities fields, got ${raw.size}" }
+            return DrawerCapabilities(
+                present = raw[0] != 0,
+                portStandard = DrawerPortStandard.fromRaw(raw[1]),
+                voltage = raw[2],
+                maxCurrentMa = raw[3],
+                channelCount = raw[4],
+                sensorPin = raw[5],
+                kickMethod = DrawerKickMethod.fromRaw(raw[6]),
+                defaultPulseMs = raw[7],
+                maxPulseMs = raw[8],
+                cooldownMs = raw[9],
+                canKickDuringPrint = raw[10] != 0,
+                statusAvailable = raw[11] != 0,
+                statusMethod = DrawerStatusMethod.fromRaw(raw[12]),
+                sharedBetweenDrawers = raw[13] != 0,
+                sharedWithBuzzer = raw[14] != 0,
+                electricalProvenance = Provenance.fromRaw(raw[15]),
+                commandsProvenance = Provenance.fromRaw(raw[16]),
+                kickable = raw[17] != 0
+            )
+        }
+    }
+}
+
+/** The outcome of one opening sequence (pd_drawer_result) -- a state, never a boolean. */
+data class DrawerResult(
+    val state: DrawerState,
+    val previousState: DrawerState,
+    val channel: Int,
+    /** 0 when no pulse was emitted at all: already open, or refused. */
+    val pulseMs: Int,
+    /** Pulse to verdict -- the "sensor changed 143 ms after kick" number. */
+    val elapsedMs: Int
+) {
+    /** The one thing worth branching on: the switch was seen changing. */
+    val verified: Boolean get() = state == DrawerState.OPEN_VERIFIED
+
+    internal companion object {
+        fun fromRaw(raw: IntArray): DrawerResult {
+            require(raw.size == 5) { "expected 5 pd_drawer_result fields, got ${raw.size}" }
+            return DrawerResult(
+                state = DrawerState.fromRaw(raw[0]),
+                previousState = DrawerState.fromRaw(raw[1]),
+                channel = raw[2],
+                pulseMs = raw[3],
+                elapsedMs = raw[4]
+            )
+        }
+    }
+}
+
+/** One non-destructive read of the drawer switch (pd_drawer_reading). */
+data class DrawerReading(
+    /** The profile documents a readable switch on this port. */
+    val available: Boolean,
+    /** The device actually replied within the timeout. */
+    val answered: Boolean,
+    /** The raw sense level, or null when nothing answered. */
+    val pinHigh: Boolean?,
+    /** True until this printer's polarity has been measured. While it is true, [state]
+     *  stays [DrawerState.UNKNOWN] however clear the level is: whether the line reads
+     *  high or low when the drawer is open depends on the drawer that is plugged in. */
+    val needsCalibration: Boolean,
+    /** The interpretation, where there is one. */
+    val state: DrawerState
+) {
+    internal companion object {
+        fun fromRaw(raw: IntArray): DrawerReading {
+            require(raw.size == 5) { "expected 5 pd_drawer_reading fields, got ${raw.size}" }
+            return DrawerReading(
+                available = raw[0] != 0,
+                answered = raw[1] != 0,
+                pinHigh = if (raw[2] < 0) null else raw[2] != 0,
+                needsCalibration = raw[3] != 0,
+                state = DrawerState.fromRaw(raw[4])
+            )
+        }
+    }
+}

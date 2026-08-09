@@ -555,6 +555,14 @@ HttpResponse Agent::handle(const HttpRequest& request) {
     if (path.size() == 3 && path[2] == "status" && method == "GET") {
       return getPrinterStatus(path[1], request);
     }
+    // M14 — docs/cash-drawer.md. POST because it energises a solenoid; the answer is a
+    // drawer state and never a boolean.
+    if (path.size() == 3 && path[2] == "drawer") {
+      if (method != "POST") {
+        return fail(405, "method not allowed", method);
+      }
+      return postPrinterDrawer(path[1], request);
+    }
     return fail(404, "not found", request.path);
   }
   // --- M13b: CloudPRNT (docs/wire-protocols.md §2) -------------------------------------
@@ -711,6 +719,158 @@ HttpResponse Agent::postPrinters(const HttpRequest& request) {
     return fail(500, "printer vanished after being added");
   }
   return ok(201, printerJson(*entry));
+}
+
+// --- M14: cash drawer (docs/cash-drawer.md) ----------------------------------------------
+//
+// The endpoint answers with the same honesty the C++ and C surfaces do, because it is
+// the same call underneath. Three things it deliberately does not do:
+//
+//   - it never reports `{ "opened": true }`. `state` is one of the eight members of the
+//     drawer state machine, and KICK_SENT_UNVERIFIED is a real answer rather than a
+//     softer success — through a print server the pulse travels forward while the
+//     sensor response does not come back, and an operator needs those apart;
+//   - it never fires an unclassified port. A 6P6C socket nobody has classified is
+//     refused with 409 and zero bytes written, which is the giant-letters rule of the
+//     document expressed as a status code;
+//   - it never guesses a polarity. Until the switch has been calibrated on this
+//     printer, `needsCalibration` is true and the state stays UNKNOWN.
+
+namespace {
+
+// SCREAMING_SNAKE on the wire, matching the document's own spelling of the states
+// ("OPEN_VERIFIED", "KICK_SENT_UNVERIFIED") rather than the core's CamelCase.
+const char* drawerStateWire(DrawerState state) {
+  switch (state) {
+    case DrawerState::Closed: return "CLOSED";
+    case DrawerState::Open: return "OPEN";
+    case DrawerState::Opening: return "OPENING";
+    case DrawerState::KickSentUnverified: return "KICK_SENT_UNVERIFIED";
+    case DrawerState::OpenVerified: return "OPEN_VERIFIED";
+    case DrawerState::FailedToOpen: return "FAILED_TO_OPEN";
+    case DrawerState::NoSensor: return "NO_SENSOR";
+    case DrawerState::Unknown: return "UNKNOWN";
+  }
+  return "UNKNOWN";
+}
+
+Json drawerCapabilitiesJson(const DrawerCapabilities& drawer) {
+  Json electrical = Json::object({});
+  electrical.set("standard", Json::string(to_string(drawer.electrical.standard)));
+  electrical.set("voltage", Json::number(drawer.electrical.voltage));
+  electrical.set("maxCurrentMa", Json::number(drawer.electrical.max_current_ma));
+  electrical.set("channels", Json::number(drawer.electrical.channel_count));
+  electrical.set("sensorPin", Json::number(drawer.electrical.sensor_pin));
+
+  Json kick = Json::object({});
+  kick.set("method", Json::string(to_string(drawer.kick.method)));
+  kick.set("defaultPulseMs", Json::number(drawer.kick.default_pulse_ms));
+  kick.set("maxPulseMs", Json::number(drawer.kick.max_pulse_ms));
+  kick.set("cooldownMs", Json::number(drawer.kick.cooldown_ms));
+  kick.set("canKickDuringPrint", Json::boolean(drawer.kick.can_kick_during_print));
+
+  Json status = Json::object({});
+  status.set("available", Json::boolean(drawer.status.available));
+  status.set("method", Json::string(to_string(drawer.status.method)));
+  status.set("sharedBetweenDrawers",
+             Json::boolean(drawer.status.shared_between_drawers));
+  status.set("calibrated", Json::boolean(drawer.status.polarity.calibrated));
+  status.set("highMeansOpen", Json::boolean(drawer.status.polarity.high_means_open));
+
+  Json evidence = Json::object({});
+  // Two columns, never one flag: the XP-S260M's 24 V / 1 A output is documented while
+  // nothing published proves its pulse command.
+  evidence.set("electrical", Json::string(to_string(drawer.evidence.electrical)));
+  evidence.set("commands", Json::string(to_string(drawer.evidence.commands)));
+  evidence.set("documented", Json::boolean(drawer.evidence.documented()));
+  evidence.set("probed", Json::boolean(drawer.evidence.probed()));
+
+  Json out = Json::object({});
+  out.set("present", Json::boolean(drawer.present));
+  out.set("kickable", Json::boolean(drawer.kickable()));
+  out.set("electrical", std::move(electrical));
+  out.set("kick", std::move(kick));
+  out.set("status", std::move(status));
+  Json port = Json::object({});
+  port.set("sharedWithBuzzer", Json::boolean(drawer.port.shared_with_buzzer));
+  out.set("port", std::move(port));
+  out.set("evidence", std::move(evidence));
+  if (!drawer.note.empty()) {
+    out.set("note", Json::string(drawer.note));
+  }
+  return out;
+}
+
+}  // namespace
+
+HttpResponse Agent::postPrinterDrawer(const std::string& id, const HttpRequest& request) {
+  std::shared_ptr<Printer> printer = lookup(id);
+  if (!printer) {
+    return fail(404, "unknown printer", id);
+  }
+
+  DrawerRequest wanted;
+  const std::string body = trimmed(request.body);
+  if (!body.empty()) {
+    Json json;
+    std::string parse_error;
+    if (!dsl::tryParseJson(body, &json, &parse_error)) {
+      return fail(400, "malformed JSON", parse_error);
+    }
+    if (!json.isObject()) {
+      return fail(400, "body must be a JSON object");
+    }
+    if (const Json* channel = json.find("channel"); channel != nullptr) {
+      if (!channel->isNumber() || channel->asInt() < 1 || channel->asInt() > 255) {
+        return fail(400, "channel must be 1 or 2");
+      }
+      wanted.channel = static_cast<uint8_t>(channel->asInt());
+    }
+    if (const Json* pulse = json.find("pulseMs"); pulse != nullptr) {
+      if (!pulse->isNumber() || pulse->asInt() < 1 || pulse->asInt() > 5000) {
+        return fail(400, "pulseMs must be 1..5000");
+      }
+      wanted.pulse_ms = static_cast<uint16_t>(pulse->asInt());
+    }
+  }
+
+  const DrawerCapabilities caps = printer->drawerCapabilities();
+  if (!caps.kickable()) {
+    // Refused before a byte is written. 409 rather than 400 because nothing about the
+    // request is wrong — the hardware, or what is known about it, is what forbids this.
+    Json out = Json::object({});
+    out.set("error", Json::string(
+        !caps.present
+            ? "this printer has no drawer port"
+            : (!caps.electricalKnown()
+                   ? "the drawer port's electrical standard is unknown: "
+                     "RJ11/RJ12-looking connectors are not a universal standard, and "
+                     "an unclassified port is never energised"
+                   : "this drawer's kick method is not one this engine drives")));
+    out.set("printerId", Json::string(printer->id()));
+    out.set("drawer", drawerCapabilitiesJson(caps));
+    return ok(409, out);
+  }
+
+  const DrawerOpenResult result = printer->openDrawer(wanted);
+
+  Json out = Json::object({});
+  out.set("printerId", Json::string(printer->id()));
+  out.set("state", Json::string(drawerStateWire(result.state)));
+  out.set("previousState", Json::string(drawerStateWire(result.previous_state)));
+  out.set("channel", Json::number(result.channel));
+  out.set("pulseMs", Json::number(result.pulse_ms));
+  out.set("elapsedMs", Json::number(result.elapsed_ms));
+  // The two facts a caller has to be able to branch on without parsing prose.
+  out.set("verified", Json::boolean(result.state == DrawerState::OpenVerified));
+  out.set("needsCalibration",
+          Json::boolean(!printer->drawerPolarity().calibrated));
+  out.set("drawer", drawerCapabilitiesJson(printer->drawerCapabilities()));
+
+  // 200 for a settled answer, 202 for one nothing could confirm — the same split
+  // POST /jobs uses between a completed job and a fence still outstanding.
+  const int status = result.state == DrawerState::KickSentUnverified ? 202 : 200;
+  return ok(status, out);
 }
 
 // --- Jobs --------------------------------------------------------------------------------

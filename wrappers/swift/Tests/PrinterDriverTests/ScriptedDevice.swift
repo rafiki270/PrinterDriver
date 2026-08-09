@@ -20,6 +20,19 @@ enum ScriptedDevice: String {
   case paperOut = "paperout"
   /// The connection itself fails.
   case refusesConnection = "refuse"
+
+  // M14 — docs/cash-drawer.md. A drawer is a solenoid latch plus a microswitch, and
+  // each of these holds one of that document's cases still.
+
+  /// Documented Epson-style 24 V port, working switch, polarity already calibrated.
+  case drawer = "drawer"
+  /// The same hardware before anybody has measured which level means open.
+  case drawerUncalibrated = "drawer-uncalibrated"
+  /// The pulse goes out and the switch never moves: a locked drawer, a jam, a wrong
+  /// channel, or a cable that fits and is not wired for this printer.
+  case drawerLocked = "drawer-locked"
+  /// An unclassified 6P6C socket. Every pulse is refused with zero bytes written.
+  case drawerUnknownPort = "drawer-unknown-port"
 }
 
 extension PrinterDriver {
@@ -42,6 +55,19 @@ extension Printer {
   /// Whether the byte stream it received contains `needle`.
   func scriptedReceivedContains(_ needle: String) -> Bool {
     pd_test_received_contains(handle, needle) != 0
+  }
+
+  /// M14. How many `ESC p` pulses actually reached the device — the number a refusal
+  /// test has to watch stay at zero.
+  var scriptedDrawerKicks: Int { pd_test_drawer_kicks(handle) }
+
+  /// M14. Where the scripted microswitch currently sits.
+  var scriptedDrawerIsOpen: Bool { pd_test_drawer_is_open(handle) != 0 }
+
+  /// M14. An operator's hand: moves the drawer without going through the printer, which
+  /// is what the non-destructive polarity calibration asks for.
+  func scriptedSetDrawerOpen(_ open: Bool) {
+    pd_test_set_drawer_open(handle, open ? 1 : 0)
   }
 }
 

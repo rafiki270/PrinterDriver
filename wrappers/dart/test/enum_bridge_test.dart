@@ -81,6 +81,15 @@ void main() {
           .where((v) => v != ConfidenceGrade.unrecognized);
       final authorities = CompletionAuthority.values
           .where((v) => v != CompletionAuthority.unrecognized);
+      // M14 — docs/cash-drawer.md.
+      final drawerStates =
+          DrawerState.values.where((v) => v != DrawerState.unrecognized);
+      final drawerPorts = DrawerPortStandard.values
+          .where((v) => v != DrawerPortStandard.unrecognized);
+      final drawerKicks = DrawerKickMethod.values
+          .where((v) => v != DrawerKickMethod.unrecognized);
+      final drawerStatuses = DrawerStatusMethod.values
+          .where((v) => v != DrawerStatusMethod.unrecognized);
 
       mirrors = <_Mirror>[
         _Mirror(PdTestEnum.jobState, JobState.nativeCount,
@@ -135,6 +144,32 @@ void main() {
         _Mirror(PdTestEnum.completionAuthority, CompletionAuthority.nativeCount,
             authorities.map((v) => v.nativeValue).toList(),
             expectedNames: _coreSpelling(authorities.map((v) => v.name))),
+        // M14. The Dart names are the core's with a lower-case first letter everywhere
+        // except the two the C constants forced — Epson24V6P6C and GsR2 — which is why
+        // those two spell their expectation out.
+        _Mirror(PdTestEnum.drawerState, DrawerState.nativeCount,
+            drawerStates.map((v) => v.nativeValue).toList(),
+            expectedNames: _coreSpelling(drawerStates.map((v) => v.name))),
+        _Mirror(PdTestEnum.drawerPortStandard, DrawerPortStandard.nativeCount,
+            drawerPorts.map((v) => v.nativeValue).toList(),
+            expectedNames: const <String>[
+              'Epson24V6P6C',
+              'Star24V6P6C',
+              'Generic12V6P6C',
+              'Unknown',
+            ]),
+        _Mirror(PdTestEnum.drawerKickMethod, DrawerKickMethod.nativeCount,
+            drawerKicks.map((v) => v.nativeValue).toList(),
+            expectedNames: _coreSpelling(drawerKicks.map((v) => v.name))),
+        _Mirror(PdTestEnum.drawerStatusMethod, DrawerStatusMethod.nativeCount,
+            drawerStatuses.map((v) => v.nativeValue).toList(),
+            expectedNames: const <String>[
+              'GsR2',
+              'Asb',
+              'StarSignal',
+              'VendorSdk',
+              'None',
+            ]),
       ];
 
       namers = <PdTestEnum, Pointer<Char> Function(int)>{
@@ -148,6 +183,10 @@ void main() {
         PdTestEnum.cutVariant: bindings.cutVariantName,
         PdTestEnum.confidenceGrade: bindings.confidenceGradeName,
         PdTestEnum.completionAuthority: bindings.completionAuthorityName,
+        PdTestEnum.drawerState: bindings.drawerStateName,
+        PdTestEnum.drawerPortStandard: bindings.drawerPortStandardName,
+        PdTestEnum.drawerKickMethod: bindings.drawerKickMethodName,
+        PdTestEnum.drawerStatusMethod: bindings.drawerStatusMethodName,
       };
     });
 
@@ -260,6 +299,17 @@ void main() {
           Provenance.unrecognized);
       expect(CommandLanguage.fromNative(CommandLanguage.nativeCount),
           CommandLanguage.unrecognized);
+      // M14. Every drawer substitution has to be the one that claims least: an
+      // unrecognized state cannot become a verified open, and an unrecognized port
+      // cannot become a fireable one.
+      expect(DrawerState.fromNative(DrawerState.nativeCount),
+          DrawerState.unrecognized);
+      expect(DrawerPortStandard.fromNative(-9),
+          DrawerPortStandard.unrecognized);
+      expect(DrawerKickMethod.fromNative(DrawerKickMethod.nativeCount),
+          DrawerKickMethod.unrecognized);
+      expect(DrawerStatusMethod.fromNative(DrawerStatusMethod.nativeCount),
+          DrawerStatusMethod.unrecognized);
 
       // And it cannot be handed back to the ABI as if it were a real member.
       final arena = Arena();

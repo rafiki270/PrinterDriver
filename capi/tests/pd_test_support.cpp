@@ -78,6 +78,29 @@ extern "C" pd_printer* pd_add_printer_scripted(pd_driver* driver, const char* pr
     // The transport itself never connects.
     profile = pdfake::fastProfile(pd::CompletionMechanism::GsParenH);
     link.behaviour.connect_fails = true;
+  } else if (id == "drawer") {
+    // M14. A documented Epson-style 24 V port with a working switch, so the wrappers
+    // can drive the whole opening sequence and see OPEN_VERIFIED come back.
+    profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+    profile.drawer.status.polarity.calibrated = true;
+    profile.drawer.status.polarity.high_means_open = true;
+  } else if (id == "drawer-uncalibrated") {
+    // The same hardware before anybody has measured which level means open.
+    profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+  } else if (id == "drawer-locked") {
+    // The pulse goes out and the switch never moves: a locked drawer, a jam, a wrong
+    // channel or a cable that fits and is not wired for this printer.
+    profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+    profile.drawer.status.polarity.calibrated = true;
+    profile.drawer.status.polarity.high_means_open = true;
+    pdfake::Script script;
+    script.drawer_opens_on_kick = false;
+    link.device->setScript(script);
+  } else if (id == "drawer-unknown-port") {
+    // An unclassified 6P6C socket. Nothing here is fired, however healthy the rest of
+    // the printer looks — docs/cash-drawer.md's giant-letters rule.
+    profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
+    profile.drawer.electrical.standard = pd::DrawerPortStandard::Unknown;
   } else {
     return nullptr;
   }
@@ -119,6 +142,27 @@ extern "C" int pd_test_received_contains(pd_printer* printer, const char* needle
   }
   const std::shared_ptr<pdfake::FakePrinter> device = lookupDevice(printer);
   return device && device->receivedContains(needle) ? 1 : 0;
+}
+
+// M14. How many ESC p pulses actually reached the device, which is the number a
+// refusal test has to see stay at zero.
+extern "C" size_t pd_test_drawer_kicks(pd_printer* printer) {
+  const std::shared_ptr<pdfake::FakePrinter> device = lookupDevice(printer);
+  return device ? device->drawerKicks() : 0;
+}
+
+extern "C" int pd_test_drawer_is_open(pd_printer* printer) {
+  const std::shared_ptr<pdfake::FakePrinter> device = lookupDevice(printer);
+  return device && device->drawerOpen() ? 1 : 0;
+}
+
+// Moves the physical drawer without going through the printer — an operator's hand,
+// which is what the non-destructive polarity calibration asks for.
+extern "C" void pd_test_set_drawer_open(pd_printer* printer, int open) {
+  const std::shared_ptr<pdfake::FakePrinter> device = lookupDevice(printer);
+  if (device) {
+    device->setDrawerOpen(open != 0);
+  }
 }
 
 // --- Scripted link behind a caller-supplied transport vtable -------------------------
@@ -258,10 +302,10 @@ extern "C" int pd_test_link_received_contains(pd_test_link* link, const char* ne
 
 // --- Enum bridge ---------------------------------------------------------------------
 //
-// JobState, ConfidenceLevel, DeviceEvent, FailureReason, JobOutcome, ConfidenceGrade
-// and CompletionAuthority are counted from the core's own kAll* arrays (types.hpp): if
-// a member is added there and pd.h is not updated to match, this count moves and pd.h's
-// _COUNT does not. The other eight enums
+// JobState, ConfidenceLevel, DeviceEvent, FailureReason, JobOutcome, ConfidenceGrade,
+// CompletionAuthority and the four M14 drawer enums (cash_drawer.hpp) are counted from
+// the core's own kAll* arrays: if a member is added there and pd.h is not updated to
+// match, this count moves and pd.h's _COUNT does not. The other eight enums
 // expose no kAll* array to this translation unit — CutSetting and PreflightMode have
 // neither an array nor a to_string; PayloadKind, CompletionMechanism and CutVariant have
 // a to_string but no public array; Alignment, CodePage and Binarization have neither —
@@ -289,6 +333,16 @@ extern "C" int pd_test_cpp_enum_count(pd_test_enum which) {
       return static_cast<int>(pd::kAllConfidenceGrades.size());
     case PD_TEST_ENUM_COMPLETION_AUTHORITY:
       return static_cast<int>(pd::kAllCompletionAuthorities.size());
+    // M14. Counted from the core's own kAll* arrays, like the seven above: a member
+    // added to cash_drawer.hpp without regenerating pd.h moves this and not the
+    // header's _COUNT.
+    case PD_TEST_ENUM_DRAWER_STATE: return static_cast<int>(pd::kAllDrawerStates.size());
+    case PD_TEST_ENUM_DRAWER_PORT_STANDARD:
+      return static_cast<int>(pd::kAllDrawerPortStandards.size());
+    case PD_TEST_ENUM_DRAWER_KICK_METHOD:
+      return static_cast<int>(pd::kAllDrawerKickMethods.size());
+    case PD_TEST_ENUM_DRAWER_STATUS_METHOD:
+      return static_cast<int>(pd::kAllDrawerStatusMethods.size());
     case PD_TEST_ENUM_TOTAL: break;
   }
   return -1;
@@ -362,6 +416,14 @@ extern "C" int pd_test_cpp_enum_value(pd_test_enum which, int index) {
       return static_cast<int>(pd::kAllConfidenceGrades[static_cast<size_t>(index)]);
     case PD_TEST_ENUM_COMPLETION_AUTHORITY:
       return static_cast<int>(pd::kAllCompletionAuthorities[static_cast<size_t>(index)]);
+    case PD_TEST_ENUM_DRAWER_STATE:
+      return static_cast<int>(pd::kAllDrawerStates[static_cast<size_t>(index)]);
+    case PD_TEST_ENUM_DRAWER_PORT_STANDARD:
+      return static_cast<int>(pd::kAllDrawerPortStandards[static_cast<size_t>(index)]);
+    case PD_TEST_ENUM_DRAWER_KICK_METHOD:
+      return static_cast<int>(pd::kAllDrawerKickMethods[static_cast<size_t>(index)]);
+    case PD_TEST_ENUM_DRAWER_STATUS_METHOD:
+      return static_cast<int>(pd::kAllDrawerStatusMethods[static_cast<size_t>(index)]);
     case PD_TEST_ENUM_TOTAL: break;
   }
   return -1;
@@ -393,6 +455,14 @@ extern "C" const char* pd_test_cpp_enum_name(pd_test_enum which, int index) {
       return pd::to_string(static_cast<pd::ConfidenceGrade>(value));
     case PD_TEST_ENUM_COMPLETION_AUTHORITY:
       return pd::to_string(static_cast<pd::CompletionAuthority>(value));
+    case PD_TEST_ENUM_DRAWER_STATE:
+      return pd::to_string(static_cast<pd::DrawerState>(value));
+    case PD_TEST_ENUM_DRAWER_PORT_STANDARD:
+      return pd::to_string(static_cast<pd::DrawerPortStandard>(value));
+    case PD_TEST_ENUM_DRAWER_KICK_METHOD:
+      return pd::to_string(static_cast<pd::DrawerKickMethod>(value));
+    case PD_TEST_ENUM_DRAWER_STATUS_METHOD:
+      return pd::to_string(static_cast<pd::DrawerStatusMethod>(value));
     case PD_TEST_ENUM_CUT:
     case PD_TEST_ENUM_PREFLIGHT:
     case PD_TEST_ENUM_ALIGNMENT:
@@ -421,6 +491,10 @@ extern "C" const char* pd_test_enum_label(pd_test_enum which) {
     case PD_TEST_ENUM_BINARIZATION: return "Binarization";
     case PD_TEST_ENUM_CONFIDENCE_GRADE: return "ConfidenceGrade";
     case PD_TEST_ENUM_COMPLETION_AUTHORITY: return "CompletionAuthority";
+    case PD_TEST_ENUM_DRAWER_STATE: return "DrawerState";
+    case PD_TEST_ENUM_DRAWER_PORT_STANDARD: return "DrawerPortStandard";
+    case PD_TEST_ENUM_DRAWER_KICK_METHOD: return "DrawerKickMethod";
+    case PD_TEST_ENUM_DRAWER_STATUS_METHOD: return "DrawerStatusMethod";
     case PD_TEST_ENUM_TOTAL: break;
   }
   return "UnknownEnum";

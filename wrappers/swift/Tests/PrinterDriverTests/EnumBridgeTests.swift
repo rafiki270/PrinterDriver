@@ -33,6 +33,11 @@ final class EnumBridgeTests: XCTestCase {
     assertCount(CompletionAuthority.self, PD_AUTHORITY_COUNT.rawValue)
     assertCount(Provenance.self, PD_PROVENANCE_COUNT.rawValue)
     assertCount(CommandLanguage.self, PD_LANGUAGE_COUNT.rawValue)
+    // M14 — docs/cash-drawer.md.
+    assertCount(DrawerState.self, PD_DRAWER_STATE_COUNT.rawValue)
+    assertCount(DrawerPortStandard.self, PD_DRAWER_PORT_STANDARD_COUNT.rawValue)
+    assertCount(DrawerKickMethod.self, PD_DRAWER_KICK_METHOD_COUNT.rawValue)
+    assertCount(DrawerStatusMethod.self, PD_DRAWER_STATUS_METHOD_COUNT.rawValue)
   }
 
   func testEveryMirroredEnumMatchesTheCoreMemberForMember() {
@@ -51,6 +56,10 @@ final class EnumBridgeTests: XCTestCase {
     assertMatchesCore(Alignment.self, PD_TEST_ENUM_ALIGNMENT)
     assertMatchesCore(CodePage.self, PD_TEST_ENUM_CODE_PAGE)
     assertMatchesCore(Binarization.self, PD_TEST_ENUM_BINARIZATION)
+    assertMatchesCore(DrawerState.self, PD_TEST_ENUM_DRAWER_STATE)
+    assertMatchesCore(DrawerPortStandard.self, PD_TEST_ENUM_DRAWER_PORT_STANDARD)
+    assertMatchesCore(DrawerKickMethod.self, PD_TEST_ENUM_DRAWER_KICK_METHOD)
+    assertMatchesCore(DrawerStatusMethod.self, PD_TEST_ENUM_DRAWER_STATUS_METHOD)
   }
 
   func testEveryMirroredMemberHasTheValueOfItsCConstant() {
@@ -187,6 +196,15 @@ final class EnumBridgeTests: XCTestCase {
     XCTAssertEqual(
       CommandLanguage.allCases.map(\.abiName),
       ["EscPos", "StarPrnt", "StarLine", "EposXml", "Zpl", "Cpcl", "BrotherRaster", "EscP"])
+    // M14 — all four drawer enums have a to_string in the core and a pd_*_name in pd.h.
+    assertSpellings(DrawerState.allCases.map(\.abiName), PD_TEST_ENUM_DRAWER_STATE)
+    assertSpellings(
+      DrawerPortStandard.allCases.map(\.abiName), PD_TEST_ENUM_DRAWER_PORT_STANDARD)
+    assertSpellings(
+      DrawerKickMethod.allCases.map(\.abiName), PD_TEST_ENUM_DRAWER_KICK_METHOD)
+    assertSpellings(
+      DrawerStatusMethod.allCases.map(\.abiName), PD_TEST_ENUM_DRAWER_STATUS_METHOD)
+
   }
 
   func testGradeHierarchyGainedAPlusWithoutRenumberingAnythingElseWrongly() {
@@ -249,6 +267,10 @@ final class EnumBridgeTests: XCTestCase {
     assertBridgesEveryMember(CompletionAuthority.self)
     assertBridgesEveryMember(Provenance.self)
     assertBridgesEveryMember(CommandLanguage.self)
+    assertBridgesEveryMember(DrawerState.self)
+    assertBridgesEveryMember(DrawerPortStandard.self)
+    assertBridgesEveryMember(DrawerKickMethod.self)
+    assertBridgesEveryMember(DrawerStatusMethod.self)
   }
 
   func testUnrecognizedFallbacksNeverClaimMoreThanIsKnown() {
@@ -268,6 +290,12 @@ final class EnumBridgeTests: XCTestCase {
     XCTAssertEqual(CompletionAuthority.unrecognizedFallback, .transportOnly)
     // An unrecognized provenance has established nothing, which is exactly Unverified.
     XCTAssertEqual(Provenance.unrecognizedFallback, .unverified)
+    // M14. The drawer's substitutions are the ones that must never turn an unconfirmed
+    // pulse into a confirmed open, or an unclassified port into a fireable one.
+    XCTAssertEqual(DrawerState.unrecognizedFallback, .unknown)
+    XCTAssertEqual(DrawerPortStandard.unrecognizedFallback, .unknown)
+    XCTAssertEqual(DrawerKickMethod.unrecognizedFallback, .unsupported)
+    XCTAssertEqual(DrawerStatusMethod.unrecognizedFallback, .none)
   }
 
   // MARK: - Helpers

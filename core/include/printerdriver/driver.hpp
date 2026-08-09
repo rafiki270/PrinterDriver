@@ -284,6 +284,46 @@ class Printer {
   void subscribe(DeviceEventCallback callback);
   void openCashDrawer();
 
+  // --- M14: cash drawer (docs/cash-drawer.md) -------------------------------------
+  //
+  // openCashDrawer() above is the fire-and-forget call this SDK shipped with: it
+  // queues one ESC p and tells the caller nothing, which is the `{sent: true}` the
+  // drawer document rejects. It stays because it is ABI, and because a caller that
+  // genuinely does not want to wait is entitled to say so. openDrawer() is the
+  // verified sequence and is what everything new should use.
+  //
+  // The sequence, from docs/cash-drawer.md "Opening sequence":
+  //   1. read the sensor first — a drawer that is already open is never pulsed again;
+  //   2. run on the printer's own worker, so a pulse can never interleave with the
+  //      bytes of a fenced job;
+  //   3. one queued pulse at the profile's duration on the requested channel;
+  //   4. watch the switch for the profile's verification window;
+  //   5. it changed  -> OpenVerified;
+  //   6. it did not  -> FailedToOpen;
+  //   7. nothing can answer -> KickSentUnverified, which is a different claim;
+  //   8. hold the manufacturer cooldown before the next pulse.
+  //
+  // Blocks until the sequence reaches a verdict. Refused — zero bytes written, state
+  // Unknown — when the profile has no drawer, when its kick method is one this engine
+  // cannot drive, or when the electrical standard is Unknown.
+  DrawerOpenResult openDrawer(const DrawerRequest& request = {});
+
+  // One non-destructive read of the drawer switch. Never pulses, so it is safe on
+  // hardware openDrawer() refuses. Reports the raw pin level and, only when the
+  // polarity has been calibrated, an interpretation of it.
+  DrawerReading readDrawerSensor(std::chrono::milliseconds timeout);
+
+  // Records which pin level means "open" for the drawer physically attached to this
+  // printer, and persists it (docs/cash-drawer.md §4 — Star warns that the meaning of
+  // the signal depends on the attached drawer, so this SDK measures instead of
+  // assuming). Returns false when there is nowhere to persist it, in which case the
+  // calibration still applies to this process.
+  bool calibrateDrawerPolarity(bool high_means_open);
+
+  DrawerCapabilities drawerCapabilities() const;
+  DrawerPolarity drawerPolarity() const;
+  // --- end M14 ---------------------------------------------------------------------
+
   // Blocks until the queue is empty and the active job is terminal.
   void drain();
 
@@ -354,6 +394,15 @@ class PrinterDriver {
   FindingsStore& capabilities() noexcept { return *capabilities_; }
   const FindingsStore& capabilities() const noexcept { return *capabilities_; }
 
+  // --- M14 --- Calibrated drawer polarities, keyed by printer id and persisted next
+  // to the journal for the same reason the instance nonce is: it describes the
+  // installation, not this run (docs/cash-drawer.md §4).
+  DrawerPolarityStore& drawerPolarities() noexcept { return *drawer_polarities_; }
+  const DrawerPolarityStore& drawerPolarities() const noexcept {
+    return *drawer_polarities_;
+  }
+  // --- end M14 ---
+
   // The two-character random prefix every verification identifier this driver issues
   // carries (docs/api.md §14). Persisted in the storage directory at first start, so
   // the tokens on yesterday's paper still name this instance; regenerated per process
@@ -368,6 +417,7 @@ class PrinterDriver {
   mutable std::mutex mutex_;
   std::shared_ptr<JobStore> store_;
   std::shared_ptr<FindingsStore> capabilities_;
+  std::shared_ptr<DrawerPolarityStore> drawer_polarities_;  // M14
   std::shared_ptr<detail::MarkerAllocator> markers_;
   std::shared_ptr<detail::DriverEventHub> hub_;
   std::shared_ptr<detail::JobIndex> index_;

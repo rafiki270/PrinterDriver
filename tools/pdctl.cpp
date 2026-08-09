@@ -263,6 +263,15 @@ int usage() {
       "      always exits 0 and only reports. Writes nothing printable unless\n"
       "      --print-test-line is given. --timeout is the fence budget in ms.\n"
       "\n"
+      "  pdctl drawer-probe <host[:port]> [--profile <name>] [--store <dir>]\n"
+      "                     [--no-calibrate]\n"
+      "      Cash drawer report that NEVER fires an output: the documented port\n"
+      "      (standard, voltage, current, channels, sense pin) and the software\n"
+      "      provenance, as two separate columns, followed by a non-destructive\n"
+      "      switch test - close the drawer, read; open it by hand, read - which\n"
+      "      records which level means OPEN and persists it. Safe on hardware\n"
+      "      nobody has classified, which is the hardware it is for.\n"
+      "\n"
       "  pdctl verify <token> [--store <dir>]\n"
       "      Paper to job: resolves the four-character V: code on a receipt and\n"
       "      prints that job's full journal history - states, timestamps, grade,\n"
@@ -293,6 +302,15 @@ int usage() {
       "      DLE ENQ 1 / DLE ENQ 2. --resume reprints from the line the error\n"
       "      happened on, which can duplicate a ticket; --clear discards the\n"
       "      buffers, which can lose one. Never sent automatically.\n"
+      "  pdctl drawer test <host[:port]> [--channel 1|2] [--pulse <ms>]\n"
+      "                     [--profile <name>] [--store <dir>]\n"
+      "      Energises the drawer solenoid: the cash drawer WILL open. Runs only\n"
+      "      when the profile's electrical standard is known - RJ11/RJ12-looking\n"
+      "      drawer connectors are not a universal electrical standard, and an\n"
+      "      unclassified port is refused rather than guessed at. Reports the\n"
+      "      state before the kick, the pulse, whether the switch changed and\n"
+      "      how long it took, and a verdict that distinguishes OPEN_VERIFIED\n"
+      "      from KICK_SENT_UNVERIFIED.\n"
       "  pdctl counters <host[:port]>    GS g 2 maintenance counters\n"
       "  pdctl test-print <host[:port]>  GS ( A built-in test print (uses paper)\n"
       "  pdctl settings <host[:port]>    GS ( E fn 4 / fn 6 settings readback\n"
@@ -1058,6 +1076,328 @@ bool profileExists(const std::string& name) {
   return name == "xp-s260m" || name == "generic" || pd::devices::exists(name);
 }
 
+// ====================================================================================
+// M14 — CASH DRAWER (docs/cash-drawer.md)
+// ====================================================================================
+//
+// Two commands, and the split between them is the whole safety model of that document.
+//
+//   `drawer-probe` NEVER fires an output. It prints what the profile documents about
+//   the port and about the commands — two separate columns — and then runs the
+//   non-destructive sensor calibration, which is an operator opening and closing the
+//   drawer by hand while the tool watches the switch. Safe on hardware nobody has
+//   classified, which is exactly the hardware it is for.
+//
+//   `drawer test` energises a solenoid, and refuses outright unless the electrical
+//   standard is established. "The plug fits" is not a classification.
+
+struct DrawerArgs {
+  std::string profile = "generic";
+  std::string store = defaultStore();
+  uint8_t channel = 1;
+  uint16_t pulse_ms = 0;  // 0 -> the profile's own default
+  bool calibrate = true;
+};
+
+void printDrawerElectrical(const pd::DrawerCapabilities& drawer) {
+  section("drawer port - electrical (documented)");
+  row("port standard", pd::to_string(drawer.electrical.standard));
+  row("drawer present", yesNo(drawer.present));
+  row("voltage",
+      drawer.electrical.voltage != 0
+          ? std::to_string(drawer.electrical.voltage) + " V"
+          : std::string("not documented"));
+  row("max current",
+      drawer.electrical.max_current_ma != 0
+          ? std::to_string(drawer.electrical.max_current_ma) + " mA"
+          : std::string("not documented"));
+  row("drive channels", std::to_string(static_cast<int>(drawer.electrical.channel_count)));
+  row("sensor pin",
+      drawer.electrical.sensor_pin != 0
+          ? std::to_string(static_cast<int>(drawer.electrical.sensor_pin))
+          : std::string("not documented"));
+  row("evidence", pd::to_string(drawer.evidence.electrical));
+  switch (drawer.electrical.standard) {
+    case pd::DrawerPortStandard::Epson24V6P6C:
+      row("cable", "standard Epson-style 24 V drawer cable (sense on pin 3)");
+      break;
+    case pd::DrawerPortStandard::Star24V6P6C:
+      row("cable", "STAR-SPECIFIC cable: +24 V on pin 3, sense on pin 6");
+      break;
+    case pd::DrawerPortStandard::Generic12V6P6C:
+      row("cable", "12 V drawer only - a 24 V drawer is the wrong load here");
+      break;
+    case pd::DrawerPortStandard::Unknown:
+      row("cable", "UNKNOWN - do not connect a drawer on the strength of the plug");
+      break;
+  }
+}
+
+void printDrawerSoftware(const pd::DrawerCapabilities& drawer) {
+  section("drawer port - software (provenance)");
+  row("kick method", pd::to_string(drawer.kick.method));
+  row("driven by this engine", yesNo(drawer.kickable()));
+  row("default pulse", std::to_string(drawer.kick.default_pulse_ms) + " ms");
+  row("maximum pulse", std::to_string(drawer.kick.max_pulse_ms) + " ms");
+  row("cooldown", std::to_string(drawer.kick.cooldown_ms) + " ms");
+  row("may kick while printing", yesNo(drawer.kick.can_kick_during_print));
+  row("status method", pd::to_string(drawer.status.method));
+  row("status available", yesNo(drawer.status.available));
+  row("one switch, two drives", yesNo(drawer.status.shared_between_drawers));
+  row("port shared with buzzer", yesNo(drawer.port.shared_with_buzzer));
+  row("evidence", pd::to_string(drawer.evidence.commands));
+  row("polarity calibrated", yesNo(drawer.status.polarity.calibrated));
+  if (drawer.status.polarity.calibrated) {
+    row("open level",
+        drawer.status.polarity.high_means_open ? "HIGH = OPEN" : "LOW = OPEN");
+  }
+  if (!drawer.note.empty()) {
+    std::cout << "\n  note: " << drawer.note << "\n";
+  }
+}
+
+void unknownStandardWarning(const std::string& profile_name) {
+  std::cout
+      << "\n"
+      << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+      << "!!\n"
+      << "!!   R E F U S E D  -  U N K N O W N  D R A W E R  P O R T\n"
+      << "!!\n"
+      << "!!   RJ11/RJ12-LOOKING DRAWER CONNECTORS ARE NOT A UNIVERSAL\n"
+      << "!!   ELECTRICAL STANDARD.\n"
+      << "!!\n"
+      << "!!   Star's identical-looking 6P6C socket carries +24 V on pin 3 and\n"
+      << "!!   the sense line on pin 6 - precisely where Epson puts the sense\n"
+      << "!!   line and signal ground. 12 V drawer outputs exist alongside the\n"
+      << "!!   common 24 V ones, and solenoid resistance has to match the drive.\n"
+      << "!!\n"
+      << "!!   No output will be energised on profile '" << profile_name << "'.\n"
+      << "!!\n"
+      << "!!   Identify the printer model, then its drawer port type, then the\n"
+      << "!!   expected voltage, then the correct cable. Actuate last.\n"
+      << "!!   `pdctl drawer-probe <host>` is safe on this hardware and reads\n"
+      << "!!   the switch without firing anything.\n"
+      << "!!\n"
+      << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+}
+
+// One GS r 2 round trip over the raw transport. `drawer-probe` asks the hardware
+// directly rather than through the engine, because a probe's whole job is to find out
+// what a profile does not already claim.
+std::optional<bool> readDrawerPin(pd::Transport& transport, Listener& listener,
+                                  std::chrono::milliseconds wait) {
+  listener.clear();
+  const pd::TransportResult written = transport.write(pd::escpos::gsDrawerStatus());
+  if (!written.ok) {
+    return std::nullopt;
+  }
+  listener.waitForBytes(1, wait);
+  const std::vector<uint8_t> raw = listener.raw();
+  if (raw.empty()) {
+    return std::nullopt;
+  }
+  return pd::drawerPinHigh(raw.front());
+}
+
+// Blocks for the operator. Returns false at end of input, which is what a pipe or a CI
+// job looks like: the calibration is skipped rather than guessed at.
+bool waitForOperator(const std::string& instruction) {
+  std::cout << "  " << instruction << " then press Enter (Ctrl-D to stop): "
+            << std::flush;
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    std::cout << "\n";
+    return false;
+  }
+  return true;
+}
+
+int runDrawerProbe(const Endpoint& endpoint, const DrawerArgs& args) {
+  const pd::CapabilityProfile profile = profileByName(args.profile);
+  const pd::DrawerCapabilities& drawer = profile.drawer;
+
+  std::cout << "drawer probe " << endpoint.host << ":" << endpoint.port
+            << "  profile=" << args.profile << "\n";
+  std::cout << "This command never fires a drawer output.\n";
+  printDrawerElectrical(drawer);
+  printDrawerSoftware(drawer);
+
+  if (!drawer.electricalKnown()) {
+    std::cout << "\n  The port is unclassified, so `pdctl drawer test` will refuse on\n"
+              << "  this profile. Reading the switch below is still safe: it asks a\n"
+              << "  question and energises nothing.\n";
+  }
+
+  section("sensor test - NON-DESTRUCTIVE");
+  if (!args.calibrate) {
+    std::cout << "  skipped (--no-calibrate)\n";
+    return kExitDone;
+  }
+
+  pd::TcpConfig config;
+  config.host = endpoint.host;
+  config.port = endpoint.port;
+  pd::TcpTransport transport(config);
+  Listener listener;
+  listener.attach(transport);
+
+  const pd::TransportResult connected = transport.connect();
+  if (!connected.ok) {
+    std::cout << "  connect failed: " << connected.message << "\n";
+    return kExitFailed;
+  }
+  std::cout << "  connected to " << transport.describe() << "\n";
+  std::cout << "  asking GS r 2 (1D 72 02) - the drawer kick-out connector status.\n\n";
+
+  if (!waitForOperator("Close the drawer completely,")) {
+    transport.close();
+    return kExitUnknown;
+  }
+  const std::optional<bool> shut = readDrawerPin(transport, listener, 2000ms);
+  std::cout << "    closed -> "
+            << (shut.has_value() ? (*shut ? "status=1 (HIGH)" : "status=0 (LOW)")
+                                 : std::string("no answer"))
+            << "\n";
+  if (!shut.has_value()) {
+    std::cout << "\n  x  no switch answer on this path.\n"
+              << "     Either the drawer port has no sense line wired, or this "
+                 "interface\n"
+              << "     path does not return the response. A pulse over this path can "
+                 "only\n"
+              << "     ever report KickSentUnverified, never OpenVerified.\n";
+    transport.close();
+    return kExitUnknown;
+  }
+
+  if (!waitForOperator("Now open the drawer by hand,")) {
+    transport.close();
+    return kExitUnknown;
+  }
+  const std::optional<bool> open = readDrawerPin(transport, listener, 2000ms);
+  std::cout << "    open   -> "
+            << (open.has_value() ? (*open ? "status=1 (HIGH)" : "status=0 (LOW)")
+                                 : std::string("no answer"))
+            << "\n";
+  transport.close();
+
+  if (!open.has_value()) {
+    std::cout << "\n  x  the switch answered once and then stopped answering.\n";
+    return kExitUnknown;
+  }
+  if (*open == *shut) {
+    std::cout << "\n  x  the level did not change between closed and open.\n"
+              << "     The sense line is not wired to this drawer's microswitch, or "
+                 "the\n"
+              << "     drawer was not actually moved. No polarity recorded - a "
+                 "guessed\n"
+              << "     one is worse than none.\n";
+    return kExitFailed;
+  }
+
+  std::cout << "\n  ok  switch detected\n"
+            << "  ok  " << (*open ? "HIGH = OPEN" : "LOW = OPEN") << "\n";
+
+  // Persisted under the same printer id `pdctl print` and pd-agent use for this
+  // endpoint, so the calibration is in force the next time the engine talks to it.
+  const std::string printer_id = endpoint.host + ":" + std::to_string(endpoint.port);
+  pd::DrawerPolarityStore polarities(args.store);
+  if (!polarities.persistent()) {
+    std::cout << "  !   could not open " << args.store
+              << " - the polarity applies to this run only\n";
+    return kExitUnknown;
+  }
+  polarities.save(printer_id, *open);
+  std::cout << "  ok  polarity persisted for " << printer_id << " in "
+            << polarities.path() << "\n";
+  return kExitDone;
+}
+
+int runDrawerTest(const Endpoint& endpoint, const DrawerArgs& args) {
+  const pd::CapabilityProfile profile = profileByName(args.profile);
+  const pd::DrawerCapabilities& drawer = profile.drawer;
+
+  std::cout << "drawer test " << endpoint.host << ":" << endpoint.port
+            << "  profile=" << args.profile << "\n";
+  printDrawerElectrical(drawer);
+
+  if (!drawer.electricalKnown()) {
+    unknownStandardWarning(args.profile);
+    return kExitFailed;
+  }
+  if (!drawer.kickable()) {
+    std::cout << "\n  refused: this profile's kick method is "
+              << pd::to_string(drawer.kick.method)
+              << ", which this ESC/POS engine does not drive.\n"
+              << "  The port is classified and the command path is somebody else's "
+                 "API;\n"
+              << "  driving it from here would mean guessing at a protocol.\n";
+    return kExitFailed;
+  }
+
+  warningBanner("ESC p " + std::to_string(args.channel == 2 ? 1 : 0) + " (1B 70 ...)",
+                "energises the drawer solenoid: the cash drawer WILL open");
+
+  pd::PrinterDriver driver(pd::StorageConfig::at(args.store));
+  pd::PrinterConfig config;
+  config.id = endpoint.host + ":" + std::to_string(endpoint.port);
+  config.transport = pd::tcp(endpoint.host, endpoint.port, 3000);
+  config.profile = profile;
+  std::shared_ptr<pd::Printer> printer = driver.addPrinter(config);
+  if (!printer) {
+    std::cout << "could not attach printer\n";
+    return kExitFailed;
+  }
+  // A polarity recorded by `drawer-probe` for this endpoint is picked up on attach.
+  printDrawerSoftware(printer->drawerCapabilities());
+
+  section("drawer test");
+  pd::DrawerRequest request;
+  request.channel = args.channel;
+  request.pulse_ms = args.pulse_ms;
+  const pd::DrawerOpenResult result = printer->openDrawer(request);
+
+  row("before kick", pd::to_string(result.previous_state));
+  row("channel", std::to_string(static_cast<int>(result.channel)));
+  row("pulse",
+      result.pulse_ms != 0 ? std::to_string(result.pulse_ms) + " ms"
+                           : std::string("none sent"));
+  switch (result.state) {
+    case pd::DrawerState::OpenVerified:
+      row("sensor", "changed " + std::to_string(result.elapsed_ms) + " ms after kick");
+      std::cout << "\n  ok  OPEN_VERIFIED - the microswitch was seen changing\n";
+      return kExitDone;
+    case pd::DrawerState::Open:
+      std::cout << "\n  ok  already OPEN before the kick - nothing was pulsed\n";
+      return kExitDone;
+    case pd::DrawerState::FailedToOpen:
+      row("sensor", "unchanged after " + std::to_string(result.elapsed_ms) + " ms");
+      std::cout << "\n  x   FAILED_TO_OPEN (locked / wrong channel / cable / jam)\n";
+      return kExitFailed;
+    case pd::DrawerState::KickSentUnverified:
+      row("sensor", result.previous_state == pd::DrawerState::NoSensor
+                        ? "no switch on this port"
+                        : "no usable answer on this path");
+      std::cout << "\n  ?   KICK_SENT_UNVERIFIED - the pulse went out and nothing "
+                   "here\n"
+                << "      can confirm the drawer moved. That is the honest answer, "
+                   "not a\n"
+                << "      weaker success: through a print server the kick travels "
+                   "forward\n"
+                << "      while the sensor response never comes back.\n";
+      return kExitUnknown;
+    case pd::DrawerState::Closed:
+    case pd::DrawerState::Opening:
+    case pd::DrawerState::NoSensor:
+    case pd::DrawerState::Unknown:
+      break;
+  }
+  std::cout << "\n  ?   " << pd::to_string(result.state)
+            << " - nothing was established; see the report above\n";
+  return kExitUnknown;
+}
+
+// ================================ end M14 ==========================================
+
 // --- render (no printer involved) -----------------------------------------------------
 
 void printCutAndMargins(const pd::dsl::RenderOutput& output) {
@@ -1490,6 +1830,56 @@ int main(int argc, char** argv) {
   if (argc >= 3 && std::string(argv[1]) == "print" && std::string(argv[2]) == "list") {
     return listProfiles();
   }
+  // M14. `drawer test <host>` puts the host in argv[3], so it cannot go through the
+  // endpoint dispatch below, which reads argv[2]. Same shape as `print list`.
+  if (argc >= 3 && std::string(argv[1]) == "drawer") {
+    if (std::string(argv[2]) != "test" || argc < 4) {
+      std::cout << "usage: pdctl drawer test <host[:port]> [options]\n\n";
+      return usage();
+    }
+    Endpoint drawer_endpoint;
+    if (!parseEndpoint(argv[3], &drawer_endpoint)) {
+      std::cout << "invalid host: " << argv[3] << "\n\n";
+      return usage();
+    }
+    DrawerArgs args;
+    for (int i = 4; i < argc; ++i) {
+      const std::string flag = argv[i];
+      const bool has_value = i + 1 < argc;
+      if (flag == "--channel" && has_value) {
+        const unsigned long value = std::strtoul(argv[++i], nullptr, 10);
+        if (value != 1 && value != 2) {
+          std::cout << "--channel must be 1 (drive 1) or 2 (drive 2)\n\n";
+          return usage();
+        }
+        args.channel = static_cast<uint8_t>(value);
+      } else if (flag == "--pulse" && has_value) {
+        const unsigned long value = std::strtoul(argv[++i], nullptr, 10);
+        if (value == 0 || value > 5000) {
+          std::cout << "--pulse must be 1..5000 ms\n\n";
+          return usage();
+        }
+        args.pulse_ms = static_cast<uint16_t>(value);
+      } else if (flag == "--profile" && has_value) {
+        args.profile = argv[++i];
+        if (!profileExists(args.profile)) {
+          std::cout << "unknown profile: " << args.profile << "\n\n";
+          return usage();
+        }
+      } else if (flag == "--store" && has_value) {
+        args.store = argv[++i];
+      } else {
+        std::cout << "unknown option: " << flag << "\n\n";
+        return usage();
+      }
+    }
+    try {
+      return runDrawerTest(drawer_endpoint, args);
+    } catch (const std::exception& error) {
+      std::cout << "error: " << error.what() << "\n";
+      return kExitFailed;
+    }
+  }
   if (argc >= 3 && std::string(argv[1]) == "verify") {
     // Not an endpoint command: it answers from the journal on disk, so it works with
     // the printer unplugged, which is exactly when somebody is holding the receipt.
@@ -1646,6 +2036,30 @@ int main(int argc, char** argv) {
   try {
     if (command == "status") {
       return runStatus(endpoint);
+    }
+    // M14 — docs/cash-drawer.md. Read-only: it energises nothing, whatever the port
+    // turns out to be.
+    if (command == "drawer-probe") {
+      DrawerArgs args;
+      for (int i = 3; i < argc; ++i) {
+        const std::string flag = argv[i];
+        const bool has_value = i + 1 < argc;
+        if (flag == "--profile" && has_value) {
+          args.profile = argv[++i];
+          if (!profileExists(args.profile)) {
+            std::cout << "unknown profile: " << args.profile << "\n\n";
+            return usage();
+          }
+        } else if (flag == "--store" && has_value) {
+          args.store = argv[++i];
+        } else if (flag == "--no-calibrate") {
+          args.calibrate = false;
+        } else {
+          std::cout << "unknown option: " << flag << "\n\n";
+          return usage();
+        }
+      }
+      return runDrawerProbe(endpoint, args);
     }
     if (command == "probe" || command == "identify") {
       DiscoveryArgs args;

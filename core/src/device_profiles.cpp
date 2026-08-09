@@ -54,7 +54,70 @@ void makePortable(CapabilityProfile& profile) {
   profile.media.head_to_cutter_feed_dots = 0;  // nothing to clear: the operator tears
   profile.transport.raw_tcp_9100 = false;
   profile.transport.usb = true;
+  // M14. A belt or handheld printer has no drawer port, so whatever the counter-top
+  // family default said about one does not survive into it (docs/cash-drawer.md is
+  // about static POS installations throughout). Cleared rather than left inherited:
+  // a present=true here would let the engine energise an output that does not exist.
+  profile.drawer = DrawerCapabilities{};
 }
+
+// --- M14: cash-drawer seeds (docs/cash-drawer.md) -----------------------------------
+//
+// Two facts per family, always kept apart: what the *port* is (pinout, voltage,
+// current, channels, sense pin) and what the *commands* are. The doc's closing
+// paragraph is explicit that the two are independent — two printers accepting the same
+// "kick drawer 1" command may still wire the modular socket differently — and every
+// helper below sets them separately so no entry can accidentally inherit one from the
+// other.
+
+// The de-facto Epson arrangement: 1 FG, 2 kick 1, 3 open/close input, 4 +24 V, 5 kick
+// 2, 6 signal ground; solenoid between +24 V and a drive pin; >= 24 ohm, ~<= 1 A. This
+// is the large interoperable ecosystem of the doc's electrical-classification section.
+void makeEpsonStyleDrawerPort(CapabilityProfile& profile, Provenance electrical) {
+  DrawerCapabilities& drawer = profile.drawer;
+  drawer.present = true;
+  drawer.electrical.standard = DrawerPortStandard::Epson24V6P6C;
+  drawer.electrical.voltage = 24;
+  drawer.electrical.max_current_ma = 1000;
+  drawer.electrical.channel_count = 2;
+  drawer.electrical.sensor_pin = 3;
+  // "Two outputs, ONE switch input": both channels kick independently and the only
+  // readable fact is that *some* attached drawer is open.
+  drawer.status.shared_between_drawers = true;
+  drawer.evidence.electrical = electrical;
+}
+
+// ESC p plus GS r 2, the reference implementation of docs/cash-drawer.md §1.
+void makeEscPosDrawerCommands(CapabilityProfile& profile, DrawerKickMethod method,
+                              Provenance commands) {
+  DrawerCapabilities& drawer = profile.drawer;
+  drawer.kick.method = method;
+  // 200 ms is the doc's default for known 24 V printer-driven drawers.
+  drawer.kick.default_pulse_ms = 200;
+  // ESC p programs t1 in 2 ms units, so 255 units is 510 ms; 500 is that rounded to a
+  // number an operator would recognise, and it is a ceiling rather than a target.
+  drawer.kick.max_pulse_ms = 500;
+  // Not a manufacturer figure. A driver-side floor so a retry loop cannot hold a 24 V
+  // solenoid energised; the families that publish a duty limit of their own override it.
+  drawer.kick.cooldown_ms = 500;
+  drawer.kick.can_kick_during_print = true;
+  drawer.status.available = commands == Provenance::Documented;
+  drawer.status.method =
+      drawer.status.available ? DrawerStatusMethod::GsR2 : DrawerStatusMethod::None;
+  drawer.evidence.commands = commands;
+}
+
+// A port that exists and has not been classified. Nothing is fired on it: kickable()
+// refuses on an Unknown standard, which is the giant-letters rule of the document.
+void makeUnclassifiedDrawerPort(CapabilityProfile& profile, std::string note) {
+  DrawerCapabilities& drawer = profile.drawer;
+  drawer = DrawerCapabilities{};
+  drawer.present = true;
+  drawer.electrical.standard = DrawerPortStandard::Unknown;
+  drawer.kick.method = DrawerKickMethod::Unsupported;
+  drawer.note = std::move(note);
+}
+// --- end M14 -------------------------------------------------------------------------
 
 CapabilityProfile epsonBase() {
   CapabilityProfile profile = thermal80();
@@ -96,6 +159,15 @@ CapabilityProfile epsonBase() {
   // Mid-range of the TM family's documented 10-15 mm head-to-cutter gap at 203 dpi;
   // tighten per model once a unit is actually probed.
   profile.media.head_to_cutter_feed_dots = 100;
+  // M14, docs/cash-drawer.md §1 — the reference implementation, and the only family
+  // here whose drawer is documented end to end: the DK connector pinout, `ESC p m t1
+  // t2` in the model-specific command tables, and `GS r 2` / `GS r 50` for the
+  // kick-out connector status, with ASB able to report a change without being polled.
+  makeEpsonStyleDrawerPort(profile, Provenance::Documented);
+  makeEscPosDrawerCommands(profile, DrawerKickMethod::EpsonEscP, Provenance::Documented);
+  // "Buzzer conflict": Epson documents that with the optional external buzzer enabled,
+  // the pulse that would go to the drawer connector sounds the buzzer instead.
+  profile.drawer.port.shared_with_buzzer = true;
   return profile;
 }
 
@@ -147,6 +219,14 @@ CapabilityProfile rongtaBase() {
   // the code page those installations run.
   profile.final_feed_lines = 6;
   profile.code_page = escpos::CodePage::PC852;
+  // M14, docs/cash-drawer.md §7-9. The RP336S-class 80 mm units carry a 6-wire socket
+  // at 24 V / 1 A, model-verified — so the *port* is established for the 80 mm family
+  // and the family default says so. The *commands* are not: no trusted
+  // manufacturer-hosted reference gives `ESC p` plus switch semantics across the
+  // range, so they stay Unverified and `pdctl drawer test` is what establishes them.
+  // rongta_rp58() below throws all of this away rather than inheriting it.
+  makeEpsonStyleDrawerPort(profile, Provenance::Documented);
+  makeEscPosDrawerCommands(profile, DrawerKickMethod::EpsonEscP, Provenance::Unverified);
   return profile;
 }
 
@@ -162,6 +242,16 @@ CapabilityProfile xprinterBase() {
   // the shipped defaults even for the S-series, where our own hardware answers it —
   // that finding belongs to a probe result, not to a family default.
   profile.code_page = escpos::CodePage::PC852;
+  // M14, docs/cash-drawer.md §6, the sentence in bold: several Xprinter 58 mm models
+  // officially specify **12 V / 1 A** while 80 mm units are commonly 24 V. So
+  // "Xprinter = 24 V" is never a family fact, and the family default classifies the
+  // port as Unknown — which refuses a pulse. xprinter_s_series() below overrides it
+  // with the XP-S260M's own published figure.
+  makeUnclassifiedDrawerPort(
+      profile,
+      "Drawer voltage is a MODEL fact on this brand: several 58 mm models specify "
+      "12 V / 1 A while 80 mm units are commonly 24 V. Identify the model and its "
+      "published drawer output before connecting a drawer.");
   return profile;
 }
 
@@ -199,6 +289,42 @@ CapabilityProfile starBase() {
   profile.transport.bluetooth.mfi_protocol = "jp.star-m.starpro";
   // Star's SDK addresses BLE devices by `BLE:<device>` name; the GATT map is hidden.
   profile.transport.bluetooth.ble_profile_unknown = true;
+
+  // M14, docs/cash-drawer.md §4 — SAME-LOOKING CONNECTOR, DIFFERENT ELECTRICS. The
+  // TSP100 hardware manual gives 1 FG, 2 DRD1, **3 = +24 V**, 4 = +24 V, 5 DRD2,
+  // **6 = DRSNS sense**: Epson puts sense on 3 and ground on 6, Star puts +24 V on 3
+  // and sense on 6. A cable that fits is not electrically correct, which is why APG
+  // sells printer-specific cables for identical-looking plugs.
+  //
+  // The software side is Star's own appendPeripheral(...) and drawerOpenCloseSignal,
+  // not `ESC p` and not `GS r 2` — documented, and not something this ESC/POS engine
+  // may drive. So the port is classified (a cable can be chosen correctly) while the
+  // kick method refuses: a Star drawer is driven through StarPRNT or not at all. This
+  // holds for the raw-socket models of starRawBase() too: driving Line Mode ourselves
+  // (M13b) buys a print fence, not a peripheral port, so they inherit this unchanged.
+  DrawerCapabilities& drawer = profile.drawer;
+  drawer.present = true;
+  drawer.electrical.standard = DrawerPortStandard::Star24V6P6C;
+  drawer.electrical.voltage = 24;
+  drawer.electrical.max_current_ma = 1000;
+  drawer.electrical.channel_count = 2;
+  drawer.electrical.sensor_pin = 6;
+  drawer.kick.method = DrawerKickMethod::StarPrnt;
+  drawer.kick.default_pulse_ms = 200;
+  drawer.kick.max_pulse_ms = 500;
+  drawer.kick.cooldown_ms = 500;
+  drawer.status.available = true;
+  drawer.status.method = DrawerStatusMethod::StarSignal;
+  drawer.status.shared_between_drawers = false;  // drawer1/drawer2 signals are separate
+  drawer.port.shared_with_buzzer = true;         // the external-device port is shared
+  drawer.evidence.electrical = Provenance::Documented;
+  drawer.evidence.commands = Provenance::Documented;
+  drawer.note =
+      "Star pinout: +24 V on pin 3, sense on pin 6 — the reverse of the Epson "
+      "arrangement. Use a Star-specific drawer cable. The kick is StarPRNT "
+      "appendPeripheral and the sense line is drawerOpenCloseSignal, neither of which "
+      "this ESC/POS engine speaks; the true/false meaning of the signal still depends "
+      "on the attached drawer, so calibrate before trusting it.";
   return profile;
 }
 
@@ -248,6 +374,22 @@ CapabilityProfile bixolonBase() {
   // rather than being mapped onto a generic UART profile.
   profile.transport.bluetooth.mfi_protocol = "com.bixolon.protocol";
   profile.transport.bluetooth.ble_profile_unknown = true;
+
+  // M14, docs/cash-drawer.md §2. The SRP-350V/352V pinout matches Epson's layout
+  // (1 FG, 2 drive 1, 3 open/close input, 4 +24 V, 5 drive 2, 6 signal ground) at
+  // >= 24 ohm / max 1 A with documented pulse and recovery limits — so the port is
+  // documented. The command surface is the WebPrint SDK's makeDKout({connector,
+  // duration}), whose own default is pin 2 at 200 ms; that is a vendor path this
+  // engine does not drive, so no pulse is emitted from here. Per-model families that
+  // do not share the 350's manual override the port back to Unknown below.
+  makeEpsonStyleDrawerPort(profile, Provenance::Documented);
+  profile.drawer.kick.method = DrawerKickMethod::BixolonSdk;
+  profile.drawer.kick.default_pulse_ms = 200;  // the SDK's own default
+  profile.drawer.kick.max_pulse_ms = 500;      // makeDKout's documented ladder tops out here
+  profile.drawer.kick.cooldown_ms = 500;
+  profile.drawer.status.available = true;
+  profile.drawer.status.method = DrawerStatusMethod::VendorSdk;
+  profile.drawer.evidence.commands = Provenance::Documented;
   return profile;
 }
 
@@ -266,6 +408,41 @@ CapabilityProfile citizenBase() {
   // string here would produce an EASession that never opens and a support case nobody can
   // reproduce.
   profile.transport.bluetooth.mfi_protocol_vendor_gated = true;
+
+  // M14, docs/cash-drawer.md §3. Citizen's common command reference explicitly lists
+  // `ESC p` and `GS r 2` / `GS r 50`, and the CT-S4500 pinout is the Epson-like one
+  // (1 FG, 2 DRAWER1, 3 DRSW switch input, 4 VDR, 5 DRAWER2, 6 GND) at 24 V, >= 24
+  // ohm, ~<= 1 A. Documented on both halves.
+  makeEpsonStyleDrawerPort(profile, Provenance::Documented);
+  makeEscPosDrawerCommands(profile, DrawerKickMethod::CitizenEscP,
+                           Provenance::Documented);
+  // The serialisation quirk, and the reason this flag exists at all: on the affected
+  // models the drawer output cannot fire while the mechanism is printing, so the pulse
+  // is ordered strictly behind everything already queued instead of jumping it.
+  profile.drawer.kick.can_kick_during_print = false;
+  profile.drawer.note =
+      "Drawer 1 and drawer 2 cannot be driven simultaneously, and on the affected "
+      "models the drawer output cannot fire while printing: the pulse is serialised "
+      "behind receipt completion.";
+  return profile;
+}
+
+// M14, docs/cash-drawer.md §5. SNBC / New Beiyang BTP-R880NP: a 6-position modular
+// drawer interface at 24 V with ~<= 1 A drive, two outputs and a switch input, and a
+// programming manual that documents `ESC p` alongside the realtime `DLE DC4 n m t`
+// pulse. Genuinely documented on both halves. The queued `ESC p` is preferred over the
+// realtime variant in normal operation, which is what this engine emits.
+CapabilityProfile snbcBase() {
+  CapabilityProfile profile = thermal80();
+  profile.identity.vendor = "SNBC";
+  profile.status.dle_eot = true;
+  profile.status.asb = true;
+  profile.status.cutter_error = true;
+  profile.transport.usb = true;
+  profile.transport.serial = true;
+  profile.completion_caps.try_process_id_gs_h = true;
+  makeEpsonStyleDrawerPort(profile, Provenance::Documented);
+  makeEscPosDrawerCommands(profile, DrawerKickMethod::SnbcEscP, Provenance::Documented);
   return profile;
 }
 
@@ -284,6 +461,15 @@ CapabilityProfile partnerBase() {
   // here — every provenance below stays Unverified, which is the honest description of
   // a device whose manual nobody can read.
   profile.completion_caps.try_process_id_gs_h = true;
+  // M14, docs/cash-drawer.md §7-9: Partner RP-110 is `cashDrawer = PROBE_REQUIRED`
+  // across the board, and the doc is explicit that Sewoo's documented implementation
+  // must not be auto-applied to it on OEM resemblance alone. So: a port that exists
+  // and is unclassified, and no pulse until somebody establishes it on a unit.
+  makeUnclassifiedDrawerPort(
+      profile,
+      "Probe required on every axis: connector pinout, drive voltage and command set "
+      "are all unestablished on this family. OEM resemblance to another vendor's unit "
+      "is not evidence about either the wiring or the firmware.");
   return profile;
 }
 
@@ -324,6 +510,11 @@ CapabilityProfile zebraBase() {
   // Wi-Fi 6 with Bluetooth 5.3. Reachable is not the same as drivable: every job on
   // these profiles is still refused, because the bytes would be ESC/POS.
   profile.transport.raw_tcp_9100 = true;
+  // M14. Mobile label printers, no drawer port, and not an ESC/POS device in any case:
+  // present stays false and the method stays Unsupported, so a drawer call writes zero
+  // bytes and claims nothing. Stated rather than inherited, because "we did not think
+  // about it" and "there is nothing there" must not look the same in this database.
+  profile.drawer = DrawerCapabilities{};
   return profile;
 }
 
@@ -349,6 +540,9 @@ CapabilityProfile brotherBase() {
   profile.transport.usb = true;
   profile.transport.bluetooth.classic_vendor = true;
   profile.transport.bluetooth.vendor_sdk = true;
+  // M14. Same as Zebra: no drawer port, not ESC/POS, so a drawer call is a refusal
+  // that writes nothing rather than a pulse nobody can account for.
+  profile.drawer = DrawerCapabilities{};
   return profile;
 }
 
@@ -400,6 +594,9 @@ const std::vector<Entry>& table() {
       {"sewoo_slk_ts", &sewoo_slk_ts},
       {"partner_rp110", &partner_rp110},
       {"partner_rp710", &partner_rp710},
+      // M14 — docs/cash-drawer.md §5.
+      {"snbc_btp_r880", &snbc_btp_r880},
+      {"snbc_btp_u80", &snbc_btp_u80},
       {"star_tsp100", &star_tsp100},
       {"star_tsp100iii", &star_tsp100iii},
       {"star_tsp100iv", &star_tsp100iv},
@@ -822,6 +1019,16 @@ CapabilityProfile rongta_rp58() {
   // and let the probe promote it.
   profile.chunk_bytes = 1024;
   profile.inter_chunk_delay_ms = 20;
+  // M14, docs/cash-drawer.md §7-9, verbatim: **`rongta_rp58_family: DO NOT INHERIT`**.
+  // The 80 mm units' 24 V / 1 A socket is a fact about those units. Smaller Rongta
+  // hardware differs, and 12 V drawer outputs exist in this size class, so inheriting
+  // the family port would mean connecting a 24 V drawer on the strength of a number
+  // measured on a different machine. Cleared to Unknown, which refuses the pulse.
+  makeUnclassifiedDrawerPort(
+      profile,
+      "DO NOT INHERIT the 80 mm family's 24 V / 1 A drawer figures: this size class "
+      "includes 12 V outputs, and connecting a 24 V drawer to one risks the drive "
+      "circuit. Establish the port on the actual unit first.");
   return profile;
 }
 
@@ -896,6 +1103,19 @@ CapabilityProfile xprinter_s_series() {
   profile.completion_caps.vendor_idle = true;  // Xprinter one-ticket-one-control
   profile.media.black_mark_sensor = true;
   profile.final_feed_lines = 3;
+  // M14, docs/cash-drawer.md §6. The XP-S260M's official specification gives the
+  // drawer output as **DC 24 V / 1 A**, which classifies the port — electrically this
+  // is an ordinary Epson-compatible 24 V socket and a normal drawer cable is correct.
+  // No current Xprinter-hosted programmer reference proves the pulse or the status
+  // command, so the command half stays PROBE REQUIRED: the kick is emitted as `ESC p`
+  // because that is the only candidate, the status path claims nothing, and the honest
+  // outcome of a pulse on this entry is KickSentUnverified until a unit is tested.
+  makeEpsonStyleDrawerPort(profile, Provenance::Documented);
+  makeEscPosDrawerCommands(profile, DrawerKickMethod::EpsonEscP, Provenance::Unverified);
+  profile.drawer.note =
+      "Drawer output documented as DC 24 V / 1 A. ESC p, the drawer status read and "
+      "channel 2 are unproven on this brand: run `pdctl drawer test` on the unit "
+      "before relying on a verified open.";
   return profile;
 }
 
@@ -930,6 +1150,18 @@ CapabilityProfile sewoo_slk_ts() {
   profile.name = "sewoo_slk_ts";
   profile.identity.vendor = "Sewoo";
   profile.identity.model = "SLK-TS series";
+  // M14, docs/cash-drawer.md §7-9. The SLK-TS200 documents cash-box control over a
+  // 6-wire socket at 24 V / 1 A, so the port is established here even though the
+  // Partner base it derives from leaves it Unknown. The command implementation is not
+  // verified, and the doc is explicit that it must not be carried across to the
+  // Partner RP-110 on OEM resemblance — which is why this override lives on the model
+  // and not on partnerBase().
+  makeEpsonStyleDrawerPort(profile, Provenance::Documented);
+  makeEscPosDrawerCommands(profile, DrawerKickMethod::EpsonEscP, Provenance::Unverified);
+  profile.drawer.note =
+      "Cash-box control documented as a 6-wire 24 V / 1 A socket. The command "
+      "implementation still needs verification on a unit, and must not be assumed for "
+      "any OEM sibling.";
   return profile;
 }
 
@@ -952,6 +1184,32 @@ CapabilityProfile partner_rp110() {
   profile.transport.bluetooth.classic_spp = true;
   profile.transport.bluetooth.ble = true;
   profile.transport.wifi = true;
+  return profile;
+}
+
+// --- M14: SNBC / New Beiyang (docs/cash-drawer.md §5) --------------------------------
+
+CapabilityProfile snbc_btp_r880() {
+  CapabilityProfile profile = snbcBase();
+  profile.name = "snbc_btp_r880";
+  profile.identity.model = "BTP-R880NP";
+  profile.drawer.note =
+      "Programming manual documents both the queued ESC p pulse and the realtime "
+      "DLE DC4 n m t variant; the queued pulse is what this engine emits, because a "
+      "realtime pulse can overtake a receipt still in the buffer.";
+  return profile;
+}
+
+CapabilityProfile snbc_btp_u80() {
+  CapabilityProfile profile = snbcBase();
+  profile.name = "snbc_btp_u80";
+  profile.identity.model = "BTP-U80 family";
+  // Same vendor, same interface class, but the drawer command reference this database
+  // trusts is the BTP-R880NP one. Port classification carries across the 80 mm line;
+  // the command half drops back to a probe question rather than borrowing a manual.
+  profile.drawer.evidence.commands = Provenance::Unverified;
+  profile.drawer.status.available = false;
+  profile.drawer.status.method = DrawerStatusMethod::None;
   return profile;
 }
 
@@ -1432,6 +1690,14 @@ CapabilityProfile generic_80() {
   profile.inter_chunk_delay_ms = 20;
   profile.completion_timeout_ms = 20000;
   profile.final_feed_lines = 6;
+  // M14, docs/cash-drawer.md fleet table: "Generic 80 mm ESC/POS — disabled
+  // initially, electrical unknown". The connector on an unidentified printer is a
+  // 6P6C-shaped hole and nothing more.
+  makeUnclassifiedDrawerPort(
+      profile,
+      "Drawer disabled: this is an unidentified device, so the connector pinout and "
+      "drive voltage are unknown. Identify the model, then its drawer port, then "
+      "connect a cable — in that order.");
   return profile;
 }
 
@@ -1447,6 +1713,15 @@ CapabilityProfile generic_58() {
   profile.chunk_bytes = 512;
   profile.inter_chunk_delay_ms = 30;
   profile.final_feed_lines = 6;
+  // M14, docs/cash-drawer.md fleet table, the row printed in bold: "Generic 58 mm
+  // ESC/POS — **frequently 12 V** — Never assume 24 V." Same refusal as generic_80,
+  // different warning, because the failure mode here is not "the drawer does not open"
+  // but "a 24 V drawer on a 12 V output, or a 12 V drive circuit asked to run one".
+  makeUnclassifiedDrawerPort(
+      profile,
+      "Drawer disabled, and NEVER assume 24 V on this size class: 58 mm units "
+      "frequently specify a 12 V / 1 A drawer output. Voltage and pinout must both be "
+      "established on the actual model before a drawer is connected.");
   return profile;
 }
 

@@ -448,18 +448,21 @@ class PrinterRuntime {
   PrinterRuntime(PrinterConfig config, std::shared_ptr<JobStore> store,
                  std::shared_ptr<MarkerAllocator> markers,
                  std::shared_ptr<DriverEventHub> hub, std::shared_ptr<JobIndex> index,
-                 std::shared_ptr<FindingsStore> capabilities)
+                 std::shared_ptr<FindingsStore> capabilities,
+                 std::shared_ptr<DrawerPolarityStore> drawer_polarities)
       : config_(std::move(config)),
         store_(std::move(store)),
         markers_(std::move(markers)),
         hub_(std::move(hub)),
         index_(std::move(index)),
-        capabilities_(std::move(capabilities)) {}
+        capabilities_(std::move(capabilities)),
+        drawer_polarities_(std::move(drawer_polarities)) {}
 
   ~PrinterRuntime() { stop(); }
 
   void start() {
     applyStoredFindings();
+    applyStoredDrawerPolarity();  // M14
     worker_ = std::thread([this] { workerLoop(); });
     // Queued before any job can be, so a promoted profile is in force by the time the
     // first receipt is built rather than one receipt too late.
@@ -521,6 +524,16 @@ class PrinterRuntime {
   void openCashDrawer();
   void drain();
 
+  // --- M14: cash drawer -------------------------------------------------------------
+  DrawerOpenResult openDrawer(const DrawerRequest& request);
+  DrawerReading readDrawerSensor(std::chrono::milliseconds timeout);
+  bool calibrateDrawerPolarity(bool high_means_open);
+  DrawerPolarity drawerPolarity() const {
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    return config_.profile.drawer.status.polarity;
+  }
+  // --- end M14 ----------------------------------------------------------------------
+
   void subscribeDevice(DeviceEventCallback callback) {
     std::lock_guard<std::mutex> lock(subscriber_mutex_);
     device_subscribers_.push_back(std::move(callback));
@@ -529,6 +542,10 @@ class PrinterRuntime {
  private:
   void workerLoop();
   void push(Task task);
+  // M14. The peripheral lane: the same worker, so a pulse can never interleave with a
+  // fenced job's bytes, but with a say in where it lands relative to jobs that are
+  // merely queued. See openDrawer() for why canKickDuringPrint decides that.
+  void pushPeripheral(Task task, bool ahead_of_queued_jobs);
 
   bool ensureConnected(std::string* error);
   void closeTransport();
@@ -536,6 +553,19 @@ class PrinterRuntime {
   void applyStoredFindings();
   void scheduleProbe();
   void runProbe();
+
+  // --- M14 ---
+  void applyStoredDrawerPolarity();
+  // Records a drawer sense level observed anywhere: a GS r 2 answer, an ASB frame, or
+  // a DLE EOT 1 answer taken during preflight. The verification window watches this.
+  std::optional<bool> drawerPin() const;
+  // Sends GS r 2 and waits for the queued answer. Runs on the worker thread only.
+  std::optional<bool> pollDrawerPin(const CapabilityProfile& profile,
+                                    std::chrono::milliseconds timeout);
+  // The whole opening sequence, on the worker thread.
+  DrawerOpenResult runDrawerSequence(const CapabilityProfile& profile,
+                                     const DrawerRequest& request);
+  // --- end M14 ---
 
   void runJob(const std::shared_ptr<PrintJob>& job, const Payload& payload,
               const JobOptions& options, uint32_t attempt, bool banner);
@@ -563,7 +593,10 @@ class PrinterRuntime {
 
   void beginJobIo();
   WaitOutcome awaitToken(const std::string& token, std::chrono::milliseconds timeout);
-  WaitOutcome awaitQueued(std::chrono::milliseconds timeout);
+  // `out_byte`, when non-null, receives the raw answer byte the expectation consumed.
+  // The fence path ignores it — a GS r 1 answer is a completion signal and nothing
+  // else — while the drawer path (M14) reads bit 0 of a GS r 2 answer out of it.
+  WaitOutcome awaitQueued(std::chrono::milliseconds timeout, uint8_t* out_byte = nullptr);
   WaitOutcome awaitRealtime(size_t count, std::chrono::milliseconds timeout,
                             std::vector<escpos::ParsedEvent>* out);
   void clearRealtime();
@@ -600,6 +633,15 @@ class PrinterRuntime {
   std::shared_ptr<FindingsStore> capabilities_;
   std::shared_ptr<CapabilityProbe> probe_;
   mutable std::mutex probe_mutex_;
+  // M14. Shared with the driver; the polarity is per printer id.
+  std::shared_ptr<DrawerPolarityStore> drawer_polarities_;
+  // M14. Guarded by status_mutex_ alongside status_, because both are fed from the
+  // same decoded frames.
+  std::optional<bool> drawer_pin_;
+  // M14. When the last pulse left, so the manufacturer cooldown can be enforced
+  // before the next one. Guarded by queue_mutex_; only the worker writes it.
+  MonotonicTime last_drawer_pulse_{};
+  bool drawer_pulsed_ = false;
 
   std::thread worker_;
   std::mutex queue_mutex_;
@@ -619,6 +661,7 @@ class PrinterRuntime {
   escpos::ResponseParser parser_;
   std::vector<std::string> gsh_tokens_;
   size_t queued_answers_ = 0;
+  std::deque<uint8_t> queued_bytes_;  // M14; see awaitQueued's out_byte
   std::vector<escpos::ParsedEvent> realtime_answers_;
   bool link_down_ = false;
 
@@ -649,6 +692,27 @@ void PrinterRuntime::push(Task task) {
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     tasks_.push_back(std::move(task));
+  }
+  queue_cv_.notify_all();
+}
+
+// M14. There is one worker per printer and it runs a task to completion, so a drawer
+// pulse can never land between two bytes of a receipt whatever this does — the "no
+// receipt/cutter/drawer interleaving" rule of docs/cash-drawer.md is a property of the
+// lane, not of a flag. What the flag decides is the *ordering against jobs that are
+// only queued*: a printer whose drawer output may fire while the mechanism prints has
+// no reason to make a cash tender wait behind three kitchen tickets, so its pulse goes
+// in front of them. A printer whose drawer output cannot fire while printing (the
+// Citizen quirk, §3) is serialised strictly behind everything already queued, which is
+// the daemon behaviour that document asks for: finish the receipt, then pulse.
+void PrinterRuntime::pushPeripheral(Task task, bool ahead_of_queued_jobs) {
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (ahead_of_queued_jobs) {
+      tasks_.push_front(std::move(task));
+    } else {
+      tasks_.push_back(std::move(task));
+    }
   }
   queue_cv_.notify_all();
 }
@@ -891,6 +955,10 @@ void PrinterRuntime::onBytes(const uint8_t* data, size_t size) {
             break;
           case escpos::ParsedEventKind::QueuedStatus:
             ++queued_answers_;
+            // M14. The byte itself, kept alongside the count: a GS r 1 answer is a
+            // completion signal whose value nothing reads, and a GS r 2 answer is a
+            // drawer sense level that is nothing but its value.
+            queued_bytes_.push_back(event.byte);
             break;
           case escpos::ParsedEventKind::RealtimeStatus:
             mergeStatus(event.flags, &events);
@@ -935,6 +1003,10 @@ void PrinterRuntime::mergeStatus(const escpos::StatusFlags& flags,
     if (flags.cutter_error) status_.cutter_error = flags.cutter_error;
     if (flags.unrecoverable_error) status_.unrecoverable_error = flags.unrecoverable_error;
     if (flags.auto_recoverable_error) status_.recoverable_error = flags.auto_recoverable_error;
+    // M14. ASB reports drawer-connector changes without being asked, and DLE EOT 1
+    // carries the same bit, so the drawer's verification window gets its answer from
+    // whichever arrives first rather than only from its own polls.
+    if (flags.drawer_pin_high) drawer_pin_ = flags.drawer_pin_high;
   }
   if (out) {
     out->insert(out->end(), events.begin(), events.end());
@@ -965,6 +1037,7 @@ void PrinterRuntime::beginJobIo() {
   parser_.reset();
   gsh_tokens_.clear();
   queued_answers_ = 0;
+  queued_bytes_.clear();  // M14
   realtime_answers_.clear();
   link_down_ = false;
   // M13b. star_counter_ is deliberately not cleared here: it is session state, not job
@@ -1006,13 +1079,20 @@ WaitOutcome PrinterRuntime::awaitToken(const std::string& token,
   return WaitOutcome::Timeout;
 }
 
-WaitOutcome PrinterRuntime::awaitQueued(std::chrono::milliseconds timeout) {
+WaitOutcome PrinterRuntime::awaitQueued(std::chrono::milliseconds timeout,
+                                        uint8_t* out_byte) {
   std::unique_lock<std::mutex> lock(io_mutex_);
   io_cv_.wait_for(lock, timeout, [this] {
     return stopping_.load() || link_down_ || queued_answers_ > 0;
   });
   if (queued_answers_ > 0) {
     --queued_answers_;
+    if (!queued_bytes_.empty()) {
+      if (out_byte != nullptr) {
+        *out_byte = queued_bytes_.front();
+      }
+      queued_bytes_.pop_front();
+    }
     return WaitOutcome::Signalled;
   }
   if (link_down_) {
@@ -2001,6 +2081,263 @@ void PrinterRuntime::openCashDrawer() {
   push(std::move(task));
 }
 
+// --- M14: the verified opening sequence (docs/cash-drawer.md) -----------------------
+
+void PrinterRuntime::applyStoredDrawerPolarity() {
+  if (!drawer_polarities_) {
+    return;
+  }
+  const std::optional<bool> stored = drawer_polarities_->find(config_.id);
+  if (!stored.has_value()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(profile_mutex_);
+  config_.profile.drawer.status.polarity.calibrated = true;
+  config_.profile.drawer.status.polarity.high_means_open = *stored;
+}
+
+std::optional<bool> PrinterRuntime::drawerPin() const {
+  std::lock_guard<std::mutex> lock(status_mutex_);
+  return drawer_pin_;
+}
+
+std::optional<bool> PrinterRuntime::pollDrawerPin(const CapabilityProfile& profile,
+                                                  std::chrono::milliseconds timeout) {
+  const auto forget = [this] {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    // An expectation nobody answered would consume the *next* queued answer and
+    // attribute a stale byte to a fresh question, so it is dropped with the phase that
+    // asked for it — the same rule clearRealtime() applies to DLE EOT.
+    if (parser_.outstandingQueued() > 0) {
+      parser_.reset();
+    }
+    queued_answers_ = 0;
+    queued_bytes_.clear();
+  };
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    parser_.expectQueued();
+  }
+  if (!sendPaced(profile, escpos::gsDrawerStatus()).ok) {
+    forget();
+    return std::nullopt;
+  }
+  uint8_t answer = 0;
+  if (awaitQueued(timeout, &answer) != WaitOutcome::Signalled) {
+    forget();
+    return std::nullopt;
+  }
+  const bool high = drawerPinHigh(answer);
+  {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    status_.observed = true;
+    drawer_pin_ = high;
+  }
+  return high;
+}
+
+DrawerOpenResult PrinterRuntime::runDrawerSequence(const CapabilityProfile& profile,
+                                                   const DrawerRequest& request) {
+  const DrawerCapabilities& caps = profile.drawer;
+  DrawerOpenResult result;
+  result.channel = caps.channelFor(request.channel);
+  result.pulse_ms = caps.pulseFor(request.pulse_ms);
+
+  std::string error;
+  if (!ensureConnected(&error)) {
+    // Nothing reached the link, so nothing is known and nothing is claimed.
+    result.pulse_ms = 0;
+    return result;
+  }
+  beginJobIo();
+
+  const auto poll_timeout = std::chrono::milliseconds(
+      caps.status.poll_interval_ms != 0 ? caps.status.poll_interval_ms : 100);
+  const bool sensor = caps.sensorReadable();
+
+  // Step 1 — read the sensor first. A drawer that is already out is never pulsed
+  // again: the solenoid would buzz against an open latch for nothing.
+  std::optional<bool> before;
+  if (sensor) {
+    before = pollDrawerPin(profile, std::chrono::milliseconds(profile.preflight_timeout_ms));
+  }
+  if (before.has_value()) {
+    result.previous_state = drawerStateFrom(*before, caps.status.polarity);
+    if (result.previous_state == DrawerState::Open) {
+      result.pulse_ms = 0;
+      result.state = DrawerState::Open;
+      return result;
+    }
+  } else {
+    // No switch on this port, or a switch whose answer never came back. The two are
+    // different facts and both end the sequence at KickSentUnverified below.
+    result.previous_state = sensor ? DrawerState::Unknown : DrawerState::NoSensor;
+  }
+
+  // Step 8, of the *previous* pulse: the manufacturer cooldown is a property of the
+  // solenoid, not of a call, so it is enforced here rather than left to the caller.
+  if (drawer_pulsed_ && caps.kick.cooldown_ms != 0) {
+    const auto cooldown = std::chrono::milliseconds(caps.kick.cooldown_ms);
+    const auto since = MonotonicClock::now() - last_drawer_pulse_;
+    if (since < cooldown) {
+      std::this_thread::sleep_for(cooldown - since);
+    }
+  }
+
+  // Step 3 — one queued pulse, at the profile's duration, on the requested channel.
+  const MonotonicTime pulse_at = MonotonicClock::now();
+  const TransportResult sent =
+      sendPaced(profile, escpos::drawerKick(result.channel, result.pulse_ms));
+  last_drawer_pulse_ = MonotonicClock::now();
+  drawer_pulsed_ = true;
+  if (!sent.ok) {
+    // A short or refused write: the pulse may or may not have been received, which is
+    // exactly the Unknown that the rest of this SDK refuses to round off.
+    result.state = DrawerState::Unknown;
+    return result;
+  }
+
+  if (!before.has_value()) {
+    // Steps 4-6 need something that can answer, and nothing here can. This is the
+    // print-server rule of docs/cash-drawer.md: the kick travels forward while the
+    // sensor answer does not come back, and that path supports KickSentUnverified —
+    // never OpenVerified.
+    result.state = DrawerState::KickSentUnverified;
+    return result;
+  }
+
+  // Steps 4-6 — watch the switch. The polls are GS r 2; an ASB frame reporting a
+  // drawer-connector change arrives on its own and is picked up from the same place.
+  const auto window = std::chrono::milliseconds(
+      caps.status.verify_window_ms != 0 ? caps.status.verify_window_ms : 1500);
+  const MonotonicTime deadline = pulse_at + window;
+  const DrawerPolarity polarity = caps.status.polarity;
+  bool verified = false;
+  bool answered = false;
+  for (;;) {
+    std::optional<bool> level = pollDrawerPin(profile, poll_timeout);
+    if (!level.has_value()) {
+      level = drawerPin();
+    }
+    if (level.has_value()) {
+      answered = true;
+      const bool opened = polarity.calibrated
+                              ? *level == polarity.high_means_open
+                              // Uncalibrated: the direction has no name, but a switch
+                              // that moved is still a switch that moved, and that is
+                              // the claim OpenVerified makes.
+                              : *level != *before;
+      if (opened) {
+        verified = true;
+        break;
+      }
+    }
+    if (stopping_.load() || MonotonicClock::now() >= deadline) {
+      break;
+    }
+    std::this_thread::sleep_for(poll_timeout);
+  }
+  result.elapsed_ms = static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(MonotonicClock::now() -
+                                                            pulse_at)
+          .count());
+  if (verified) {
+    result.state = DrawerState::OpenVerified;
+  } else if (!answered) {
+    // It answered before the pulse and stopped answering after it. Reporting
+    // FailedToOpen would claim a measurement that was never taken.
+    result.state = DrawerState::KickSentUnverified;
+  } else if (polarity.calibrated) {
+    result.state = DrawerState::FailedToOpen;
+  } else {
+    // Uncalibrated and unchanged: this cannot tell "it was already open" from "it
+    // never opened", so it says so instead of picking one.
+    result.state = DrawerState::KickSentUnverified;
+  }
+  return result;
+}
+
+DrawerOpenResult PrinterRuntime::openDrawer(const DrawerRequest& request) {
+  const CapabilityProfile profile = this->profile();
+  const DrawerCapabilities& caps = profile.drawer;
+
+  DrawerOpenResult refused;
+  refused.channel = caps.channelFor(request.channel);
+  // Refusal writes zero bytes and claims nothing. Three ways to get here: no drawer
+  // port on this model, a kick method this engine cannot drive (Star's peripheral
+  // command, ePOS, a vendor SDK), and — the giant-letters rule — a port whose
+  // electrical standard nobody has established.
+  if (!caps.kickable() || !profile.drivableByEscposEngine() || stopping_.load()) {
+    return refused;
+  }
+
+  auto done = std::make_shared<std::promise<DrawerOpenResult>>();
+  auto future = done->get_future();
+  Task task;
+  task.run = [this, profile, request, done] {
+    done->set_value(runDrawerSequence(profile, request));
+  };
+  task.cancel = [done, refused] { done->set_value(refused); };
+  pushPeripheral(std::move(task), caps.kick.can_kick_during_print);
+  future.wait();
+  return future.get();
+}
+
+DrawerReading PrinterRuntime::readDrawerSensor(std::chrono::milliseconds timeout) {
+  const CapabilityProfile profile = this->profile();
+  const DrawerCapabilities& caps = profile.drawer;
+
+  DrawerReading empty;
+  empty.available = caps.sensorReadable();
+  empty.needs_calibration = !caps.status.polarity.calibrated;
+  if (!empty.available || !profile.drivableByEscposEngine() || stopping_.load()) {
+    return empty;
+  }
+
+  auto done = std::make_shared<std::promise<DrawerReading>>();
+  auto future = done->get_future();
+  Task task;
+  task.run = [this, profile, timeout, done, empty] {
+    DrawerReading reading = empty;
+    std::string error;
+    if (!ensureConnected(&error)) {
+      done->set_value(reading);
+      return;
+    }
+    beginJobIo();
+    const std::optional<bool> level = pollDrawerPin(profile, timeout);
+    if (level.has_value()) {
+      reading.answered = true;
+      reading.pin_high = *level;
+      reading.state = drawerStateFrom(*level, profile.drawer.status.polarity);
+    }
+    done->set_value(reading);
+  };
+  task.cancel = [done, empty] { done->set_value(empty); };
+  // A read is non-destructive — it cannot energise anything — so it goes in front of
+  // queued jobs whatever canKickDuringPrint says. It still runs as its own task on the
+  // one worker, so it cannot land inside a receipt.
+  pushPeripheral(std::move(task), true);
+  future.wait();
+  return future.get();
+}
+
+bool PrinterRuntime::calibrateDrawerPolarity(bool high_means_open) {
+  {
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    config_.profile.drawer.status.polarity.calibrated = true;
+    config_.profile.drawer.status.polarity.high_means_open = high_means_open;
+  }
+  if (!drawer_polarities_ || !drawer_polarities_->persistent()) {
+    // The calibration still applies to this process; it simply will not outlive it.
+    return false;
+  }
+  drawer_polarities_->save(config_.id, high_means_open);
+  return true;
+}
+
+// --- end M14 -------------------------------------------------------------------------
+
 }  // namespace detail
 
 // --- Printer ---------------------------------------------------------------------
@@ -2046,6 +2383,26 @@ void Printer::subscribe(DeviceEventCallback callback) {
 
 void Printer::openCashDrawer() { rt_->openCashDrawer(); }
 
+// --- M14: cash drawer ---------------------------------------------------------------
+
+DrawerOpenResult Printer::openDrawer(const DrawerRequest& request) {
+  return rt_->openDrawer(request);
+}
+
+DrawerReading Printer::readDrawerSensor(std::chrono::milliseconds timeout) {
+  return rt_->readDrawerSensor(timeout);
+}
+
+bool Printer::calibrateDrawerPolarity(bool high_means_open) {
+  return rt_->calibrateDrawerPolarity(high_means_open);
+}
+
+DrawerCapabilities Printer::drawerCapabilities() const { return rt_->profile().drawer; }
+
+DrawerPolarity Printer::drawerPolarity() const { return rt_->drawerPolarity(); }
+
+// --- end M14 -------------------------------------------------------------------------
+
 void Printer::drain() { rt_->drain(); }
 
 std::shared_ptr<PrintJob> Printer::reserveJob(const std::string& key, PayloadKind kind,
@@ -2066,6 +2423,9 @@ PrinterDriver::PrinterDriver(StorageConfig storage)
       // After the store, which is what creates the directory the nonce lives in.
       markers_(std::make_shared<detail::MarkerAllocator>(
           loadOrCreateNonce(storage.directory))) {
+  // M14. Same directory, same "describes the installation, not this run" rule as the
+  // instance nonce above.
+  drawer_polarities_ = std::make_shared<DrawerPolarityStore>(storage.directory);
   hub_ = std::make_shared<detail::DriverEventHub>();
   index_ = std::make_shared<detail::JobIndex>();
   // Jobs from a previous run come back as terminal handles so findJob(key) works
@@ -2137,7 +2497,8 @@ std::shared_ptr<Printer> PrinterDriver::addPrinter(PrinterConfig config) {
     config.id = probe ? probe->describe() : ("printer-" + newJobId());
   }
   auto runtime = std::make_shared<detail::PrinterRuntime>(
-      std::move(config), store_, markers_, hub_, index_, capabilities_);
+      std::move(config), store_, markers_, hub_, index_, capabilities_,
+      drawer_polarities_);  // M14
   runtime->start();
   auto printer = std::shared_ptr<Printer>(new Printer(runtime));
   std::lock_guard<std::mutex> lock(mutex_);

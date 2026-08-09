@@ -162,6 +162,8 @@ class Agent {
   HttpResponse getPrinters() const;
   HttpResponse postPrinters(const HttpRequest& request);
   HttpResponse getPrinterStatus(const std::string& id, const HttpRequest& request);
+  // M14 — POST /printers/<id>/drawer {channel?, pulseMs?} (docs/cash-drawer.md).
+  HttpResponse postPrinterDrawer(const std::string& id, const HttpRequest& request);
   HttpResponse getHealth() const;
 
   // --- M13b: CloudPRNT ------------------------------------------------------------------

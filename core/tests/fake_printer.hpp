@@ -84,6 +84,40 @@ struct Script {
   bool answer_asb = true;
   // ASB frame sent when GS a enables status back: healthy, cover closed, paper ok.
   std::array<uint8_t, 4> asb_frame{0x10, 0x10, 0x10, 0x10};
+
+  // --- M14: the cash drawer (docs/cash-drawer.md) ---------------------------------
+  // A drawer is a solenoid latch plus a microswitch, and the whole point of the
+  // milestone is that those two are separate: the pulse is an output and the switch is
+  // an input, and a device can perfectly well accept the first while the second says
+  // nothing. Each flag below turns one of the doc's cases into something a test can
+  // hold still.
+
+  // Whether GS r 2 is answered at all. False is the print-server / no-back-channel
+  // case, where the kick travels forward and the sensor answer never returns.
+  bool answer_drawer_status = true;
+  // The microswitch's current position, which the fixture moves rather than the test.
+  bool drawer_open = false;
+  // A healthy drawer opens when the solenoid is energised. False is the locked
+  // drawer, the jam, the wrong channel and the wrong cable — every case that ends at
+  // FailedToOpen, all of which look identical from this side of the connector.
+  bool drawer_opens_on_kick = true;
+  // Star's warning made concrete: the level the sense line sits at when the drawer is
+  // open depends on the drawer, not on the printer.
+  bool drawer_pin_high_when_open = true;
+  // Only this channel physically moves anything. Kicking the other one is accepted by
+  // the firmware and does nothing, which is exactly what a miswired install looks like.
+  uint8_t drawer_wired_channel = 1;
+};
+
+// One ESC p as the device saw it, decoded (docs/cash-drawer.md §1): channel 1 is
+// m = 0/48 (pin 2) and channel 2 is m = 1/49 (pin 5); the times are in 2 ms units.
+struct DrawerKickRecord {
+  uint8_t channel = 1;
+  uint8_t on_units = 0;
+  uint8_t off_units = 0;
+  // How much print data had been consumed when the pulse was reached, so a test can
+  // prove that a pulse never landed inside a receipt.
+  size_t print_data_len = 0;
 };
 
 inline uint8_t withBit(uint8_t base, unsigned index) {
@@ -155,6 +189,26 @@ class FakePrinter {
     std::lock_guard<std::mutex> lock(mutex_);
     return drawer_kicks_;
   }
+  // --- M14 ---
+  std::vector<DrawerKickRecord> drawerKickRecords() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return drawer_kick_records_;
+  }
+  size_t drawerStatusRequests() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return drawer_status_requests_;
+  }
+  bool drawerOpen() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return script_.drawer_open;
+  }
+  // Moves the physical drawer without going through the printer, which is what an
+  // operator does during the non-destructive calibration of `pdctl drawer-probe`.
+  void setDrawerOpen(bool open) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    script_.drawer_open = open;
+  }
+  // --- end M14 ---
   size_t rasterBlocks() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return raster_blocks_;
@@ -301,9 +355,22 @@ class FakePrinter {
           continue;
         }
         if (second == 0x72 && offset + 2 < pending_.size()) {  // GS r n
-          ++queued_requests_;
-          if (script_.answer_queued_status) {
-            out.push_back(script_.queued_status);
+          // M14. GS r 1 is the paper-status completion fence; GS r 2 (and GS r 50) is
+          // the drawer-kick-out connector status, and the two are different questions
+          // answered by different bytes. Answering one with the other is precisely the
+          // conflation docs/cash-drawer.md keeps separating.
+          const uint8_t kind = pending_[offset + 2];
+          if (kind == 2 || kind == 50) {
+            ++drawer_status_requests_;
+            if (script_.answer_drawer_status) {
+              const bool high = script_.drawer_open == script_.drawer_pin_high_when_open;
+              out.push_back(static_cast<uint8_t>(high ? 0x01 : 0x00));
+            }
+          } else {
+            ++queued_requests_;
+            if (script_.answer_queued_status) {
+              out.push_back(script_.queued_status);
+            }
           }
           offset += 3;
           continue;
@@ -368,6 +435,18 @@ class FakePrinter {
           break;
         }
         ++drawer_kicks_;
+        // M14. Decode it rather than just counting it: which output was energised and
+        // for how long are the two things an integrator is actually testing.
+        DrawerKickRecord record;
+        record.channel = static_cast<uint8_t>((pending_[offset + 2] % 48u) + 1u);
+        record.on_units = pending_[offset + 3];
+        record.off_units = pending_[offset + 4];
+        record.print_data_len = print_data_.size();
+        drawer_kick_records_.push_back(record);
+        // The solenoid only moves the drawer it is wired to.
+        if (script_.drawer_opens_on_kick && record.channel == script_.drawer_wired_channel) {
+          script_.drawer_open = true;
+        }
         offset += 5;
         continue;
       }
@@ -402,6 +481,8 @@ class FakePrinter {
   size_t queued_requests_ = 0;
   size_t cuts_ = 0;
   size_t drawer_kicks_ = 0;
+  std::vector<DrawerKickRecord> drawer_kick_records_;  // M14
+  size_t drawer_status_requests_ = 0;                  // M14
   size_t raster_blocks_ = 0;
   size_t process_ids_answered_ = 0;
   bool foreign_emitted_ = false;
@@ -654,6 +735,32 @@ inline pd::CapabilityProfile fastProfile(pd::CompletionMechanism mechanism) {
     profile.name = "none-profile";
     profile.status.dle_eot = false;
   }
+  return profile;
+}
+
+// M14. The same trick for the drawer: production profiles watch the switch for 1-2
+// seconds after the pulse (docs/cash-drawer.md step 4), which is right on a counter and
+// unaffordable in a suite that runs the failure cases too. Everything else — the port
+// classification, the method, the cooldown, the polarity — is left to the caller,
+// because those are the facts under test.
+inline pd::CapabilityProfile drawerProfile(pd::CompletionMechanism mechanism) {
+  pd::CapabilityProfile profile = fastProfile(mechanism);
+  profile.drawer.present = true;
+  profile.drawer.electrical.standard = pd::DrawerPortStandard::Epson24V6P6C;
+  profile.drawer.electrical.voltage = 24;
+  profile.drawer.electrical.max_current_ma = 1000;
+  profile.drawer.electrical.channel_count = 2;
+  profile.drawer.electrical.sensor_pin = 3;
+  profile.drawer.kick.method = pd::DrawerKickMethod::EpsonEscP;
+  profile.drawer.kick.default_pulse_ms = 200;
+  profile.drawer.kick.max_pulse_ms = 500;
+  profile.drawer.kick.cooldown_ms = 0;
+  profile.drawer.status.available = true;
+  profile.drawer.status.method = pd::DrawerStatusMethod::GsR2;
+  profile.drawer.status.verify_window_ms = 120;
+  profile.drawer.status.poll_interval_ms = 10;
+  profile.drawer.evidence.electrical = pd::Provenance::Documented;
+  profile.drawer.evidence.commands = pd::Provenance::Documented;
   return profile;
 }
 
