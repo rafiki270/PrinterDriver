@@ -230,3 +230,35 @@ receipt demonstrably did not finish.
 
 - The XP-S260M's LAN IP address on the local network (`192.168.x.x` or `10.x.x.x` is fine).
 - Which machine will run the test: Mac, Linux/Raspberry Pi, or Windows.
+
+## ✅ Hardware finding: the XP-S260M impersonates an Epson — 2026-08-09
+
+`pdctl autodetect 192.168.1.0/24` against the reference unit:
+
+```
+IP                  VENDOR    MODEL       TRUSTED  PROFILE      COMPLETION  CEILING
+192.168.1.101:9100  Unknown   TM-T88III   NO       generic_80   GsParenH    A
+  identity untrusted (35%)
+```
+
+**The unit answers `GS I` with "TM-T88III"** — an Epson model it is not. This is the
+impersonation case [capability-profiles.md](capability-profiles.md) documents for clone
+firmware (Rongta's manual shows "EPOSN"/"TM-T88V"), now observed first-hand on our own
+hardware rather than inferred from a vendor manual.
+
+The identification logic behaved correctly: identity marked **untrusted** at 35%, the
+Epson profile **not** loaded on the strength of a self-reported string, `generic_80`
+selected instead, and the reason stated on the report. Had `GS I` been trusted, this
+printer would have been driven with Epson-specific assumptions — including Epson's
+drawer pinout and command set — on hardware that merely claims the name.
+
+Also confirmed in the same run: `autodetect` promotes the completion *flag* but not its
+*provenance* from a printless probe (`GS ( H` shown as `Unverified` even though the
+mechanism answered), which is the documented honesty rule — a fence asked out of an
+empty buffer proves the command exists, not that its answer waits for paper. The
+`Probed` promotion in the earlier self-test came from a run that actually printed.
+
+`pdctl drawer-probe` on the same unit reports the documented 24 V / 1 A `Epson24V6P6C`
+port with sensor pin 3, kick method `EpsonEscP`, and `Unverified` command provenance —
+a pulse would honestly end at `KickSentUnverified` until `pdctl drawer test` establishes
+otherwise against a physically attached drawer.

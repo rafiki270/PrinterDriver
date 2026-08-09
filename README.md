@@ -87,8 +87,32 @@ curl -X POST localhost:8880/jobs -d '{"printerId":"...","payload":{"text":"..."}
 | Generic ESC/POS (80/58 mm) | conservative defaults, auto-upgraded after a probe |
 | Zebra ZQ, Brother RJ | not ESC/POS — detected and reported, never driven blind |
 
-Unknown printers are probed automatically: profiles supply defaults, a one-time
-capability probe measures what the device actually supports.
+### Unbranded and clone printers
+
+Cheap ESC/POS printers are the normal case, not the exception, and they are handled
+without a hardcoded model list:
+
+```sh
+build/pdctl autodetect            # scans the subnet, identifies, classifies — prints nothing
+```
+
+Each device found is identified from several signals (MAC OUI, its `GS I` reply,
+observed command behaviour), matched to a profile, and probed once for what it actually
+supports; results are cached per model+firmware. Profiles only supply defaults — the
+probe decides. A no-name 80 mm printer that turns out to answer `GS ( H` gets full
+completion feedback; one that doesn't falls back to `GS r 1` or reports plainly that it
+can't confirm anything.
+
+**Model names from the printer are not trusted on their own.** Clone firmware commonly
+reports somebody else's model: the reference Xprinter used to develop this SDK answers
+`GS I` with `TM-T88III`, an Epson it isn't ([docs/testing-plan.md](docs/testing-plan.md)).
+Loading an Epson profile on that basis would apply Epson's command set and drawer
+pinout to hardware that merely borrowed the name, so identification reports a confidence
+score and falls back to a conservative generic profile when the signals disagree.
+
+Details: [docs/capability-profiles.md](docs/capability-profiles.md) (identification and
+probing), [docs/device-database.md](docs/device-database.md) (profiles, media,
+print servers).
 
 ## Supported features
 

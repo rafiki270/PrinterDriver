@@ -687,3 +687,45 @@ PD_TEST(the_polarity_store_keeps_one_answer_per_printer) {
   memory.save("counter-1", true);
   CHECK(memory.find("counter-1").value_or(false));
 }
+
+// M16 (docs/api.md §16): a registered vendor kick fills DrawerKickMethod::Vendor. Its
+// kick_bytes produce the pulse (here the standard ESC p), so the sequence reaches the same
+// verified open a built-in method does. An unregistered Vendor method is refused.
+PD_TEST(a_registered_vendor_kick_reaches_a_verified_open) {
+  Rig rig;
+  rig.profile.drawer.kick.method = DrawerKickMethod::Vendor;
+  rig.profile.drawer.kick.vendor_id = "acme.kick";
+  rig.profile.drawer.status.polarity.calibrated = true;
+  rig.profile.drawer.status.polarity.high_means_open = true;
+
+  std::string error;
+  CHECK(rig.driver->registerDrawerKick(
+      DrawerKickReg{"acme.kick",
+                    [](uint8_t channel, uint16_t pulse_ms) -> escpos::Bytes {
+                      // This vendor path emits the standard ESC p pulse.
+                      return escpos::drawerKick(channel, pulse_ms);
+                    },
+                    {},
+                    {}},
+      &error));
+  rig.build();
+
+  const DrawerOpenResult result = rig.printer->openDrawer();
+  CHECK_EQ(result.state, DrawerState::OpenVerified);
+  CHECK_EQ(rig.link.device->drawerKicks(), size_t{1});
+  CHECK(rig.link.device->drawerOpen());
+}
+
+PD_TEST(an_unregistered_vendor_kick_is_refused_and_writes_no_bytes) {
+  Rig rig;
+  rig.profile.drawer.kick.method = DrawerKickMethod::Vendor;
+  rig.profile.drawer.kick.vendor_id = "acme.kick";
+  rig.profile.drawer.status.polarity.calibrated = true;
+  rig.profile.drawer.status.polarity.high_means_open = true;
+  // Deliberately no registerDrawerKick.
+  rig.build();
+
+  const DrawerOpenResult result = rig.printer->openDrawer();
+  CHECK_EQ(result.state, DrawerState::Unknown);
+  CHECK_EQ(rig.link.device->drawerKicks(), size_t{0});
+}

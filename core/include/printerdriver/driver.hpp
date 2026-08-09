@@ -17,6 +17,8 @@
 #include "printerdriver/escpos_encoder.hpp"
 #include "printerdriver/identity.hpp"
 #include "printerdriver/job_store.hpp"
+// M16 — the five per-driver-instance registries (docs/api.md §16).
+#include "printerdriver/registrations.hpp"
 // M15 — the option and result types for selfTest()/autoDetect() (docs/api.md §15).
 #include "printerdriver/self_test.hpp"
 #include "printerdriver/transport.hpp"
@@ -417,6 +419,35 @@ class PrinterDriver {
 
   void subscribeDevices(DriverDeviceEventCallback callback);
 
+  // --- M16: custom method registration (docs/api.md §16) ---------------------------
+  //
+  // Five runtime extension points, all per-driver-instance, all process-local (never
+  // persisted beyond their ids), all id-attributed in the results they produce. Each
+  // returns false and fills `error` (when non-null) on a bad/duplicate id or a record
+  // missing a required callback; a registered id is immutable for the driver's life, so a
+  // pointer handed to a worker thread never has to be re-validated.
+  //
+  //   registerCompletionMethod — a vendor idle/ack scheme becomes a real graded
+  //     completion path with no core release. A profile binds it by setting
+  //     completion == CompletionMechanism::VendorIdle and completion_vendor_id == the id.
+  //   registerProbeStep — extends probe()/autoDetect() fingerprinting. The request bytes
+  //     MUST be non-printing (enforced here, not on a paper roll).
+  //   registerBlockHandler — a new DSL block kind renders through the ordinary pipeline.
+  //   registerFormatter — backs {{ v | name:args }}, checked before the built-in table.
+  //   registerDrawerKick — fills DrawerKickMethod::Vendor for a profile.
+  bool registerCompletionMethod(CompletionMethod method, std::string* error = nullptr);
+  bool registerProbeStep(ProbeStep step, std::string* error = nullptr);
+  bool registerBlockHandler(BlockHandlerReg handler, std::string* error = nullptr);
+  bool registerFormatter(FormatterReg formatter, std::string* error = nullptr);
+  bool registerDrawerKick(DrawerKickReg kick, std::string* error = nullptr);
+
+  // The registries themselves, shared with every printer's worker and with the DSL
+  // renderer so a block handler / formatter registered here takes effect on this driver's
+  // self-test tickets and on the agent's template jobs.
+  Registrations& registrations() noexcept { return *registrations_; }
+  const Registrations& registrations() const noexcept { return *registrations_; }
+  // --- end M16 ---------------------------------------------------------------------
+
   JobStore& store() noexcept { return *store_; }
   const JobStore& store() const noexcept { return *store_; }
 
@@ -468,6 +499,7 @@ class PrinterDriver {
   std::shared_ptr<JobStore> store_;
   std::shared_ptr<FindingsStore> capabilities_;
   std::shared_ptr<DrawerPolarityStore> drawer_polarities_;  // M14
+  std::shared_ptr<Registrations> registrations_;            // M16
   std::shared_ptr<detail::MarkerAllocator> markers_;
   std::shared_ptr<detail::DriverEventHub> hub_;
   std::shared_ptr<detail::JobIndex> index_;

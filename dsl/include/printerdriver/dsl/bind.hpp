@@ -44,6 +44,9 @@ namespace pd::dsl {
 
 struct BindOptions {
   FormatTables tables = FormatTables::builtin();
+  // M16 (docs/api.md §16). The driver's per-instance registry, or nullptr; registered
+  // formatters are checked before the built-in table when substituting {{ v | name }}.
+  const ::pd::Registrations* registrations = nullptr;
   // Non-empty values win over the document's own meta.
   std::string locale;
   std::string currency;

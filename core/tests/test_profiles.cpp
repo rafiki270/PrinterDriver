@@ -830,3 +830,32 @@ PD_TEST(generic_unknown_prints_and_claims_nothing) {
   // generic_80 still claims the queued fence, which is the difference.
   CHECK_EQ(devices::generic_80().completion, CompletionMechanism::GsR1);
 }
+
+// M16 (docs/api.md §16): a registered probe step is run by the probe after its built-in
+// phases, and its classify result is attributed to the step id in the findings.
+PD_TEST(a_registered_probe_step_extends_the_fingerprint) {
+  pdfake::FakePrinter device;  // healthy default: answers the built-in fences
+  ProbeOptions options;
+  bool ran = false;
+  ProbeStep step;
+  step.id = "acme.house-quirk";
+  step.request_bytes = {0x1B, 0x05};  // ESC ENQ, non-printing
+  step.classify = [&ran](const std::vector<uint8_t>& response) -> ProbeFinding {
+    ran = true;
+    ProbeFinding finding;
+    finding.answered = !response.empty();
+    finding.label = "checked";
+    return finding;
+  };
+  options.custom_steps.push_back(step);
+
+  const CapabilityFindings findings = probeDevice(device, options);
+  CHECK(ran);
+  CHECK_EQ(findings.custom_probe.size(), size_t{1});
+  if (!findings.custom_probe.empty()) {
+    CHECK_EQ(findings.custom_probe[0].id, std::string("acme.house-quirk"));
+    CHECK_EQ(findings.custom_probe[0].finding.label, std::string("checked"));
+  }
+  // The built-in phases still ran alongside it.
+  CHECK(findings.gs_h_process_id.value_or(false));
+}

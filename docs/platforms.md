@@ -80,3 +80,65 @@ the SDK gets the same `GS ( H`-fenced tri-state truth as every other platform, w
 | Dart/Flutter package | pub.dev |
 | .NET wrapper + native DLL | NuGet (`runtimes/` layout) |
 | C/C++ | CMake from source; vcpkg candidate later |
+
+## React Native / Expo wrapper
+
+**The short version:** RN's New Architecture supports **C++ TurboModules**, which bind a
+C ABI directly and compile once for both platforms. `pd.h` is already that ABI, so an RN
+wrapper is a thin JSI layer plus packaging — no new native logic on either side.
+
+### Shape
+
+```
+JS/TS app
+  │  npm package `printerdriver-react-native`
+  ▼
+TS spec (codegen) ── NativePrinterDriver.ts
+  │
+  ▼
+C++ TurboModule (shared, one implementation)
+  │  calls pd_* directly
+  ▼
+core/src + capi/src   ← the same files SwiftPM and the AAR compile
+```
+
+iOS: a podspec compiling `core/src` + `capi/src` + the module (mirrors `Package.swift`).
+Android: `build.gradle` + `CMakeLists.txt` compiling the same sources (mirrors
+`wrappers/android`). Autolinking via `react-native.config.js`; Expo apps add a config
+plugin so it works without ejecting.
+
+### Mapping the API to JS
+
+| Core concept | RN surface |
+|---|---|
+| `pd_print`, fenced completion | `Promise<JobResult>` — resolves on the terminal state |
+| Job events | event emitter keyed by job id, or an async iterator |
+| Device events, `discover`, `autoDetect` | event emitter streams (candidates as found) |
+| Tri-state result | discriminated union `{outcome:'done'\|'failed'\|'unknown', confidence, grade, authority, method}` — never a boolean |
+| Closed enums | TS string-literal unions generated from `pd.h`, asserted by a bridge test like the other wrappers |
+| Raster payloads | JSI `ArrayBuffer` (zero copy); base64 only as a fallback |
+| Custom transports (§ Bluetooth) | JS-supplied `connect/write/close` callbacks over the existing vtable ABI — lets an RN app use its own BLE stack |
+
+### Threading
+
+Core callbacks arrive on printer worker/reader threads; the module must hop them to JS
+through the TurboModule `CallInvoker` before invoking listeners. Same contract the other
+wrappers document, one layer further out.
+
+### Constraints worth knowing up front
+
+- **New Architecture required** for the C++ TurboModule path (RN 0.71+, Fabric enabled).
+  An old-architecture fallback is possible via NativeModules but pays JSON-bridge costs
+  on every raster payload.
+- **Expo Go cannot load it** — it contains native code. Expo apps need a development
+  build (`expo prebuild` / EAS), which is the normal path for any native module.
+- The parity contract ([api.md §17](api.md#17-wrapper-parity-contract)) applies: every
+  public `pd_*` function must be reachable from the RN package, checked by
+  `scripts/check_parity.sh` like the other four.
+
+### Effort
+
+Small, because nothing new is invented: packaging + codegen spec + the TurboModule
+translation layer + enum bridge test + one end-to-end test against the scripted device.
+The work is mechanical; the risky parts (fencing, dedupe, profiles, transports) already
+live in the core.

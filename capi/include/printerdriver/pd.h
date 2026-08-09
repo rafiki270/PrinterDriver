@@ -1348,6 +1348,196 @@ const char* pd_detection_status_name(pd_detection_status value);
 
 /* ============================== end M15 ========================================== */
 
+/* =================================================================================
+ * M16 — CUSTOM METHOD REGISTRATION (docs/api.md §16)
+ * =================================================================================
+ *
+ * Five runtime extension points that let an integrator extend the SDK without forking it.
+ * All are per-driver-instance, all are data-plus-function-pointers (no subclassing across
+ * this ABI), all are keyed by namespaced string ids ("acme.x-idle"), all are process-local
+ * (never persisted into a shared journal beyond their ids), and everything a registration
+ * claims — a completion grade, an authority, a formatter name — is attributed to it by id
+ * in the result and in `pdctl verify`, so a custom method's claims are auditable exactly
+ * like a built-in's.
+ *
+ *   pd_register_completion_method — the marquee. A vendor idle/ack scheme becomes a real
+ *     graded completion path with no core release: the engine sends fence_bytes(token)
+ *     behind the payload and routes the printer's continuous response stream through the
+ *     matcher, and a Matched(token) confirms the job EXACTLY like GS ( H — the same
+ *     per-job token map, the same journalled RVI, the same jobByToken / `pdctl verify`
+ *     resolution. It coexists with the built-in parser: the raw bytes are fed to the
+ *     matcher ALONGSIDE the GS ( H / GS r / ASB parser, so ForeignWriterDetected and the
+ *     queued/realtime status paths keep working. A profile uses a registered method when
+ *     its completion is PD_COMPLETION_VENDOR_IDLE and its vendor id is this id; select
+ *     such a profile at attach time with a profile id of the form "vendoridle:<id>"
+ *     (e.g. pd_add_printer_custom(..., "vendoridle:acme.x-idle", ...)), which resolves to
+ *     a generic ESC/POS profile bound to the registered method.
+ *   pd_register_probe_step — extends probe/autoDetect fingerprinting. request_bytes MUST
+ *     be non-printing (no 0x20-0x7E run, no line feed); a printing step is refused at
+ *     registration, because autoDetect must never cost a venue a roll of paper.
+ *   pd_register_block_handler — a new DSL block kind renders through the ordinary pipeline.
+ *   pd_register_formatter — backs {{ v | name:args }}, checked before the built-in table.
+ *   pd_register_drawer_kick — fills PD_DRAWER_KICK_VENDOR for a profile.
+ *
+ * -- Callback threads --------------------------------------------------------------
+ * Every callback below is invoked on a CORE thread, never the caller's — the same
+ * contract the custom-transport vtable documents above:
+ *   - a completion method's fence_bytes / matcher run on the owning printer's worker
+ *     thread and the transport reader path;
+ *   - a probe step's classify runs on the worker thread driving the probe;
+ *   - a drawer method's callbacks run on the worker thread;
+ *   - a formatter / block handler runs on whatever thread renders the document.
+ * A callback must not block and must not call back into any pd_* function on the same
+ * driver, for the reason given under "Callback threads" at the top of this header.
+ *
+ * -- Lifetime and return convention ------------------------------------------------
+ * Every pd_register_* returns 1 on success and 0 on failure (a bad or duplicate id, a
+ * missing required callback, a printing probe request); pd_last_error explains a 0. The
+ * struct is copied before the call returns, exactly like pd_add_printer_custom's vtable;
+ * the function pointers it holds and every `ctx` must stay valid until pd_destroy. Strings
+ * (`id`, `name`, `method_name`) are copied. Callbacks that hand back a variable-length
+ * result write it into a caller-supplied buffer and return its length; a result longer
+ * than the buffer is treated as the registration's error and never truncates silently.
+ */
+
+/* --- (1) Custom completion method --------------------------------------------------- */
+
+/* pd::CustomMatchKind — a matcher's verdict on the bytes it was handed. */
+typedef enum pd_match_kind {
+  PD_MATCH_MATCHED = 0,   /* a fence answer carrying `token`; confirm like a GS ( H echo */
+  PD_MATCH_NOT_MINE = 1,  /* not this mechanism's bytes; the core drops its matcher buffer */
+  PD_MATCH_NEED_MORE = 2, /* an answer may be forming but is incomplete; keep buffering */
+  PD_MATCH_KIND_COUNT = 3
+} pd_match_kind;
+
+typedef struct pd_match_result {
+  pd_match_kind kind;
+  /* For PD_MATCH_MATCHED: the four-character correlation token, NUL-terminated. The core
+   * copies it out before the matcher returns, so this fixed buffer never escapes. */
+  char token[8];
+} pd_match_result;
+
+/*
+ * Produce the fence bytes to send behind the payload for this job's four-character
+ * verification token (NUL-terminated). Writes up to `cap` bytes into `out` and returns the
+ * number written; a fence longer than `cap` is a registration the core cannot honour and
+ * the job it fences fails Unknown rather than sending a truncated fence.
+ */
+typedef size_t (*pd_fence_bytes_fn)(void* ctx, const char* job_token, uint8_t* out,
+                                    size_t cap);
+
+/* Classify the printer->host bytes accumulated since the matcher last returned Matched or
+ * NotMine. Returned by value, so it may be built on the callback's stack. */
+typedef pd_match_result (*pd_completion_matcher_fn)(void* ctx, const uint8_t* data,
+                                                    size_t size);
+
+typedef struct pd_completion_method {
+  const char* id;                    /* namespaced, e.g. "acme.x-idle"; copied */
+  pd_fence_bytes_fn fence_bytes;
+  pd_completion_matcher_fn matcher;
+  void* ctx;                         /* passed to both callbacks */
+  pd_confidence_grade grade;         /* what a confirmed completion on this method claims */
+  pd_completion_authority authority;
+  const char* method_name;           /* shown in the result and `pdctl verify`; copied.
+                                      * NULL or "" -> the id. */
+} pd_completion_method;
+
+int32_t pd_register_completion_method(pd_driver* driver,
+                                      const pd_completion_method* method);
+
+/* --- (2) Custom probe step ---------------------------------------------------------- */
+
+typedef struct pd_probe_finding {
+  int32_t answered;  /* 1 when the device replied to this step at all */
+  char label[64];    /* short classification, surfaced in the findings summary; copied */
+} pd_probe_finding;
+
+typedef pd_probe_finding (*pd_probe_classify_fn)(void* ctx, const uint8_t* response,
+                                                 size_t size);
+
+typedef struct pd_probe_step {
+  const char* id;
+  const uint8_t* request_bytes;  /* MUST be non-printing: no 0x20-0x7E, no 0x0A; copied */
+  size_t request_size;
+  pd_probe_classify_fn classify;
+  void* ctx;
+} pd_probe_step;
+
+int32_t pd_register_probe_step(pd_driver* driver, const pd_probe_step* step);
+
+/* --- (3) Custom document block handler ---------------------------------------------- */
+
+/*
+ * Renders a new DSL block kind — a handler registered for a kind always owns it (unknown
+ * block kinds otherwise degrade; this intercepts first). `block_json` is the block object;
+ * `profile_json` is a small JSON of the render profile facts
+ * ({"width_dots":576,"barcode":true,"qr":true,...}). Set *ok to 1 and write raw ESC/POS
+ * ops into `out` (return the count), or set *ok to 0 and write a one-line degradation
+ * reason into `detail` (a degradation entry is reported the same way a built-in block's
+ * is). A result longer than `cap` is an error.
+ */
+typedef size_t (*pd_block_handler_fn)(void* ctx, const char* block_json,
+                                      const char* profile_json, uint8_t* out, size_t cap,
+                                      int32_t* ok, char* detail, size_t detail_cap);
+
+typedef struct pd_block_handler {
+  const char* kind;  /* the block object key that selects this handler; copied */
+  pd_block_handler_fn handler;
+  void* ctx;
+} pd_block_handler;
+
+int32_t pd_register_block_handler(pd_driver* driver, const pd_block_handler* handler);
+
+/* --- (4) Custom formatter ----------------------------------------------------------- */
+
+/*
+ * Backs {{ v | name:args }} in the template layer, checked before the built-in formatter
+ * table. Writes the formatted text into `out` and returns its length with *handled 1; set
+ * *handled 0 to decline (fall through to the built-ins). A result longer than `cap` is an
+ * error. `value` and `args` are the placeholder's value and the text after the first ':';
+ * `locale` is the effective locale tag.
+ */
+typedef size_t (*pd_formatter_fn)(void* ctx, const char* value, const char* args,
+                                  const char* locale, char* out, size_t cap,
+                                  int32_t* handled);
+
+typedef struct pd_formatter {
+  const char* name;  /* the formatter name used in templates; copied */
+  pd_formatter_fn formatter;
+  void* ctx;
+} pd_formatter;
+
+int32_t pd_register_formatter(pd_driver* driver, const pd_formatter* formatter);
+
+/* --- (5) Custom drawer kick method -------------------------------------------------- */
+
+/* Writes the pulse bytes for (channel, pulse_ms) into `out`; returns the count. */
+typedef size_t (*pd_drawer_kick_bytes_fn)(void* ctx, uint8_t channel, uint16_t pulse_ms,
+                                          uint8_t* out, size_t cap);
+/* Optional. Writes the bytes that ask for the switch state; returns the count. */
+typedef size_t (*pd_drawer_status_request_fn)(void* ctx, uint8_t* out, size_t cap);
+/* Optional. Parses a status reply to a pin level: PD_UNKNOWN, PD_FALSE or PD_TRUE. */
+typedef int32_t (*pd_drawer_status_parse_fn)(void* ctx, const uint8_t* response,
+                                             size_t size);
+
+typedef struct pd_drawer_kick_reg {
+  const char* id;
+  pd_drawer_kick_bytes_fn kick_bytes;
+  /* status_request and status_parse are optional and go together: both NULL means the
+   * vendor method has no readable switch, so a kick reports PD_DRAWER_KICK_SENT_UNVERIFIED
+   * rather than a verified open. */
+  pd_drawer_status_request_fn status_request;
+  pd_drawer_status_parse_fn status_parse;
+  void* ctx;
+} pd_drawer_kick_reg;
+
+int32_t pd_register_drawer_kick(pd_driver* driver, const pd_drawer_kick_reg* reg);
+
+/* Static storage, never NULL, matching the core's own spelling one-for-one. */
+const char* pd_match_kind_name(pd_match_kind value);
+
+/* ============================== end M16 ========================================== */
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

@@ -345,6 +345,48 @@ class Layout {
                          RenderPath::NotRendered,
                          "template control block in an unbound document");
         return;
+      case Block::Kind::Custom: {
+        // M16 (docs/api.md §16). A registered handler owns this kind. It renders through
+        // this same pipeline — its ESC/POS ops are spliced as a Raw op — and it reports a
+        // degradation the same way a built-in block does, so nothing about a custom block
+        // is a second code path once it reaches here.
+        if (options_.registrations == nullptr) {
+          out_->report.add(ReportKind::UnsupportedBlock, where, block.custom_kind,
+                           "omitted", RenderPath::NotRendered,
+                           "no handler registered for this block kind");
+          return;
+        }
+        const std::string profile_json =
+            std::string("{\"width_dots\":") +
+            std::to_string(options_.profile.width_dots) +
+            ",\"barcode\":" + (options_.profile.barcodes ? "true" : "false") +
+            ",\"qr\":" + (options_.profile.qr ? "true" : "false") +
+            ",\"cutter\":" + (options_.profile.cutter ? "true" : "false") + "}";
+        const std::optional<::pd::BlockRenderResult> result =
+            options_.registrations->renderBlock(block.custom_kind,
+                                                toJson(block.custom_payload), profile_json);
+        if (!result.has_value()) {
+          out_->report.add(ReportKind::UnsupportedBlock, where, block.custom_kind,
+                           "omitted", RenderPath::NotRendered,
+                           "no handler registered for this block kind");
+          return;
+        }
+        if (result->ok) {
+          LayoutOp op;
+          op.kind = LayoutOp::Kind::Raw;
+          op.raw = result->bytes;
+          op.source = where;
+          out_->ops.push_back(std::move(op));
+        } else {
+          out_->report.add(
+              ReportKind::UnsupportedBlock, where,
+              result->requested.empty() ? block.custom_kind : result->requested,
+              result->delivered, RenderPath::NotRendered,
+              result->detail.empty() ? "the block handler declined to render"
+                                     : result->detail);
+        }
+        return;
+      }
     }
   }
 

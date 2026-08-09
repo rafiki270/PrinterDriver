@@ -102,6 +102,19 @@ extern "C" pd_printer* pd_add_printer_scripted(pd_driver* driver, const char* pr
     // the printer looks — docs/cash-drawer.md's giant-letters rule.
     profile = pdfake::drawerProfile(pd::CompletionMechanism::GsParenH);
     profile.drawer.electrical.standard = pd::DrawerPortStandard::Unknown;
+  } else if (id == "vendor-idle") {
+    // M16 (docs/api.md §16). A CompletionMechanism::VendorIdle profile bound to the
+    // registered id "acme.x-idle", behind a device that echoes the ESC x fence. The whole
+    // point of the milestone: a made-up vendor ack scheme drives a graded completion path
+    // with no core release. The caller must have registered "acme.x-idle" first.
+    profile = pdfake::vendorIdleProfile("acme.x-idle");
+  } else if (id == "vendor-idle-busy") {
+    // The same printer that never idles: the fence is sent, nothing is echoed, and the
+    // job ends Unknown — the honest answer for a receipt whose fate cannot be established.
+    profile = pdfake::vendorIdleProfile("acme.x-idle");
+    pdfake::Script script;
+    script.answer_vendor_idle = false;
+    link.device->setScript(script);
   } else {
     return nullptr;
   }

@@ -386,16 +386,19 @@ std::vector<uint8_t> parseBytes(const Json& json, const std::string& where) {
 }
 
 Block parseBlock(const Json& json, const std::string& where,
-                 std::vector<std::string>* warnings, size_t depth);
+                 std::vector<std::string>* warnings, size_t depth,
+                 const ::pd::Registrations* registrations);
 
 BlockList parseBody(Reader* reader, Block* block, const std::string& where,
-                    std::vector<std::string>* warnings, size_t depth) {
+                    std::vector<std::string>* warnings, size_t depth,
+                    const ::pd::Registrations* registrations) {
   BlockList body;
   const Json* single = reader->take("block");
   const Json* many = reader->take("blocks");
   if (single != nullptr) {
     block->body_is_single = true;
-    body.push_back(parseBlock(*single, where + ".block", warnings, depth + 1));
+    body.push_back(
+        parseBlock(*single, where + ".block", warnings, depth + 1, registrations));
     return body;
   }
   if (many != nullptr) {
@@ -404,8 +407,8 @@ BlockList parseBody(Reader* reader, Block* block, const std::string& where,
     }
     size_t index = 0;
     for (const Json& item : many->asArray()) {
-      body.push_back(parseBlock(
-          item, where + ".blocks[" + std::to_string(index) + "]", warnings, depth + 1));
+      body.push_back(parseBlock(item, where + ".blocks[" + std::to_string(index) + "]",
+                                warnings, depth + 1, registrations));
       ++index;
     }
     return body;
@@ -414,7 +417,8 @@ BlockList parseBody(Reader* reader, Block* block, const std::string& where,
 }
 
 Block parseBlock(const Json& json, const std::string& where,
-                 std::vector<std::string>* warnings, size_t depth) {
+                 std::vector<std::string>* warnings, size_t depth,
+                 const ::pd::Registrations* registrations) {
   if (depth > 32) {
     throw DocumentError(where + ": blocks nested deeper than 32 levels");
   }
@@ -429,7 +433,7 @@ Block parseBlock(const Json& json, const std::string& where,
   if (const Json* value = reader.take("each"); value != nullptr) {
     block.kind = Block::Kind::Each;
     block.path = value->asString();
-    block.body = parseBody(&reader, &block, where, warnings, depth);
+    block.body = parseBody(&reader, &block, where, warnings, depth, registrations);
     reader.finish();
     return block;
   }
@@ -439,7 +443,7 @@ Block parseBlock(const Json& json, const std::string& where,
     block.kind = Block::Kind::If;
     block.negated = unless_path != nullptr;
     block.path = block.negated ? unless_path->asString() : if_path->asString();
-    block.body = parseBody(&reader, &block, where, warnings, depth);
+    block.body = parseBody(&reader, &block, where, warnings, depth, registrations);
     reader.finish();
     return block;
   }
@@ -688,6 +692,22 @@ Block parseBlock(const Json& json, const std::string& where,
     return block;
   }
 
+  // M16 (docs/api.md §16). Before failing an unrecognised block, offer its key to the
+  // driver's registered block handlers. A block like {"loyaltyStamp": {...}} whose key is
+  // registered becomes a Custom block carrying the whole object as JSON, to be rendered by
+  // the handler at render time (which is where the profile it needs is available). With no
+  // registry, or no handler for the key, the strict parse failure below still stands.
+  if (registrations != nullptr) {
+    for (const Json::Member& member : json.asObject()) {
+      if (registrations->hasBlockHandler(member.first)) {
+        block.kind = Block::Kind::Custom;
+        block.custom_kind = member.first;
+        block.custom_payload = json;
+        return block;
+      }
+    }
+  }
+
   throw DocumentError(where + ": block carries no recognised key");
 }
 
@@ -883,6 +903,9 @@ Json blockToJson(const Block& block) {
         out.set("blocks", blockListToJson(block.body));
       }
       return out;
+    case Block::Kind::Custom:
+      // M16. Round-trips as the original block object the handler was handed.
+      return block.custom_payload.isObject() ? block.custom_payload : out;
   }
   return out;
 }
@@ -1038,7 +1061,8 @@ ResolvedStyle Document::resolve(const StyleRef& ref, RenderReport* report,
 
 // --- parse / serialize -----------------------------------------------------------------
 
-Document parseDocument(const Json& json, std::vector<std::string>* warnings) {
+Document parseDocument(const Json& json, std::vector<std::string>* warnings,
+                       const ::pd::Registrations* registrations) {
   if (!json.isObject()) {
     throw DocumentError("document: expected a JSON object");
   }
@@ -1113,8 +1137,8 @@ Document parseDocument(const Json& json, std::vector<std::string>* warnings) {
     }
     size_t index = 0;
     for (const Json& item : blocks->asArray()) {
-      document.blocks.push_back(
-          parseBlock(item, "blocks[" + std::to_string(index) + "]", warnings, 0));
+      document.blocks.push_back(parseBlock(
+          item, "blocks[" + std::to_string(index) + "]", warnings, 0, registrations));
       ++index;
     }
   }
@@ -1123,8 +1147,9 @@ Document parseDocument(const Json& json, std::vector<std::string>* warnings) {
   return document;
 }
 
-Document parseDocument(std::string_view json, std::vector<std::string>* warnings) {
-  return parseDocument(parseJson(json), warnings);
+Document parseDocument(std::string_view json, std::vector<std::string>* warnings,
+                       const ::pd::Registrations* registrations) {
+  return parseDocument(parseJson(json), warnings, registrations);
 }
 
 Json documentToJson(const Document& document) {
@@ -1285,6 +1310,7 @@ const char* to_string(Block::Kind value) noexcept {
     case Block::Kind::Raw: return "raw";
     case Block::Kind::Each: return "each";
     case Block::Kind::If: return "if";
+    case Block::Kind::Custom: return "custom";
   }
   return "text";
 }

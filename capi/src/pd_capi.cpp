@@ -12,6 +12,8 @@
 #include "printerdriver/capability_profile.hpp"
 #include "printerdriver/device_profiles.hpp"
 #include "printerdriver/escpos_encoder.hpp"
+// M16 — the five per-driver registries the pd_register_* functions below feed.
+#include "printerdriver/registrations.hpp"
 // M13b: the print-queue addon, bound below. The addon is a separate library on purpose
 // (docs/sdk-spec.md §12) and stays one — this ABI links it so that every wrapper can
 // reach the same policy engine, not so that the core grows a queue.
@@ -291,6 +293,24 @@ bool resolveProfile(const char* profile_id, pd::CapabilityProfile* out,
                     std::string* error) {
   const std::string id =
       profile_id != nullptr && profile_id[0] != '\0' ? profile_id : "generic";
+  // M16 (docs/api.md §16). "vendoridle:<registered-id>" resolves to a generic ESC/POS
+  // profile whose completion is bound to a registered custom completion method, so a
+  // caller can attach a printer that uses pd_register_completion_method without a
+  // hand-authored device-database entry. The job fails Unsupported if nothing is
+  // registered under that id by the time it runs, which is the honest answer.
+  const std::string kVendorIdlePrefix = "vendoridle:";
+  if (id.rfind(kVendorIdlePrefix, 0) == 0) {
+    const std::string vendor_id = id.substr(kVendorIdlePrefix.size());
+    if (vendor_id.empty()) {
+      *error = "vendoridle profile id needs a registered method id after the colon";
+      return false;
+    }
+    *out = pd::generic_escpos();
+    out->name = "vendoridle-" + vendor_id;
+    out->completion = pd::CompletionMechanism::VendorIdle;
+    out->completion_vendor_id = vendor_id;
+    return true;
+  }
   if (id == "generic") {
     *out = pd::generic_escpos();
     return true;
@@ -1455,6 +1475,11 @@ static_assert(PD_DETECTION_UNREACHABLE == value_of(pd::DetectionStatus::Unreacha
 static_assert(PD_DETECTION_STATUS_COUNT ==
               static_cast<int>(pd::kAllDetectionStatuses.size()));
 
+// M16 — the matcher verdict enum mirrors pd::CustomMatchKind one-for-one.
+static_assert(PD_MATCH_MATCHED == value_of(pd::CustomMatchKind::Matched));
+static_assert(PD_MATCH_NOT_MINE == value_of(pd::CustomMatchKind::NotMine));
+static_assert(PD_MATCH_NEED_MORE == value_of(pd::CustomMatchKind::NeedMore));
+
 namespace {
 
 const char* const kProfileSelectionNames[PD_PROFILE_SELECTION_COUNT] = {
@@ -1795,3 +1820,258 @@ extern "C" const char* pd_detection_status_name(pd_detection_status value) {
 }
 
 // ================================ end M15 ==========================================
+
+// ================================ M16 ==============================================
+// Custom method registration (docs/api.md §16). Each function wraps the C struct's plain
+// function pointers plus its void* ctx into the std::function callbacks the core's
+// per-driver registries hold — exactly the shape pd_add_printer_custom uses for the
+// transport vtable. Variable-length results are handed back through a fixed stack buffer
+// the callback fills; a result that overflows it is treated as the registration's error,
+// never truncated onto the wire.
+
+namespace {
+
+// The token buffer a matcher fills is NUL-terminated within its 8 bytes; copy it out
+// defensively so a callback that forgets the terminator cannot walk off the end.
+std::string matchToken(const char (&token)[8]) {
+  char safe[8];
+  std::memcpy(safe, token, sizeof(safe));
+  safe[sizeof(safe) - 1] = '\0';
+  return std::string(safe);
+}
+
+}  // namespace
+
+extern "C" int32_t pd_register_completion_method(pd_driver* driver,
+                                                 const pd_completion_method* method) {
+  if (driver == nullptr) {
+    return 0;
+  }
+  if (method == nullptr || method->id == nullptr || method->fence_bytes == nullptr ||
+      method->matcher == nullptr) {
+    setError(driver, "completion method needs an id, a fence_bytes and a matcher");
+    return 0;
+  }
+  pd::CompletionMethod reg;
+  reg.id = method->id;
+  reg.method_name =
+      method->method_name != nullptr && method->method_name[0] != '\0'
+          ? std::string(method->method_name)
+          : reg.id;
+  reg.grade = static_cast<pd::ConfidenceGrade>(method->grade);
+  reg.authority = static_cast<pd::CompletionAuthority>(method->authority);
+  const pd_fence_bytes_fn fence = method->fence_bytes;
+  const pd_completion_matcher_fn matcher = method->matcher;
+  void* const ctx = method->ctx;
+  reg.fence_bytes = [fence, ctx](const std::string& job_token) -> pd::escpos::Bytes {
+    uint8_t buffer[256];
+    const size_t n = fence(ctx, job_token.c_str(), buffer, sizeof(buffer));
+    if (n > sizeof(buffer)) {
+      return {};  // over cap: honoured as an empty fence -> the job it fences goes Unknown
+    }
+    return pd::escpos::Bytes(buffer, buffer + n);
+  };
+  reg.matcher = [matcher, ctx](const uint8_t* data, size_t size) -> pd::CustomMatch {
+    const pd_match_result result = matcher(ctx, data, size);
+    switch (result.kind) {
+      case PD_MATCH_MATCHED:
+        return pd::CustomMatch::matched(matchToken(result.token));
+      case PD_MATCH_NOT_MINE:
+        return pd::CustomMatch::notMine();
+      case PD_MATCH_NEED_MORE:
+      case PD_MATCH_KIND_COUNT:
+        break;
+    }
+    return pd::CustomMatch::needMore();
+  };
+  std::string error;
+  if (!driver->driver->registerCompletionMethod(std::move(reg), &error)) {
+    setError(driver, error);
+    return 0;
+  }
+  clearError(driver);
+  return 1;
+}
+
+extern "C" int32_t pd_register_probe_step(pd_driver* driver, const pd_probe_step* step) {
+  if (driver == nullptr) {
+    return 0;
+  }
+  if (step == nullptr || step->id == nullptr || step->classify == nullptr) {
+    setError(driver, "probe step needs an id and a classify callback");
+    return 0;
+  }
+  pd::ProbeStep reg;
+  reg.id = step->id;
+  if (step->request_bytes != nullptr && step->request_size > 0) {
+    reg.request_bytes.assign(step->request_bytes,
+                             step->request_bytes + step->request_size);
+  }
+  const pd_probe_classify_fn classify = step->classify;
+  void* const ctx = step->ctx;
+  reg.classify =
+      [classify, ctx](const std::vector<uint8_t>& response) -> pd::ProbeFinding {
+    const pd_probe_finding finding = classify(ctx, response.data(), response.size());
+    pd::ProbeFinding out;
+    out.answered = finding.answered != 0;
+    char safe[sizeof(finding.label)];
+    std::memcpy(safe, finding.label, sizeof(safe));
+    safe[sizeof(safe) - 1] = '\0';
+    out.label = safe;
+    return out;
+  };
+  std::string error;
+  if (!driver->driver->registerProbeStep(std::move(reg), &error)) {
+    setError(driver, error);
+    return 0;
+  }
+  clearError(driver);
+  return 1;
+}
+
+extern "C" int32_t pd_register_block_handler(pd_driver* driver,
+                                             const pd_block_handler* handler) {
+  if (driver == nullptr) {
+    return 0;
+  }
+  if (handler == nullptr || handler->kind == nullptr || handler->handler == nullptr) {
+    setError(driver, "block handler needs a kind and a callback");
+    return 0;
+  }
+  pd::BlockHandlerReg reg;
+  reg.kind = handler->kind;
+  const pd_block_handler_fn fn = handler->handler;
+  void* const ctx = handler->ctx;
+  reg.fn = [fn, ctx](const std::string& block_json,
+                     const std::string& profile_json) -> pd::BlockRenderResult {
+    uint8_t out[4096];
+    char detail[256];
+    detail[0] = '\0';
+    int32_t ok = 0;
+    const size_t n = fn(ctx, block_json.c_str(), profile_json.c_str(), out, sizeof(out),
+                        &ok, detail, sizeof(detail));
+    pd::BlockRenderResult result;
+    if (ok != 0 && n <= sizeof(out)) {
+      result.ok = true;
+      result.bytes.assign(out, out + n);
+    } else {
+      result.ok = false;
+      detail[sizeof(detail) - 1] = '\0';
+      result.detail = detail;
+      result.delivered = "omitted";
+    }
+    return result;
+  };
+  std::string error;
+  if (!driver->driver->registerBlockHandler(std::move(reg), &error)) {
+    setError(driver, error);
+    return 0;
+  }
+  clearError(driver);
+  return 1;
+}
+
+extern "C" int32_t pd_register_formatter(pd_driver* driver, const pd_formatter* formatter) {
+  if (driver == nullptr) {
+    return 0;
+  }
+  if (formatter == nullptr || formatter->name == nullptr ||
+      formatter->formatter == nullptr) {
+    setError(driver, "formatter needs a name and a callback");
+    return 0;
+  }
+  pd::FormatterReg reg;
+  reg.name = formatter->name;
+  const pd_formatter_fn fn = formatter->formatter;
+  void* const ctx = formatter->ctx;
+  reg.fn = [fn, ctx](const std::string& value, const std::string& args,
+                     const std::string& locale) -> std::optional<std::string> {
+    char out[1024];
+    int32_t handled = 0;
+    const size_t n = fn(ctx, value.c_str(), args.c_str(), locale.c_str(), out, sizeof(out),
+                        &handled);
+    if (handled == 0) {
+      return std::nullopt;  // declined -> fall through to the built-in formatter table
+    }
+    if (n > sizeof(out)) {
+      return std::string();  // over cap: honoured as an empty string
+    }
+    return std::string(out, out + n);
+  };
+  std::string error;
+  if (!driver->driver->registerFormatter(std::move(reg), &error)) {
+    setError(driver, error);
+    return 0;
+  }
+  clearError(driver);
+  return 1;
+}
+
+extern "C" int32_t pd_register_drawer_kick(pd_driver* driver,
+                                           const pd_drawer_kick_reg* reg_in) {
+  if (driver == nullptr) {
+    return 0;
+  }
+  if (reg_in == nullptr || reg_in->id == nullptr || reg_in->kick_bytes == nullptr) {
+    setError(driver, "drawer kick needs an id and a kick_bytes callback");
+    return 0;
+  }
+  pd::DrawerKickReg reg;
+  reg.id = reg_in->id;
+  const pd_drawer_kick_bytes_fn kick = reg_in->kick_bytes;
+  void* const ctx = reg_in->ctx;
+  reg.kick_bytes = [kick, ctx](uint8_t channel, uint16_t pulse_ms) -> pd::escpos::Bytes {
+    uint8_t buffer[256];
+    const size_t n = kick(ctx, channel, pulse_ms, buffer, sizeof(buffer));
+    if (n > sizeof(buffer)) {
+      return {};
+    }
+    return pd::escpos::Bytes(buffer, buffer + n);
+  };
+  if (reg_in->status_request != nullptr && reg_in->status_parse != nullptr) {
+    const pd_drawer_status_request_fn request = reg_in->status_request;
+    const pd_drawer_status_parse_fn parse = reg_in->status_parse;
+    reg.status_request = [request, ctx]() -> pd::escpos::Bytes {
+      uint8_t buffer[256];
+      const size_t n = request(ctx, buffer, sizeof(buffer));
+      if (n > sizeof(buffer)) {
+        return {};
+      }
+      return pd::escpos::Bytes(buffer, buffer + n);
+    };
+    reg.status_parse =
+        [parse, ctx](const std::vector<uint8_t>& response) -> std::optional<bool> {
+      const int32_t level = parse(ctx, response.data(), response.size());
+      if (level == PD_TRUE) {
+        return true;
+      }
+      if (level == PD_FALSE) {
+        return false;
+      }
+      return std::nullopt;
+    };
+  }
+  std::string error;
+  if (!driver->driver->registerDrawerKick(std::move(reg), &error)) {
+    setError(driver, error);
+    return 0;
+  }
+  clearError(driver);
+  return 1;
+}
+
+extern "C" const char* pd_match_kind_name(pd_match_kind value) {
+  switch (value) {
+    case PD_MATCH_MATCHED:
+      return "Matched";
+    case PD_MATCH_NOT_MINE:
+      return "NotMine";
+    case PD_MATCH_NEED_MORE:
+      return "NeedMore";
+    case PD_MATCH_KIND_COUNT:
+      break;
+  }
+  return "Unknown";
+}
+
+// ================================ end M16 ==========================================

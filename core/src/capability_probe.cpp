@@ -403,6 +403,22 @@ CapabilityFindings CapabilityProbe::run(const Writer& write) {
   findings.asb = asb_seen;
   write(escpos::asbDisable());
 
+  // 6. M16 (docs/api.md §16). House-specific registered probe steps, run through the same
+  // send/await/classify machinery. Each request is non-printing (enforced at
+  // registration), so this loop is as safe on the printless autoDetect path as the phases
+  // above. A classify result is attributed to its step id.
+  for (const ProbeStep& step : options_.custom_steps) {
+    beginPhase(Phase::Escpos);
+    if (!step.request_bytes.empty()) {
+      if (!write(escpos::Bytes(step.request_bytes.begin(), step.request_bytes.end()))) {
+        return findings;
+      }
+    }
+    waitForRawBytes(options_.status_timeout_ms);
+    ProbeFinding result = step.classify(takeRaw());
+    findings.custom_probe.push_back(CustomProbeResult{step.id, std::move(result)});
+  }
+
   findings.completion = completionFrom(findings);
   findings.key = identityKey(findings.reported, options_.endpoint);
   {

@@ -7,6 +7,8 @@
 
 #include "printerdriver/dsl/json.hpp"
 #include "printerdriver/dsl/report.hpp"
+// M16 — registered formatters (docs/api.md §16) are checked before the built-in table.
+#include "printerdriver/registrations.hpp"
 
 // Value formatters (docs/receipt-dsl.md "Repeating groups ... and value formatters"):
 //
@@ -85,6 +87,10 @@ struct FormatContext {
   std::string locale;                    // empty → "en-US"
   std::string currency;                  // empty → the locale's default currency
   std::string tz;                        // empty → render in the value's own offset
+  // M16 (docs/api.md §16). The driver's per-instance registry, or nullptr. A formatter
+  // registered here is checked before the built-in table; when it declines (returns
+  // nothing) the built-ins run, so a registration extends rather than replaces them.
+  const ::pd::Registrations* registrations = nullptr;
 };
 
 struct FormatOutcome {

@@ -58,6 +58,13 @@ struct Script {
   bool answer_queued_status = true;
   uint8_t queued_status = 0x00;
 
+  // M16 (docs/api.md §16). The made-up "acme.x-idle" vendor completion scheme the custom
+  // completion registration tests drive: the host sends ESC 'x' + a 4-char token
+  // (0x1B 0x78 t0 t1 t2 t3) behind the payload, and an idle device echoes it back as
+  // ESC 'y' + the same token (0x1B 0x79 t0 t1 t2 t3). False models a device that stays
+  // busy and never idles, so the fence is never confirmed.
+  bool answer_vendor_idle = true;
+
   // Stop answering process-ID markers after this many have been echoed; 0 = never.
   size_t process_id_answer_limit = 0;
 
@@ -188,6 +195,11 @@ class FakePrinter {
   size_t drawerKicks() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return drawer_kicks_;
+  }
+  // M16. The vendor-idle (ESC x) fence tokens this device has seen, in order.
+  std::vector<std::string> vendorIdleFences() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return vendor_idle_fences_;
   }
   // --- M14 ---
   std::vector<DrawerKickRecord> drawerKickRecords() const {
@@ -451,6 +463,26 @@ class FakePrinter {
         continue;
       }
 
+      if (first == 0x1B && offset + 1 < pending_.size() && pending_[offset + 1] == 0x78) {
+        // M16. The made-up vendor-idle fence ESC 'x' + a 4-char token. An idle device
+        // echoes ESC 'y' + the same token, which is what the registered matcher confirms.
+        if (offset + 6 > pending_.size()) {
+          break;  // the token is still in flight
+        }
+        const std::string token(pending_.begin() + static_cast<long>(offset) + 2,
+                                pending_.begin() + static_cast<long>(offset) + 6);
+        vendor_idle_fences_.push_back(token);
+        if (script_.answer_vendor_idle) {
+          out.push_back(0x1B);
+          out.push_back(0x79);
+          for (const char c : token) {
+            out.push_back(static_cast<uint8_t>(c));
+          }
+        }
+        offset += 6;
+        continue;
+      }
+
       const size_t fixed = fixedCommandLength(offset);
       if (fixed != 0) {
         if (offset + fixed > pending_.size()) {
@@ -483,6 +515,7 @@ class FakePrinter {
   size_t drawer_kicks_ = 0;
   std::vector<DrawerKickRecord> drawer_kick_records_;  // M14
   size_t drawer_status_requests_ = 0;                  // M14
+  std::vector<std::string> vendor_idle_fences_;        // M16
   size_t raster_blocks_ = 0;
   size_t process_ids_answered_ = 0;
   bool foreign_emitted_ = false;
@@ -744,6 +777,18 @@ inline pd::CapabilityProfile fastProfile(pd::CompletionMechanism mechanism) {
     profile.name = "none-profile";
     profile.status.dle_eot = false;
   }
+  return profile;
+}
+
+// M16 (docs/api.md §16). A profile bound to a registered custom completion method:
+// CompletionMechanism::VendorIdle plus the registered id. Driven on the ESC/POS engine's
+// path with fast test budgets, exactly like fastProfile, so a custom-fenced job sequences
+// the same way a GS ( H one does.
+inline pd::CapabilityProfile vendorIdleProfile(const std::string& vendor_id) {
+  pd::CapabilityProfile profile = fastProfile(pd::CompletionMechanism::GsR1);
+  profile.completion = pd::CompletionMechanism::VendorIdle;
+  profile.completion_vendor_id = vendor_id;
+  profile.name = "vendoridle-" + vendor_id;
   return profile;
 }
 

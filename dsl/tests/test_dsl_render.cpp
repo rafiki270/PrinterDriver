@@ -3,6 +3,7 @@
 
 #include "printerdriver/dsl/render.hpp"
 #include "printerdriver/escpos_encoder.hpp"
+#include "printerdriver/registrations.hpp"
 #include "test_harness.hpp"
 
 using namespace pd::dsl;
@@ -466,4 +467,58 @@ PD_TEST(render_clamps_absurd_feed_dots_and_declares_it) {
   CHECK(declared);
   const std::string preview = pd::dsl::renderText(doc, options).text();
   CHECK(preview.size() < 1000000);  // bounded, not ~90M lines
+}
+
+// M16 (docs/api.md §16): a registered block handler intercepts an otherwise-unknown block
+// kind and renders it through this same pipeline; declining reports a degradation. Without
+// a registry the parse still fails strictly, so nothing about the base behaviour changes.
+PD_TEST(a_registered_block_handler_renders_a_custom_kind) {
+  pd::Registrations registrations;
+  std::string error;
+  CHECK(registrations.addBlockHandler(
+      pd::BlockHandlerReg{
+          "loyaltyStamp",
+          [](const std::string& block_json,
+             const std::string& profile_json) -> pd::BlockRenderResult {
+            pd::BlockRenderResult result;
+            // The profile facts reach the handler as JSON.
+            CHECK(profile_json.find("width_dots") != std::string::npos);
+            if (block_json.find("\"deny\"") != std::string::npos) {
+              result.ok = false;
+              result.detail = "loyalty program disabled";
+              return result;
+            }
+            result.ok = true;
+            const std::string bytes = "STAMP";
+            result.bytes.assign(bytes.begin(), bytes.end());
+            return result;
+          }},
+      &error));
+
+  const char* source = R"({"blocks":[{"loyaltyStamp":{"points":5}}]})";
+
+  // Without a registry the unknown block kind fails the parse, unchanged from before.
+  bool threw = false;
+  try {
+    parseDocument(source);
+  } catch (const DocumentError&) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  // With the registry it parses as a Custom block and renders through the handler.
+  RenderOptions options = at(576);
+  options.registrations = &registrations;
+  const RenderOutput output = render(parseDocument(source, nullptr, &registrations), options);
+  const auto& out_bytes = output.bytes();
+  const std::string text(out_bytes.begin(), out_bytes.end());
+  CHECK(text.find("STAMP") != std::string::npos);
+  CHECK_EQ(output.report.count(ReportKind::UnsupportedBlock), static_cast<size_t>(0));
+
+  // A handler that declines produces a degradation entry, reported like a built-in block.
+  const char* deny = R"({"blocks":[{"loyaltyStamp":{"deny":true}}]})";
+  const RenderOutput degraded =
+      render(parseDocument(deny, nullptr, &registrations), options);
+  CHECK_EQ(degraded.report.count(ReportKind::UnsupportedBlock), static_cast<size_t>(1));
+  CHECK_EQ(degraded.report.entries[0].detail, std::string("loyalty program disabled"));
 }
