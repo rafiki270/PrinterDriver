@@ -17,6 +17,7 @@
 
 #include "printerdriver/capability_probe.hpp"
 #include "printerdriver/device_profiles.hpp"
+#include "printerdriver/discovery.hpp"
 #include "printerdriver/driver.hpp"
 #include "printerdriver/identity.hpp"
 #include "printerdriver/receipt_dsl.hpp"
@@ -184,6 +185,15 @@ int usage() {
       "pdctl - PrinterDriver core diagnostics\n"
       "\n"
       "read-only commands:\n"
+      "  pdctl discover [cidr] [--port <n>] [--concurrency <n>]\n"
+      "                 [--connect-timeout <ms>] [--response-timeout <ms>]\n"
+      "                 [--no-probe] [--quiet]\n"
+      "      Sweep a subnet for port-9100 listeners and report whether each one\n"
+      "      answers on the backchannel. Default cidr is the local /24.\n"
+      "      The only bytes ever written are DLE EOT 1 (10 04 01): a port-9100\n"
+      "      device prints what it receives, so nothing printable is sent and no\n"
+      "      printer on the subnet ejects paper. --no-probe writes nothing at all.\n"
+      "\n"
       "  pdctl status <host[:port]>\n"
       "      DLE EOT 1-4 decoded, plus the raw response bytes.\n"
       "\n"
@@ -1099,6 +1109,74 @@ int runVerify(const std::string& token, const std::string& store) {
   return kExitDone;
 }
 
+// --- discover ---------------------------------------------------------------------
+
+struct DiscoverArgs {
+  std::string cidr;  // empty → the local /24
+  pd::DiscoveryOptions options;
+  bool quiet = false;  // suppress the per-address progress line
+};
+
+int runDiscover(const DiscoverArgs& args) {
+  pd::Subnet subnet;
+  if (args.cidr.empty()) {
+    const std::optional<pd::Subnet> local = pd::localSubnet();
+    if (!local.has_value()) {
+      std::cout << "could not determine a local IPv4 subnet; pass a CIDR, e.g.\n"
+                   "  pdctl discover 192.168.1.0/24\n";
+      return kExitFailed;
+    }
+    subnet = *local;
+  } else if (!pd::parseCidr(args.cidr, &subnet)) {
+    std::cout << "not a CIDR block: " << args.cidr << "\n";
+    return kExitUsage;
+  }
+
+  std::cout << "scanning " << subnet.toString() << " port " << args.options.port << " ("
+            << subnet.hostCount() << " addresses, " << args.options.concurrency
+            << " at a time)\n"
+               "probe: DLE EOT 1 (10 04 01) and nothing else - no printable byte is\n"
+               "ever written, so this scan cannot make a printer eject paper\n\n";
+
+  std::mutex output;
+  pd::DiscoveryCallbacks callbacks;
+  if (!args.quiet) {
+    callbacks.on_progress = [&](const pd::DiscoveryProgress& progress) {
+      if (!progress.device.port9100_open) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(output);
+      std::cout << "  found " << progress.device.ip << " (" << progress.completed << "/"
+                << progress.total << ")\n";
+    };
+  }
+
+  const std::vector<pd::DiscoveredDevice> devices =
+      pd::discover(subnet, args.options, callbacks);
+
+  std::cout << "\n"
+            << std::left << std::setw(18) << "ADDRESS" << std::setw(8) << "PORT"
+            << std::setw(10) << "STATE" << std::setw(14) << "BACKCHANNEL"
+            << "DLE EOT 1\n"
+            << "----------------------------------------------------------------------\n";
+  for (const pd::DiscoveredDevice& device : devices) {
+    std::cout << std::left << std::setw(18) << device.ip << std::setw(8) << device.port
+              << std::setw(10) << "open" << std::setw(14)
+              << (device.answered() ? "answers" : "silent")
+              << (device.answered() ? device.responseHex() : std::string("-")) << "\n";
+  }
+  if (devices.empty()) {
+    std::cout << "  (nothing listening on port " << args.options.port << ")\n";
+  }
+  std::cout << "\n" << devices.size() << " open, " << subnet.hostCount()
+            << " scanned\n\n"
+               "an open port is a device, not a printer, and a silent one may still\n"
+               "print perfectly - its LAN module just does not forward status bytes\n"
+               "(docs/techspec.md §4). Run `pdctl probe <address>` to find out what a\n"
+               "listener actually is; that one costs paper, so point it deliberately.\n";
+  return devices.empty() ? kExitFailed : kExitDone;
+}
+
 int listProfiles() {
   std::cout << "device database (docs/device-database.md):\n\n";
   for (const std::string& name : pd::devices::names()) {
@@ -1134,6 +1212,52 @@ int main(int argc, char** argv) {
       }
     }
     return runVerify(argv[2], store);
+  }
+
+  // `discover` takes a subnet rather than an endpoint, and the subnet is optional, so
+  // it is dispatched before argv[2] is read as a host.
+  if (argc >= 2 && std::string(argv[1]) == "discover") {
+    DiscoverArgs args;
+    for (int i = 2; i < argc; ++i) {
+      const std::string flag = argv[i];
+      const bool has_value = i + 1 < argc;
+      if (flag == "--port" && has_value) {
+        const long value = std::strtol(argv[++i], nullptr, 10);
+        if (value <= 0 || value > 65535) {
+          std::cout << "invalid port\n\n";
+          return kExitUsage;
+        }
+        args.options.port = static_cast<uint16_t>(value);
+      } else if (flag == "--concurrency" && has_value) {
+        args.options.concurrency =
+            static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        if (args.options.concurrency == 0) {
+          std::cout << "invalid concurrency\n\n";
+          return kExitUsage;
+        }
+      } else if (flag == "--connect-timeout" && has_value) {
+        args.options.connect_timeout_ms =
+            static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      } else if (flag == "--response-timeout" && has_value) {
+        args.options.response_timeout_ms =
+            static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      } else if (flag == "--no-probe") {
+        args.options.probe_backchannel = false;
+      } else if (flag == "--quiet") {
+        args.quiet = true;
+      } else if (!flag.empty() && flag[0] != '-' && args.cidr.empty()) {
+        args.cidr = flag;
+      } else {
+        std::cout << "unknown option: " << flag << "\n\n";
+        return usage();
+      }
+    }
+    try {
+      return runDiscover(args);
+    } catch (const std::exception& error) {
+      std::cout << "error: " << error.what() << "\n";
+      return kExitFailed;
+    }
   }
 
   // `render` takes no printer, so it is dispatched before the endpoint is parsed.

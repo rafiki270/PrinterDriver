@@ -41,11 +41,26 @@ the printer's characters-per-line. Every departure from what a document asked fo
 italic the hardware cannot do, a barcode this milestone does not draw, a model path that
 is not there — comes back in a render report rather than disappearing. `pdctl render`
 prints that report and a character approximation of the paper without touching a printer.
+Code 128 (with automatic B/C subset optimisation) and EAN-13/EAN-8 render as real `GS k`
+symbols with HRI positioning; symbologies beyond those keep the declared degradation.
+Every cut the renderer emits — mid-document as well as trailing — feeds the profile's
+blade clearance first, so a multi-ticket document cannot clip its own content.
+
+**`pd-agent`** ([agent/README.md](agent/README.md)) is the same core compiled as the
+local printer agent of [docs/techspec.md §5](docs/techspec.md): a small HTTP/1.1
+submission API in front of **one** `PrinterDriver`, which is what makes the same order
+key from two tills print once. Every response is an evidence document — state, fence,
+cutter and paper status, grade, authority, method and the verification token on the
+paper — never a bare success flag.
+
+**LAN discovery** lives in the core (`discovery.hpp`, `pdctl discover`). The only bytes
+it ever writes are `DLE EOT 1` (`10 04 01`): a port-9100 device prints what it receives,
+so a scan that sent anything printable would cost a venue a roll of paper per run.
 
 Not built yet: Bluetooth/USB/serial transports, the ePOS and StarPRNT transports (their
 profiles are data only — Star printers refuse honestly instead of printing unfenced),
-network discovery in the core, and the DSL's raster path (wrapper-side text rendering
-and barcode symbologies).
+Bluetooth discovery, and the DSL's raster path (wrapper-side text rendering, plus the
+2-D and remaining linear symbologies).
 
 The **Windows port** ([docs/platforms.md](docs/platforms.md)) is written but not built:
 the Winsock2 transport and the `FlushFileBuffers`/`ReplaceFile` journal path are
@@ -65,10 +80,11 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The build produces the static libraries `printerdriver_core`, `printerdriver_queue` and
-`printerdriver_dsl`, plus the `pdctl` diagnostic CLI; public headers live in
-`core/include/printerdriver/`, `queue/include/printerdriver/` and
-`dsl/include/printerdriver/`. Tests are plain executables using a small built-in assert
+The build produces the static libraries `printerdriver_core`, `printerdriver_queue`,
+`printerdriver_dsl` and `printerdriver_agent`, plus the `pdctl` diagnostic CLI and the
+`pd-agent` daemon; public headers live in `core/include/printerdriver/`,
+`queue/include/printerdriver/`, `dsl/include/printerdriver/` and
+`agent/include/printerdriver/`. Tests are plain executables using a small built-in assert
 harness (`core/tests/test_harness.hpp`) and are registered individually with CTest.
 
 ## Swift package
@@ -164,12 +180,18 @@ Every result names what backs it ([docs/device-database.md](docs/device-database
 ## pdctl
 
 ```sh
+build/pdctl discover [cidr]                   # sweep a subnet (default: the local /24)
 build/pdctl status   <host>                   # DLE EOT 1-4 decoded plus raw bytes
 build/pdctl probe    <host> [--mac <address>] # full printer discovery report
 build/pdctl identify <host> [--mac <address>] # fingerprint only, prints nothing
 build/pdctl print    <host> --text "..." --key order-7F3A
 build/pdctl print list                        # the device database
 ```
+
+`discover` writes exactly three bytes per address — `DLE EOT 1` — and reports each open
+port together with whatever came back. Silence is a finding, not a failure: it is the LAN
+module that does not forward status bytes, and it is why the table separates "open" from
+"answers".
 
 `print` runs through the whole engine — preflight, ordered fence, cut fence, cutter
 status, job store — and exits 0 on `done`, 1 on `failed`, 2 on `unknown`. The core owns a
@@ -202,6 +224,7 @@ core/include/printerdriver/   public headers
                               and the findings cache
   job_store.hpp               append-only durable job journal
   transport.hpp               Transport interface and the TCP implementation
+  discovery.hpp               LAN sweep: DLE EOT 1 only, never a printable byte
   driver.hpp                  PrinterDriver / Printer / PrintJob — the public API
 core/src/                     implementation
 core/tests/                   test harness, scriptable fake printer, test binaries
@@ -209,6 +232,10 @@ capi/include/printerdriver/   pd.h — the C ABI every wrapper binds, plus its m
 capi/src/                     the ABI implementation and its enum static_asserts
 capi/tests/                   the C ABI test, the scripted-device factory, the enum bridge
 queue/                        the print-queue addon (separate library on purpose)
+dsl/                          the receipt DSL: document model, binding, renderer,
+                              barcode symbologies
+agent/                        pd-agent: the local printer agent and its HTTP/1.1 front
+                              end, with its own README
 Package.swift                 SwiftPM manifest for the whole repository
 wrappers/swift/               the Swift wrapper: Sources, Tests, README
 wrappers/dart/                the Dart FFI package (pub-ready)
@@ -224,7 +251,9 @@ scripts/printer_probe.py      standalone hardware capability probe
 One worker thread per printer runs jobs strictly FIFO, one at a time. Each open
 connection has its own reader thread pumping received bytes into the response parser.
 Job-event and device-event callbacks run on those threads and must not block or call
-back into the driver.
+back into the driver. `pd-agent` adds one accept thread plus a small fixed pool of
+connection workers, so a request waiting on a completion fence never stops the agent
+answering another printer's.
 
 ## Documentation
 

@@ -59,6 +59,7 @@ add_library(printerdriver_core STATIC
   core/src/identity.cpp
   core/src/capability_probe.cpp
   core/src/job_store.cpp
+  core/src/discovery.cpp
   core/src/driver.cpp
   ${printerdriver_platform_sources})
 
@@ -101,6 +102,7 @@ add_library(printerdriver_dsl STATIC
   dsl/src/document.cpp
   dsl/src/format.cpp
   dsl/src/bind.cpp
+  dsl/src/barcode.cpp
   dsl/src/render.cpp)
 
 target_include_directories(printerdriver_dsl PUBLIC
@@ -158,6 +160,23 @@ if(PD_BUILD_SHARED_CAPI)
   printerdriver_warnings(printerdriver_capi_testing)
 endif()
 
+# The local printer agent (docs/techspec.md §5, docs/sdk-spec.md §14) — the same core
+# compiled as a daemon, with a hand-rolled HTTP/1.1 front end. A library plus a thin
+# main, so the test suite can spin the real server on a loopback port in-process.
+add_library(printerdriver_agent STATIC
+  agent/src/http.cpp
+  agent/src/agent.cpp)
+
+target_include_directories(printerdriver_agent PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/agent/include>)
+target_link_libraries(printerdriver_agent PUBLIC printerdriver_dsl)
+
+printerdriver_warnings(printerdriver_agent)
+
+add_executable(pd-agent agent/src/main.cpp)
+target_link_libraries(pd-agent PRIVATE printerdriver_agent)
+printerdriver_warnings(pd-agent)
+
 add_executable(pdctl tools/pdctl.cpp)
 target_link_libraries(pdctl PRIVATE printerdriver_dsl)
 printerdriver_warnings(pdctl)
@@ -174,6 +193,7 @@ set(printerdriver_tests
   test_store
   test_identity
   test_profiles
+  test_discovery
   test_engine)
 
 foreach(test_name IN LISTS printerdriver_tests)
@@ -193,6 +213,7 @@ set(printerdriver_dsl_tests
   test_dsl_document
   test_dsl_format
   test_dsl_bind
+  test_dsl_barcode
   test_dsl_render)
 
 foreach(test_name IN LISTS printerdriver_dsl_tests)
@@ -214,6 +235,17 @@ target_link_libraries(test_queue PRIVATE printerdriver_queue)
 target_include_directories(test_queue PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
 printerdriver_warnings(test_queue)
 add_test(NAME test_queue COMMAND test_queue)
+
+# The agent suite runs the real HTTP server on a loopback port against the same scripted
+# device the engine tests use: an evidence document that never crossed a socket would
+# prove nothing about the socket.
+add_executable(test_agent
+  agent/tests/test_agent.cpp
+  core/tests/test_harness.cpp)
+target_link_libraries(test_agent PRIVATE printerdriver_agent)
+target_include_directories(test_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
+printerdriver_warnings(test_agent)
+add_test(NAME test_agent COMMAND test_agent)
 
 # Compiled as C11 on purpose. pd_test_support.cpp is the only C++ in this target: it
 # holds the scripted transport and the enum bridge, and it is deliberately not part of
