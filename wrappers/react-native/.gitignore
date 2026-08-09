@@ -1,0 +1,19 @@
+# Dependencies. `npm install` pulls React Native in as an auto-installed peer, which is
+# what lets `npm run typecheck` run against React Native's real .d.ts files rather than a
+# hand-written stand-in (README "Verification status").
+node_modules/
+package-lock.json
+
+# tsc output (package.json "main"). Metro reads src/ directly, so this only exists for
+# published tarballs, type declarations and non-Metro hosts.
+lib/
+*.tsbuildinfo
+
+# The staged copy of the SDK's C++ sources, produced by scripts/stage-native-sources.mjs
+# during `npm pack`. Deliberately NOT committed: inside this repository the build files
+# compile core/, capi/, queue/ and dsl/ in place, and a committed copy is exactly the drift
+# that arrangement exists to prevent.
+native/
+
+# npm pack output
+*.tgz

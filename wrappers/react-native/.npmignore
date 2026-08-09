@@ -1,0 +1,27 @@
+# package.json "files" is the primary filter and is an allowlist; this file trims what
+# survives it. Both are kept because `files` decides which top-level entries are considered
+# and this decides what inside them is not worth shipping.
+
+# Tests and their fixtures. cpp/__tests__/rn_stub.h in particular must never reach a device
+# build: it is a host-side syntax-check stand-in for React Native's own headers, and a copy
+# of it inside a pod could shadow the real ones.
+test/
+**/__tests__/
+**/*.test.ts
+
+# Build and tool configuration a consumer never runs.
+tsconfig.json
+tsconfig.build.json
+.gitignore
+*.tsbuildinfo
+*.tgz
+
+# scripts/ ships only stage-native-sources.mjs, referenced by "prepack" (see package.json
+# "files"); the ABI generator and the C++ syntax check are repository tooling.
+scripts/generate-abi-mirror.mjs
+scripts/check_rn_cpp_syntax.sh
+
+# Editor and CI noise.
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,77 @@
+// The Android library module React Native's autolinking adds to a consuming app.
+//
+// It contains no Java and no Kotlin. The whole module is the C++ TurboModule in
+// ../cpp/PrinterDriverModule.cpp, compiled by ./CMakeLists.txt together with the portable
+// core -- one implementation shared with iOS, which is the entire reason the C++
+// TurboModule path was chosen (docs/platforms.md, "React Native / Expo wrapper").
+//
+// UNVERIFIED: never configured, never assembled. This machine has no Android SDK, NDK,
+// JVM or Gradle. See README.md "Verification status".
+
+buildscript {
+  repositories {
+    google()
+    mavenCentral()
+  }
+  dependencies {
+    classpath("com.android.tools.build:gradle:8.6.0")
+  }
+}
+
+apply plugin: "com.android.library"
+
+def resolveProperty(name, fallback) {
+  // React Native's own gradle plugin publishes these into the root project; an app on a
+  // different SDK level overrides them there rather than by editing this file.
+  return rootProject.hasProperty(name) ? rootProject.property(name).toString().toInteger()
+                                       : fallback
+}
+
+android {
+  namespace "com.printerdriver.reactnative"
+  compileSdk resolveProperty("compileSdkVersion", 35)
+
+  defaultConfig {
+    minSdk resolveProperty("minSdkVersion", 24)
+
+    externalNativeBuild {
+      cmake {
+        // The New Architecture is required for the C++ TurboModule path; RN 0.71+ with
+        // Fabric enabled. libc++_shared is what React Native itself links, and mixing STLs
+        // inside one process is how a JSI module crashes on a std::string boundary.
+        arguments "-DANDROID_STL=c++_shared"
+        cppFlags "-std=c++17", "-frtti", "-fexceptions"
+      }
+    }
+    consumerProguardFiles "consumer-rules.pro"
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+      version "3.22.1"
+    }
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  packagingOptions {
+    // The app's own React Native artifacts own these; a second copy from this module would
+    // be the duplicate-symbol failure at install time.
+    excludes += ["**/libc++_shared.so", "**/libjsi.so", "**/libreactnative.so"]
+  }
+}
+
+repositories {
+  google()
+  mavenCentral()
+}
+
+dependencies {
+  // The React Native version comes from the app, never from here: a library that pinned it
+  // would break every app that upgraded.
+  implementation "com.facebook.react:react-android"
+}
