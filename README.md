@@ -249,3 +249,41 @@ back into the driver.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Supported functionality
+
+✅ shipped & tested · 🔄 in build · 📋 specced (docs are normative)
+
+- ✅ Fenced print completion (`GS ( H` / `GS r 1`) with tri-state results, evidence
+  grades A+–E, and completion authority — never a bare success boolean
+- ✅ Idempotency keys, explicit force-reprint with toggleable banner, duplicate
+  prevention; durable journal with crash recovery to honest `Unknown`
+- ✅ Receipt verification identifiers: `V:` token printed + QR'd, `jobByToken`,
+  `pdctl verify` (paper → full evidence record)
+- ✅ Compositional capability profiles, multi-signal identification (GS I untrusted),
+  non-destructive probe-then-promote with provenance (documented/probed/unverified)
+- ✅ Print-queue addon (hold/drain, TTL, priority, lane-blocking on Unknown)
+- ✅ Receipt DSL: JSON documents, templates + bound models, formatters, columns,
+  margins, cut control, declared degradation; `pdctl render` preview
+- ✅ Wrappers: Swift (iOS+macOS), Dart (pub-ready), .NET (NuGet-packed); Kotlin/Android
+  scaffold (CI-pending); iOS example app (ReceiptStudio)
+- ✅ pdctl: status · probe · identify · print · verify · render · counters · settings ·
+  test-print · recover
+- 🔄 Provenance-in-code, A+ grade, Bluetooth custom-transport ABI, expanded catalogue
+  (M12) · pd-agent daemon, LAN discovery, DSL barcodes (M13a)
+- 📋 ePOS A+ transport, Star raw (ETB / ESC GS ETX / CloudPRNT), serial, probe-path,
+  BLE heuristics (M13b) · cash drawers with OPEN_VERIFIED (M14) · Windows native CI
+
+## Supported printers
+
+| Family | Completion path | Status |
+|---|---|---|
+| **Xprinter XP-S260M** | `GS ( H` | ⭐ **hardware-verified** (probe + 100-receipt soak) |
+| Epson TM-T20/T70/T82/T88 IV–VII, m-series, P20II/P80II, U220 | `GS ( H` (manufacturer-documented); ePOS A+ on spooler models | documented |
+| Star TSP100/TSP650/mC-Print, SM portables | ETB / ESC GS ETX / CloudPRNT (specced), StarPRNT | queued (M13b); refuses honestly today |
+| Bixolon SRP-330/350/380/Q/F310, SPP-R mobiles | per-model manuals; `GS ( H` never assumed | profile per model |
+| Citizen CT-S/CT-E desktop, CT-S4500 wide, CMP portables | `ESC p`/`GS r` documented; probe fences | documented |
+| Rongta RP80/RP3xx/RP58 | `GS ( H` documented-provisional (mirror manuals) | probe-first |
+| Partner RP-110 / Sewoo SLK-TS200 | probe all | probe-first |
+| Generic ESC/POS 80/58 mm | `GS r 1` conservative → probe-promoted | supported |
+| Zebra ZQ (ZPL/CPCL), Brother RJ (raster/ESC-P) | non-ESC/POS | refuse honestly, zero bytes |
