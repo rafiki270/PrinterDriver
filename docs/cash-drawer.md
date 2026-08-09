@@ -193,3 +193,35 @@ Epson first (kick + physical open verification fully testable against documented
 protocol), then Star, Citizen, Bixolon, then controlled probes of XP-S260M, Rongta,
 RP-110 — covering the overwhelming majority of static installations without unsafe
 voltage or pinout assumptions.
+
+## Electrical classification (the refinement that keeps this small)
+
+Mechanically, most drawers share the 6P6C modular plug casually called RJ11/RJ12, and a
+huge proportion of Epson-compatible printers share Epson's de-facto arrangement (1 FG ·
+2 kick 1 · 3 sensor · 4 +24 V · 5 kick 2 · 6 signal ground, solenoid between pin 4 and
+a kick pin). **Epson, Citizen, much of Bixolon, many Rongta/Xprinter clones form one
+large interoperable ecosystem** — a normal "Epson-compatible 24 V drawer" very likely
+works across them. Electrically it is NOT universal: Star's same-looking connector
+swaps the purposes of pins 3 and 6 (+24 V on 3, sensor on 6), which is why APG sells
+printer-specific cables (MultiPRO interchangeable-cable system) despite identical-
+looking plugs; and voltage varies (24 V common on static 80-mm, 12 V exists, solenoid
+resistance/current must match — Epson: ≥24 Ω / ≤1 A on its 24 V output).
+
+So the software does not need a drawer-brand database. Printer profiles carry a small
+electrical classification:
+
+```
+drawerPort:
+    standard: EPSON_24V_6P6C   # or STAR_24V_6P6C, GENERIC_12V_6P6C, UNKNOWN
+    voltage: 24
+    channels: 2
+    sensorPin: 3               # 6 on Star-style
+```
+
+Four buckets cover reality: **Epson-style · Star-style · 12-V exceptions · unknown.**
+For the overwhelming majority of the fleet: `EPSON_24V_6P6C → send the ESC/POS drawer
+pulse`. And keep two facts separate always: **the software command and the cable pinout
+are independent** — two printers accepting the same "kick drawer 1" command may still
+wire the modular port differently. Most static POS installations are effectively
+compatible (especially the Epson-compatible universe); the exceptions are manageable,
+not a giant problem.
