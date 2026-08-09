@@ -8,6 +8,7 @@
 
 #include "pd_internal.hpp"
 #include "printerdriver/capability_profile.hpp"
+#include "printerdriver/device_profiles.hpp"
 #include "printerdriver/escpos_encoder.hpp"
 #include "printerdriver/transport.hpp"
 #include "printerdriver/types.hpp"
@@ -75,6 +76,8 @@ static_assert(PD_DEVICE_FOREIGN_WRITER_DETECTED ==
               value_of(pd::DeviceEvent::ForeignWriterDetected));
 static_assert(PD_DEVICE_EVENT_COUNT == static_cast<int>(pd::kAllDeviceEvents.size()));
 
+static_assert(PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB ==
+              value_of(pd::ConfidenceGrade::APlus_DurableQueryableJob));
 static_assert(PD_GRADE_A_JOB_LEVEL_CONFIRMATION ==
               value_of(pd::ConfidenceGrade::A_JobLevelConfirmation));
 static_assert(PD_GRADE_B_ORDERED_DEVICE_RESPONSE ==
@@ -85,6 +88,21 @@ static_assert(PD_GRADE_D_SPOOLER_COMPLETED ==
               value_of(pd::ConfidenceGrade::D_SpoolerCompleted));
 static_assert(PD_GRADE_E_TRANSPORT_ONLY == value_of(pd::ConfidenceGrade::E_TransportOnly));
 static_assert(PD_GRADE_COUNT == static_cast<int>(pd::kAllConfidenceGrades.size()));
+
+static_assert(PD_PROVENANCE_DOCUMENTED == value_of(pd::Provenance::Documented));
+static_assert(PD_PROVENANCE_PROBED == value_of(pd::Provenance::Probed));
+static_assert(PD_PROVENANCE_UNVERIFIED == value_of(pd::Provenance::Unverified));
+static_assert(PD_PROVENANCE_COUNT == static_cast<int>(pd::kAllProvenances.size()));
+
+static_assert(PD_LANGUAGE_ESC_POS == value_of(pd::CommandLanguage::EscPos));
+static_assert(PD_LANGUAGE_STAR_PRNT == value_of(pd::CommandLanguage::StarPrnt));
+static_assert(PD_LANGUAGE_STAR_LINE == value_of(pd::CommandLanguage::StarLine));
+static_assert(PD_LANGUAGE_EPOS_XML == value_of(pd::CommandLanguage::EposXml));
+static_assert(PD_LANGUAGE_ZPL == value_of(pd::CommandLanguage::Zpl));
+static_assert(PD_LANGUAGE_CPCL == value_of(pd::CommandLanguage::Cpcl));
+static_assert(PD_LANGUAGE_BROTHER_RASTER == value_of(pd::CommandLanguage::BrotherRaster));
+static_assert(PD_LANGUAGE_ESC_P == value_of(pd::CommandLanguage::EscP));
+static_assert(PD_LANGUAGE_COUNT == static_cast<int>(pd::kAllCommandLanguages.size()));
 
 static_assert(PD_AUTHORITY_PHYSICAL_PRINTER ==
               value_of(pd::CompletionAuthority::PhysicalPrinter));
@@ -183,10 +201,18 @@ const char* const kDeviceEventNames[PD_DEVICE_EVENT_COUNT] = {
     "ForeignWriterDetected"};
 
 const char* const kConfidenceGradeNames[PD_GRADE_COUNT] = {
-    "A_JobLevelConfirmation", "B_OrderedDeviceResponse", "C_DeviceStatusAround",
-    "D_SpoolerCompleted",     "E_TransportOnly"};
+    "APlus_DurableQueryableJob", "A_JobLevelConfirmation", "B_OrderedDeviceResponse",
+    "C_DeviceStatusAround",      "D_SpoolerCompleted",     "E_TransportOnly"};
 
-const char* const kConfidenceGradeLetters[PD_GRADE_COUNT] = {"A", "B", "C", "D", "E"};
+const char* const kConfidenceGradeLetters[PD_GRADE_COUNT] = {"A+", "A", "B",
+                                                             "C",  "D", "E"};
+
+const char* const kProvenanceNames[PD_PROVENANCE_COUNT] = {"Documented", "Probed",
+                                                           "Unverified"};
+
+const char* const kCommandLanguageNames[PD_LANGUAGE_COUNT] = {
+    "EscPos", "StarPrnt", "StarLine",      "EposXml",
+    "Zpl",    "Cpcl",     "BrotherRaster", "EscP"};
 
 const char* const kCompletionAuthorityNames[PD_AUTHORITY_COUNT] = {
     "PhysicalPrinter", "VendorSpooler", "PdAgent", "PrintServer", "TransportOnly"};
@@ -217,7 +243,53 @@ const pd_code_page kCodePages[PD_CODE_PAGE_COUNT] = {
     PD_CODE_PAGE_PC437, PD_CODE_PAGE_PC850, PD_CODE_PAGE_WPC1252, PD_CODE_PAGE_PC852,
     PD_CODE_PAGE_PC858};
 
-const char* const kProfileIds[] = {"generic", "xp-s260m", nullptr};
+// The two hand-built profiles of capability_profile.hpp plus every entry in the device
+// database (docs/compatibility-brief.md §26). Assembled once, into storage that lives
+// forever, because pd.h promises these pointers are valid for the life of the process.
+const std::vector<const char*>& profileIds() {
+  static const std::vector<std::string>* const owned = [] {
+    auto* names = new std::vector<std::string>{"generic", "xp-s260m"};
+    for (const std::string& name : pd::devices::names()) {
+      names->push_back(name);
+    }
+    return names;
+  }();
+  static const std::vector<const char*>* const table = [] {
+    auto* ids = new std::vector<const char*>();
+    ids->reserve(owned->size() + 1);
+    for (const std::string& name : *owned) {
+      ids->push_back(name.c_str());
+    }
+    ids->push_back(nullptr);
+    return ids;
+  }();
+  return *table;
+}
+
+// "generic" and "xp-s260m" are the two profiles that predate the database and are kept
+// as ids; everything else is looked up by database name. An unknown id is an error and
+// not a silent fall back to generic: a caller that asked for a TM-T88VI and got an
+// unknown-device profile would be told a weaker completion story than it asked for,
+// with nothing in the result explaining why.
+bool resolveProfile(const char* profile_id, pd::CapabilityProfile* out,
+                    std::string* error) {
+  const std::string id =
+      profile_id != nullptr && profile_id[0] != '\0' ? profile_id : "generic";
+  if (id == "generic") {
+    *out = pd::generic_escpos();
+    return true;
+  }
+  if (id == "xp-s260m") {
+    *out = pd::xp_s260m();
+    return true;
+  }
+  if (pd::devices::exists(id)) {
+    *out = pd::devices::byName(id);
+    return true;
+  }
+  *error = "unknown profile id: " + id;
+  return false;
+}
 
 // --- Helpers -----------------------------------------------------------------------
 
@@ -531,7 +603,7 @@ extern "C" const char* pd_last_error(pd_driver* driver) {
   return driver->last_error.c_str();
 }
 
-extern "C" const char* const* pd_profile_ids(void) { return kProfileIds; }
+extern "C" const char* const* pd_profile_ids(void) { return profileIds().data(); }
 
 // --- Printers ----------------------------------------------------------------------
 
@@ -543,16 +615,10 @@ extern "C" pd_printer* pd_add_printer_tcp(pd_driver* driver, const pd_tcp_config
     setError(driver, "tcp printer needs a host");
     return nullptr;
   }
-  const std::string profile_id =
-      config->profile_id != nullptr && config->profile_id[0] != '\0' ? config->profile_id
-                                                                     : "generic";
   pd::CapabilityProfile profile;
-  if (profile_id == "generic") {
-    profile = pd::generic_escpos();
-  } else if (profile_id == "xp-s260m") {
-    profile = pd::xp_s260m();
-  } else {
-    setError(driver, "unknown profile id: " + profile_id);
+  std::string error;
+  if (!resolveProfile(config->profile_id, &profile, &error)) {
+    setError(driver, error);
     return nullptr;
   }
 
@@ -569,6 +635,72 @@ extern "C" pd_printer* pd_add_printer_tcp(pd_driver* driver, const pd_tcp_config
   return pd::capi::attachPrinter(driver, std::move(printer));
 }
 
+extern "C" pd_printer* pd_add_printer_custom(pd_driver* driver,
+                                             const pd_transport_vtable* vtable,
+                                             void* ctx, const char* profile_id,
+                                             uint32_t width_dots) {
+  if (driver == nullptr) {
+    return nullptr;
+  }
+  if (vtable == nullptr || vtable->connect == nullptr || vtable->write == nullptr) {
+    setError(driver, "custom transport needs at least connect and write");
+    return nullptr;
+  }
+  pd::CapabilityProfile profile;
+  std::string error;
+  if (!resolveProfile(profile_id, &profile, &error)) {
+    setError(driver, error);
+    return nullptr;
+  }
+
+  // The function pointers are copied out of the caller's struct here, as pd.h promises;
+  // only `ctx` and the pointed-to functions have to outlive the call.
+  pd::CustomTransportLink::Callbacks callbacks;
+  const pd_transport_connect_fn on_connect = vtable->connect;
+  const pd_transport_write_fn on_write = vtable->write;
+  const pd_transport_close_fn on_close = vtable->close;
+  callbacks.connect = [on_connect, ctx]() { return on_connect(ctx) != 0; };
+  callbacks.write = [on_write, ctx](const uint8_t* data, size_t size) {
+    return on_write(ctx, data, size);
+  };
+  if (on_close != nullptr) {
+    callbacks.close = [on_close, ctx]() { on_close(ctx); };
+  }
+  callbacks.description =
+      vtable->description != nullptr && vtable->description[0] != '\0'
+          ? vtable->description
+          : "custom";
+
+  auto link = std::make_shared<pd::CustomTransportLink>(std::move(callbacks));
+
+  pd::PrinterConfig printer;
+  printer.transport = pd::customTransport(link);
+  printer.width_dots = width_dots != 0 ? width_dots : pd::escpos::kWidth80mm;
+  printer.profile = profile;
+  clearError(driver);
+  pd_printer* handle = pd::capi::attachPrinter(driver, std::move(printer));
+  if (handle != nullptr) {
+    handle->link = std::move(link);
+  }
+  return handle;
+}
+
+extern "C" int32_t pd_transport_feed_bytes(pd_printer* printer, const uint8_t* data,
+                                           size_t size) {
+  if (printer == nullptr || !printer->link || data == nullptr || size == 0) {
+    return 0;
+  }
+  return printer->link->feedBytes(data, size) ? 1 : 0;
+}
+
+extern "C" int32_t pd_transport_link_dropped(pd_printer* printer, const char* message) {
+  if (printer == nullptr || !printer->link) {
+    return 0;
+  }
+  return printer->link->linkDropped(message != nullptr ? message : "link dropped") ? 1
+                                                                                  : 0;
+}
+
 extern "C" const char* pd_printer_id(pd_printer* printer) {
   return printer != nullptr ? printer->id.c_str() : "";
 }
@@ -582,6 +714,40 @@ extern "C" pd_completion_mechanism pd_printer_completion(pd_printer* printer) {
     return PD_COMPLETION_NONE;
   }
   return static_cast<pd_completion_mechanism>(printer->printer->profile().completion);
+}
+
+extern "C" pd_provenance pd_printer_completion_provenance(pd_printer* printer) {
+  if (printer == nullptr || !printer->printer) {
+    return PD_PROVENANCE_UNVERIFIED;
+  }
+  const pd::CapabilityProfile profile = printer->printer->profile();
+  // The provenance of the capability the fence actually rests on, not a summary of the
+  // whole profile: a printer whose GS ( H is documented but whose GS r has only ever
+  // been assumed is answering two different questions, and only one of them is being
+  // asked here.
+  switch (profile.completion) {
+    case pd::CompletionMechanism::GsParenH:
+      return static_cast<pd_provenance>(
+          profile.completion_caps.process_id_gs_h_provenance);
+    case pd::CompletionMechanism::GsR1:
+      return static_cast<pd_provenance>(profile.completion_caps.queued_gs_r_provenance);
+    case pd::CompletionMechanism::VendorIdle:
+    case pd::CompletionMechanism::StarCheckedBlock:
+      return static_cast<pd_provenance>(profile.completion_caps.vendor_idle_provenance);
+    case pd::CompletionMechanism::EposJobId:
+      return static_cast<pd_provenance>(profile.completion_caps.epos_job_id_provenance);
+    case pd::CompletionMechanism::None:
+      break;
+  }
+  // No fence, so there is nothing to have documented or probed.
+  return PD_PROVENANCE_UNVERIFIED;
+}
+
+extern "C" pd_command_language pd_printer_language(pd_printer* printer) {
+  if (printer == nullptr || !printer->printer) {
+    return PD_LANGUAGE_ESC_POS;
+  }
+  return static_cast<pd_command_language>(printer->printer->profile().language);
 }
 
 extern "C" pd_device_status pd_printer_status(pd_driver* driver, pd_printer* printer) {
@@ -859,6 +1025,12 @@ extern "C" const char* pd_confidence_grade_name(pd_confidence_grade value) {
 }
 extern "C" const char* pd_completion_authority_name(pd_completion_authority value) {
   return nameAt(kCompletionAuthorityNames, value);
+}
+extern "C" const char* pd_provenance_name(pd_provenance value) {
+  return nameAt(kProvenanceNames, value);
+}
+extern "C" const char* pd_command_language_name(pd_command_language value) {
+  return nameAt(kCommandLanguageNames, value);
 }
 extern "C" const char* pd_confidence_grade_letter(pd_confidence_grade value) {
   return nameAt(kConfidenceGradeLetters, value);

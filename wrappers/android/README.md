@@ -18,6 +18,7 @@ What was actually checked, and with what:
 | Layer | Status |
 |---|---|
 | Kotlin sources (`src/main/kotlin`) | Written, reviewed by hand. **Not compiled** -- no `kotlinc`/Gradle/Android SDK on the authoring machine. |
+| Bluetooth SPP transport (`src/main/kotlin/com/printerdriver/Bluetooth.kt`) | Written. **Never compiled and never run** -- not on a device, not on an emulator. No paired printer has ever been in the room. See that file's own header comment for the itemised list of what is unproven. **Hardware-pending.** |
 | JNI glue (`src/main/cpp/printerdriver_jni.cpp`) | **Syntax- and type-checked** with a real compiler -- see below. Not compiled by the NDK, not linked, not run. |
 | CMake build (`CMakeLists.txt`) | Written against the root project's own `CMakeLists.txt` as a reference. **Never configured or run**, on Android or otherwise -- no Android SDK/NDK available. |
 | Gradle build (`build.gradle.kts`, `settings.gradle.kts`) | Written. **Never resolved** -- no Gradle/JVM available. Plugin/dependency versions are unpinned-against-reality: believed current and mutually compatible at authoring time, not verified against an actual repository. |
@@ -32,25 +33,45 @@ available is a host C++ compiler, so the one piece of this scaffold that got a r
 adversarial check is the JNI glue's C++ syntax and types:
 
 ```sh
-clang++ -std=c++17 -fsyntax-only \
+clang++ -std=c++17 -fsyntax-only -Wall -Wextra -Wpedantic \
   -DPD_JNI_TEST_STUB \
   -include wrappers/android/src/test/cpp/jni_stub.h \
   -I core/include -I capi/include -I capi/src \
   wrappers/android/src/main/cpp/printerdriver_jni.cpp
 ```
 
-This passes cleanly, including under `-Wall -Wextra -Wpedantic`. `jni_stub.h`
+Run it from the repository root. It passes cleanly. `jni_stub.h`
 (`src/test/cpp/jni_stub.h`) is a minimal, test-only stand-in for the two real NDK
 headers the glue includes (`<jni.h>`, `<android/log.h>`) -- declared-but-undefined
 methods matching the real JNI API's shapes closely enough to catch real signature
 mistakes, force-included in place of those headers only when `PD_JNI_TEST_STUB` is
-defined (which the real Android/Gradle/CMake build never does). **This is a syntax and
-type check only** -- it proves the glue parses, that every `pd_*`/`PD_*` symbol it
-uses matches the real `pd.h`, and that JNI calls are shaped correctly against a
-faithful-enough stub. It does **not** prove the code links, runs, or is correct against
-the *real* NDK's `<jni.h>` (ABI-compatible in the parts that matter, but not verified
-byte-for-byte against it), and it does not exercise the CMake/Gradle/NDK build path at
-all -- see the table above.
+defined (which the real Android/Gradle/CMake build never does). Keep the stub in sync
+with the JNI subset the glue actually calls; it grew `NewByteArray`,
+`SetByteArrayRegion`, `CallBooleanMethod` and `CallIntMethod` when the custom-transport
+vtable landed. **This is a syntax and type check only** -- it proves the glue parses,
+that every `pd_*`/`PD_*` symbol it uses matches the real `pd.h`, and that JNI calls are
+shaped correctly against a faithful-enough stub. It does **not** prove the code links,
+runs, or is correct against the *real* NDK's `<jni.h>` (ABI-compatible in the parts that
+matter, but not verified byte-for-byte against it), and it does not exercise the
+CMake/Gradle/NDK build path at all -- see the table above.
+
+Two things it structurally cannot catch, worth knowing before trusting a green run:
+
+- **The JNI signature strings.** `"()Z"`, `"([B)I"`, `"(IIZIJ)V"` and friends are string
+  literals handed to `GetMethodID`; no compiler checks them against the Kotlin
+  declarations they are supposed to describe. They are verified by `javap`, or by the
+  code failing at runtime, and neither has happened. This is item 4 below.
+- **Anything about the Kotlin side.** `Bluetooth.kt` has never been near a compiler.
+
+A green check is worthless if the check cannot go red, so the same technique run against
+a deliberately wrong translation unit must fail, and does. Two controls specific to the
+custom-transport ABI, each built by prepending the mistake to the real glue file and
+compiling the result with the command above:
+
+| Control | Expected rejection |
+|---|---|
+| `pd_transport_vtable.write` assigned a function returning `int32_t` -- a wrapper that reports a short write as a 32-bit count | `incompatible function pointer types assigning to 'pd_transport_write_fn'` |
+| `pd_transport_feed_bytes(printer, size, data)` -- the buffer/length transposition | `no matching function for call to 'pd_transport_feed_bytes'` |
 
 ## What a real CI run must confirm
 
@@ -66,11 +87,12 @@ In priority order -- this is the actual risk list, not a formality:
 3. **The JNI glue compiles under the real NDK `<jni.h>`**, not just the host stub --
    in particular `__android_log_print`'s variadic signature and every
    `Get*ArrayElements`/`Release*ArrayElements` call.
-4. **`GetMethodID` actually finds `onEvent`/`onMessage`** on the Kotlin lambda classes
-   the `callbackFlow` builders and `Printer.send` produce at runtime -- the JNI
-   signature strings (`"(IIZIJ)V"`, `"(I)V"`, `"(Ljava/lang/String;)V"`) were derived
-   by hand from the Kotlin declarations in `NativeCallbacks.kt` and never confirmed
-   against `javap` output.
+4. **`GetMethodID` actually finds `onEvent`/`onMessage`/`connect`/`write`/`close`** on the
+   Kotlin classes the `callbackFlow` builders, `Printer.send` and
+   `BluetoothSppTransport` produce at runtime -- the JNI signature strings
+   (`"(IIZIJ)V"`, `"(I)V"`, `"(Ljava/lang/String;)V"`, `"()Z"`, `"([B)I"`, `"()V"`) were
+   derived by hand from the Kotlin declarations in `NativeCallbacks.kt` and never
+   confirmed against `javap` output.
 5. **The `internal`-without-per-member-`internal` visibility pattern in
    `NativeBridge.kt`/`NativeCallbacks.kt` actually avoids Kotlin's internal-member name
    mangling** the way its code comments assert. This determines whether the
@@ -83,8 +105,15 @@ In priority order -- this is the actual risk list, not a formality:
    device/emulator -- believed correct and well-documented Android behavior, not
    independently re-verified here.
 8. **R8/consumer-rules.pro** actually keeps what it claims to on a real minified build
-   (`NativeBridge`'s native methods, the three callback interfaces and their lambda
+   (`NativeBridge`'s native methods, the four callback interfaces and their lambda
    implementers).
+9. **An RFCOMM connection to a real printer succeeds at all.** Everything in
+   `Bluetooth.kt` -- the SPP UUID, `cancelDiscovery()` before `connect()`, the reader
+   thread, the API 31+ permission set -- comes from documentation rather than from an
+   observed connection. In particular, the handle-publication latch exists because
+   `pd_add_printer_custom` starts the printer's worker thread (and queues a capability
+   probe on it) before returning, so `connect()` can run before Kotlin has been told the
+   printer handle: sound on paper, never observed racing.
 
 ## Repository layout
 
@@ -100,7 +129,9 @@ wrappers/android/            <- this Gradle project's root IS the `printerdriver
     ├── main/
     │   ├── AndroidManifest.xml
     │   ├── cpp/printerdriver_jni.cpp
-    │   └── kotlin/com/printerdriver/...
+    │   └── kotlin/com/printerdriver/
+    │       ├── Bluetooth.kt   <- RFCOMM/SPP transport over pd_add_printer_custom
+    │       └── ...
     └── test/
         ├── cpp/jni_stub.h     <- host-only syntax-check fixture, see above
         └── kotlin/com/printerdriver/...
@@ -150,8 +181,21 @@ dependencies {
 ```
 
 `minSdk` 26. Pulls in `kotlinx-coroutines-core` and `kotlinx-coroutines-android`
-transitively. Declares `android.permission.INTERNET` (every transport this wrapper
-currently exposes -- `addPrinterTcp` -- is a raw TCP socket).
+transitively.
+
+Permissions this library declares, and what they are for:
+
+| Permission | Why |
+|---|---|
+| `INTERNET` | `addPrinterTcp` is a raw TCP socket. |
+| `BLUETOOTH`, `BLUETOOTH_ADMIN` (`maxSdkVersion="30"`) | The pre-Android-12 pair, for `addPrinterBluetooth`. |
+| `BLUETOOTH_CONNECT` | API 31+: talking to an already-paired device. **Runtime permission** -- the host app must request it. |
+| `BLUETOOTH_SCAN` (`neverForLocation`) | API 31+: what `cancelDiscovery()` falls under. `neverForLocation` is asserted because this library never scans and never derives location; without it every consuming app inherits a location requirement. |
+
+This library cannot request the runtime permissions itself -- a prompt needs an Activity,
+and a library that pops one has taken a decision belonging to the host app. Pairing is
+likewise out of scope: it is an operator action in the system's Bluetooth settings, and a
+printing SDK that can pair can also pair with the wrong printer.
 
 ## Quick start
 
@@ -160,6 +204,16 @@ import com.printerdriver.*
 
 val driver = PrinterDriver.create(PrinterDriverConfig(storageDirectory = context.filesDir.path))
 val kitchen = driver.addPrinterTcp(TcpPrinterConfig(host = "192.168.1.101"))
+
+// Or over Bluetooth Classic SPP, to a device the operator has already paired
+// (docs/compatibility-brief.md §25). NEVER RUN AGAINST HARDWARE -- see "Verification
+// status". Registration does not connect: an out-of-range printer is reported through
+// the job's own JobResult, not by this call.
+val counter = driver.addPrinterBluetooth(
+    context,
+    BluetoothPrinterConfig(address = "00:11:22:33:44:55", widthDots = 384)
+)
+counter.bluetoothTransportKind   // CLASSIC_SPP -- never a bare `bluetooth = true` (§25)
 
 // Coroutine style
 val job = kitchen.print(
@@ -220,6 +274,22 @@ Straight from `pd.h`, unchanged by this wrapper:
   `Dispatchers.Main.immediate` by default -- the conventional choice for callback-style
   Android APIs. `onResult` fires exactly once, always, because it is sugar over
   `PrintJob.result()`'s suspend contract, not a separate mechanism.
+- **A custom transport's `connect`/`write`/`close`** (`BluetoothSppTransport`) are called
+  **by the core**, on the owning printer's worker thread, one at a time and never
+  concurrently with each other. None of them may call `pd_transport_feed_bytes` -- the
+  thread they run on is the thread that would have to service the delivery. Received
+  bytes go the other way from the transport's own reader thread, which may run
+  concurrently with a `write` in flight; that is the normal case, a status answer
+  arriving while the next chunk goes out. The registration outlives an individual
+  connection: after a link drop the core calls `connect` again on the same object.
+- **`PrinterDriver.close()`** shuts every registered Bluetooth transport down *before*
+  `pd_destroy`, because `pd_destroy` frees every `pd_printer` handle and a reader thread
+  outliving it would feed bytes through a dangling pointer. The consequence is that an
+  in-flight job loses its backchannel at that moment and settles as Failed or Unknown
+  rather than waiting for a fence that can no longer arrive -- await outstanding results
+  before closing if that matters. The native side independently refuses post-`pd_destroy`
+  feeds (`printerdriver_jni.cpp`'s lifecycle mutex), so a straggler is safe rather than
+  merely unlikely.
 - **`PrinterDriver.close()`** cancels that internal scope and then calls `pd_destroy`,
   which itself blocks until every in-flight job reaches a terminal state. A
   `Printer.send` callback already inside its native wait when `close()` runs may still

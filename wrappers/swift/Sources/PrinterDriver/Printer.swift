@@ -28,12 +28,37 @@ public final class Printer: @unchecked Sendable {
   /// ``CompletionMechanism/none`` can prove only that the transport took the bytes.
   public let completionMechanism: CompletionMechanism
 
+  /// What ``completionMechanism`` is actually worth — docs/compatibility-brief.md §28.
+  ///
+  /// Not a confidence level, and it changes nothing about what a job reports. It answers
+  /// a different question, and answers it *before* anything has been printed: should this
+  /// printer's fence be trusted on the strength of a profile alone?
+  ///
+  /// ``Provenance/documented`` means the manufacturer's own command documentation lists
+  /// the mechanism for this model — in the shipped database, Epson and nobody else.
+  /// ``Provenance/probed`` means this driver asked the installed hardware over the
+  /// installed interface path and it answered, which beats any datasheet and is specific
+  /// to that path. ``Provenance/unverified`` means neither, which is what "ESC/POS
+  /// compatible" on a spec sheet amounts to — and is the signal that running `pdctl probe`
+  /// against the site's hardware is worth the trip.
+  public let completionProvenance: Provenance
+
+  /// The command language this printer's profile is driven in.
+  ///
+  /// Anything but ``CommandLanguage/escPos`` is refused with ``FailureReason/unsupported``
+  /// before a byte is written: a Zebra or a Brother is not an ESC/POS printer, and sending
+  /// it ESC/POS produces a metre of text rather than a label.
+  public let language: CommandLanguage
+
   init(core: DriverCore, handle: OpaquePointer) {
     self.core = core
     self.handle = handle
     id = String(cString: pd_printer_id(handle))
     widthDots = pd_printer_width_dots(handle)
     completionMechanism = CompletionMechanism(bridging: pd_printer_completion(handle).rawValue)
+    completionProvenance = Provenance(
+      bridging: pd_printer_completion_provenance(handle).rawValue)
+    language = CommandLanguage(bridging: pd_printer_language(handle).rawValue)
   }
 
   // MARK: - Printing

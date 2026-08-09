@@ -125,6 +125,7 @@ void main() {
         _Mirror(PdTestEnum.confidenceGrade, ConfidenceGrade.nativeCount,
             grades.map((v) => v.nativeValue).toList(),
             expectedNames: const <String>[
+              'APlus_DurableQueryableJob',
               'A_JobLevelConfirmation',
               'B_OrderedDeviceResponse',
               'C_DeviceStatusAround',

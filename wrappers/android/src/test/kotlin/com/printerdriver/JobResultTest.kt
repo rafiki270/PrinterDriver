@@ -15,9 +15,13 @@ class JobResultTest {
 
     @Test
     fun `outcome 0 maps to Done, carrying confidence`() {
+        // grade 1, not 0: PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB took raw 0 and pushed
+        // every letter grade up by one. A GS(H) fn48 confirmation is grade A, and
+        // asserting that against raw 1 is what stops this wrapper quietly promoting
+        // every A-graded job to A+ -- a grade no transport in this core can produce.
         val result = JobResult.fromRaw(
             outcome = 0, confidence = 4, reason = 0,
-            grade = 0, authority = 0, method = "GS(H) fn48"
+            grade = 1, authority = 0, method = "GS(H) fn48"
         )
         assertTrue(result is JobResult.Done)
         val done = result as JobResult.Done
@@ -46,7 +50,7 @@ class JobResultTest {
         // pd.h's pd_job_result struct comment is explicit that confidence is carried
         // on Failed too ("what an operator needs to decide about a reprint"), not only
         // on Done -- this is the case that pins that down.
-        val result = JobResult.fromRaw(outcome = 1, confidence = 1, reason = 3, grade = 4, authority = 4, method = "none")
+        val result = JobResult.fromRaw(outcome = 1, confidence = 1, reason = 3, grade = 5, authority = 4, method = "none")
         assertTrue(result is JobResult.Failed)
         val failed = result as JobResult.Failed
         assertEquals(FailureReason.PREFLIGHT_PAPER_OUT, failed.reason)
@@ -55,7 +59,7 @@ class JobResultTest {
 
     @Test
     fun `outcome 2 maps to Unknown, carrying confidence, never collapsed into Done or Failed`() {
-        val result = JobResult.fromRaw(outcome = 2, confidence = 2, reason = 0, grade = 4, authority = 4, method = "none")
+        val result = JobResult.fromRaw(outcome = 2, confidence = 2, reason = 0, grade = 5, authority = 4, method = "none")
         assertTrue(result is JobResult.Unknown)
         assertEquals(ConfidenceLevel.PRINT_CONFIRMED, (result as JobResult.Unknown).confidence)
     }
@@ -65,13 +69,13 @@ class JobResultTest {
         // Same "closed enum, explicit unrecognized handling" contract as Enums.kt, but
         // enforced at the sealed-class boundary instead of an enum's: an outcome this
         // wrapper does not recognize must never be silently reported as Done or Failed.
-        val result = JobResult.fromRaw(outcome = 99, confidence = 0, reason = 0, grade = 4, authority = 4, method = "none")
+        val result = JobResult.fromRaw(outcome = 99, confidence = 0, reason = 0, grade = 5, authority = 4, method = "none")
         assertTrue(result is JobResult.Unknown)
     }
 
     @Test
     fun `Failed reason maps through FailureReason fromRaw, including its UNRECOGNIZED fallback`() {
-        val result = JobResult.fromRaw(outcome = 1, confidence = 0, reason = 12345, grade = 4, authority = 4, method = "none")
+        val result = JobResult.fromRaw(outcome = 1, confidence = 0, reason = 12345, grade = 5, authority = 4, method = "none")
         assertTrue(result is JobResult.Failed)
         assertEquals(FailureReason.UNRECOGNIZED, (result as JobResult.Failed).reason)
     }

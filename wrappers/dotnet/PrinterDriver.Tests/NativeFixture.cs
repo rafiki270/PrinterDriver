@@ -175,6 +175,8 @@ internal enum BridgedEnum
     Alignment = 10,
     CodePage = 11,
     Binarization = 12,
+    ConfidenceGrade = 13,
+    CompletionAuthority = 14,
 }
 
 /// <summary>

@@ -157,7 +157,9 @@ PD_TEST(device_database_records_the_researched_per_family_facts) {
   CHECK(devices::epson_tm_i().completion_caps.epos_job_id);
   CHECK(devices::epson_tm_i().transport.epos);
 
-  // Rongta RP80: the manual documents GS ( H, and it documents GS I lying.
+  // Rongta RP80: the probe should still ask about GS ( H, and the family documents
+  // GS I lying. What the family does NOT do any more is claim the extension —
+  // docs/compatibility-brief.md §13 withdrew that, see the provenance test below.
   const CapabilityProfile rp80 = devices::rongta_rp80();
   CHECK(rp80.completion_caps.try_process_id_gs_h);
   CHECK(rp80.quirks.unreliable_identity);
@@ -168,9 +170,16 @@ PD_TEST(device_database_records_the_researched_per_family_facts) {
   CHECK_EQ(devices::rongta_rp58().media.printable_width_dots, escpos::kWidth58mm);
   CHECK(devices::rongta_rp3xx().completion_caps.try_process_id_gs_h);
 
-  // Xprinter S series: GS ( H hardware-confirmed on the XP-S260M.
-  CHECK_EQ(devices::xprinter_s_series().completion, CompletionMechanism::GsParenH);
-  CHECK(devices::xprinter_s_series().completion_caps.process_id_gs_h);
+  // Xprinter S series, CORRECTED per docs/compatibility-brief.md §14 and §28. Xprinter
+  // does not document GS ( H, so the *family* default must not claim it — one probed
+  // XP-S260M is not a family, and firmware varies across the line. The hardware finding
+  // lives in xp_s260m(), which carries Provenance::Probed, and in the findings store.
+  // The family still asks the question on every probe.
+  CHECK_EQ(devices::xprinter_s_series().completion, CompletionMechanism::GsR1);
+  CHECK(!devices::xprinter_s_series().completion_caps.process_id_gs_h);
+  CHECK(devices::xprinter_s_series().completion_caps.try_process_id_gs_h);
+  CHECK_EQ(xp_s260m().completion, CompletionMechanism::GsParenH);
+  CHECK(xp_s260m().completion_caps.process_id_gs_h);
   CHECK_EQ(devices::xprinter_pos58().media.printable_width_dots, escpos::kWidth58mm);
   CHECK(devices::xprinter_pos80().completion_caps.try_process_id_gs_h);
 
@@ -448,4 +457,356 @@ PD_TEST(findings_store_persists_across_a_restart_and_replaces_by_key) {
   CHECK(!memory.persistent());
   memory.save(findings);
   CHECK_EQ(memory.size(), static_cast<size_t>(1));
+}
+
+// --- Capability provenance (docs/compatibility-brief.md §28) ------------------------
+
+PD_TEST(provenance_defaults_are_documented_only_where_the_manufacturer_documents_them) {
+  // Epson is the reference implementation and the only family whose shipped defaults
+  // claim Documented: Epson publishes a model-by-model ESC/POS applicability database
+  // in which `GS ( H` fn 48 appears by name, alongside GS r, DLE EOT and ASB (§2).
+  for (const CapabilityProfile& epson :
+       {devices::epson_tm_t20iii(), devices::epson_tm_t88vi(), devices::epson_tm_t88vii(),
+        devices::epson_tm_m30iii(), devices::epson_tm_p20ii(), devices::epson_tm_p80ii()}) {
+    CHECK_EQ(epson.completion_caps.process_id_gs_h_provenance, Provenance::Documented);
+    CHECK_EQ(epson.completion_caps.queued_gs_r_provenance, Provenance::Documented);
+    CHECK_EQ(epson.status.dle_eot_provenance, Provenance::Documented);
+    CHECK_EQ(epson.status.asb_provenance, Provenance::Documented);
+    CHECK(epson.completion_caps.process_id_gs_h);
+  }
+
+  // Everyone else is Unverified until something establishes otherwise. These three are
+  // named in the brief for three different reasons, and all three end in the same
+  // place: an advertised standard is not a documented command table.
+  //
+  //   Xprinter (§14)  — the XP-S260M answers GS ( H on our bench, but Xprinter's public
+  //                     documentation does not contain it, so the family cannot claim it.
+  //   Rongta (§13)    — THE CORRECTION. An earlier revision of this database assumed
+  //                     GS ( H from an RP80 manual; no manufacturer-hosted Rongta
+  //                     reference proving it was found, so the claim is withdrawn.
+  //   Partner (§15)   — not enough public programmer documentation for any of the Epson
+  //                     completion extensions: DLE EOT, GS r, GS ( H and ASB are all
+  //                     probe questions.
+  for (const CapabilityProfile& unverified :
+       {devices::xprinter_s_series(), devices::xprinter_pos80(), devices::rongta_rp80(),
+        devices::rongta_rp58(), devices::rongta_rp3xx(), devices::rongta_rp8xx(),
+        devices::partner_rp110(), devices::partner_rp710(), devices::sewoo_slk_ts()}) {
+    CHECK_EQ(unverified.completion_caps.process_id_gs_h_provenance,
+             Provenance::Unverified);
+    CHECK_EQ(unverified.completion_caps.queued_gs_r_provenance, Provenance::Unverified);
+    CHECK_EQ(unverified.status.dle_eot_provenance, Provenance::Unverified);
+    CHECK_EQ(unverified.status.asb_provenance, Provenance::Unverified);
+    // Unverified means "nobody checked", never "absent": the probe still asks.
+    CHECK(!unverified.completion_caps.process_id_gs_h);
+    CHECK(unverified.completion_caps.try_process_id_gs_h);
+  }
+
+  // Bixolon and Citizen publish real per-model command manuals, but those manuals have
+  // not been loaded and validated here, so their entries do not borrow credibility from
+  // the manuals' existence (§9-§12 policy: GS ( H = DO NOT ASSUME).
+  for (const CapabilityProfile& per_model :
+       {devices::bixolon_srp_q300(), devices::bixolon_spp_r310(),
+        devices::citizen_cmp_20ii(), devices::citizen_cmp_30ii()}) {
+    CHECK_EQ(per_model.completion_caps.process_id_gs_h_provenance,
+             Provenance::Unverified);
+    CHECK(!per_model.completion_caps.process_id_gs_h);
+  }
+
+  // Nothing in the shipped database claims Probed: a default has by definition not been
+  // measured. Probed appears only on the one hand-written profile for an interrogated
+  // unit, and on whatever the probe promotes at runtime.
+  for (const std::string& name : devices::names()) {
+    const CapabilityProfile profile = devices::byName(name);
+    CHECK(profile.completion_caps.process_id_gs_h_provenance != Provenance::Probed);
+    CHECK(profile.status.dle_eot_provenance != Provenance::Probed);
+  }
+  CHECK_EQ(xp_s260m().completion_caps.process_id_gs_h_provenance, Provenance::Probed);
+  CHECK_EQ(xp_s260m().status.dle_eot_provenance, Provenance::Probed);
+  // generic-escpos is UNKNOWN DEVICE: it knows nothing about anything.
+  CHECK_EQ(generic_escpos().completion_caps.process_id_gs_h_provenance,
+           Provenance::Unverified);
+  CHECK_EQ(generic_escpos().status.asb_provenance, Provenance::Unverified);
+}
+
+PD_TEST(provenance_promotes_to_probed_when_the_device_answers) {
+  // The Xprinter story end to end. Start from the family default, which is honest about
+  // knowing nothing; interrogate a device that does answer; end with Probed — a
+  // stronger claim than Xprinter's own marketing, and visibly a different one from
+  // Epson's Documented.
+  pdfake::Script script;
+  script.answer_process_id = true;  // this unit really does answer GS ( H
+  pdfake::FakePrinter device(script);
+  const CapabilityFindings findings = probeDevice(device);
+  CHECK_EQ(findings.gs_h_process_id.value_or(false), true);
+
+  const CapabilityProfile defaults = devices::xprinter_s_series();
+  CHECK_EQ(defaults.completion_caps.process_id_gs_h_provenance, Provenance::Unverified);
+  CHECK(!defaults.probed);
+
+  const CapabilityProfile promoted = promote(defaults, findings);
+  CHECK(promoted.probed);
+  CHECK(promoted.completion_caps.process_id_gs_h);
+  CHECK_EQ(promoted.completion, CompletionMechanism::GsParenH);
+  CHECK_EQ(promoted.completion_caps.process_id_gs_h_provenance, Provenance::Probed);
+  CHECK_EQ(promoted.status.dle_eot_provenance, Provenance::Probed);
+  CHECK_EQ(promoted.completion_caps.queued_gs_r_provenance, Provenance::Probed);
+  // The grade the promoted profile can now claim is A, from the physical printer.
+  CHECK_EQ(promoted.evidence().grade, ConfidenceGrade::A_JobLevelConfirmation);
+
+  // An Epson that the probe could not reach keeps its documentation. Silence demotes
+  // nothing — that is the difference between "no answer" and "answered no".
+  CapabilityFindings silent;
+  silent.key = "unreachable";
+  silent.gs_i = true;  // non-empty, but says nothing about the completion extensions
+  const CapabilityProfile epson = promote(devices::epson_tm_t88vi(), silent);
+  CHECK_EQ(epson.completion_caps.process_id_gs_h_provenance, Provenance::Documented);
+  CHECK_EQ(epson.status.dle_eot_provenance, Provenance::Documented);
+
+  // A device that answers "no" is also a probe result: an established absence is
+  // evidence and demotes a documented default to Probed-false.
+  CapabilityFindings denied;
+  denied.key = "answered-no";
+  denied.gs_h_process_id = false;
+  denied.gs_r1 = true;
+  const CapabilityProfile demoted = promote(devices::epson_tm_t88vi(), denied);
+  CHECK(!demoted.completion_caps.process_id_gs_h);
+  CHECK_EQ(demoted.completion_caps.process_id_gs_h_provenance, Provenance::Probed);
+  CHECK_EQ(demoted.completion, CompletionMechanism::GsR1);
+}
+
+PD_TEST(provenance_survives_a_persisted_findings_round_trip) {
+  // Probe results are persisted so a fleet does not re-interrogate every printer on
+  // every boot. What comes back out has to promote to the same provenance it did the
+  // first time, or the second boot would quietly report a weaker profile than the
+  // first (docs/capability-profiles.md, "persisted keyed by model + serial + firmware").
+  pdfake::TempDir dir("provenance-round-trip");
+  CapabilityFindings findings;
+  findings.key = "xp-s260m-probed";
+  findings.endpoint = "tcp://192.0.2.44:9100";
+  findings.gs_h_process_id = true;
+  findings.gs_r1 = true;
+  findings.dle_eot = true;
+  findings.asb = true;
+  findings.cutter_error_status = true;
+
+  {
+    FindingsStore store(dir.path());
+    store.save(findings);
+  }
+  FindingsStore reopened(dir.path());
+  const std::optional<CapabilityFindings> loaded = reopened.find(findings.key);
+  CHECK(loaded.has_value());
+
+  const CapabilityProfile promoted = promote(devices::xprinter_s_series(), *loaded);
+  CHECK_EQ(promoted.completion_caps.process_id_gs_h_provenance, Provenance::Probed);
+  CHECK_EQ(promoted.completion_caps.queued_gs_r_provenance, Provenance::Probed);
+  CHECK_EQ(promoted.status.dle_eot_provenance, Provenance::Probed);
+  CHECK_EQ(promoted.status.asb_provenance, Provenance::Probed);
+  CHECK_EQ(promoted.status.cutter_error_provenance, Provenance::Probed);
+  CHECK_EQ(promoted.completion, CompletionMechanism::GsParenH);
+}
+
+// --- Catalogue expansion (docs/compatibility-brief.md §26) --------------------------
+
+PD_TEST(catalogue_covers_every_family_the_brief_lists) {
+  // §26's initial catalogue, spelled out. A missing id is a printer somebody cannot
+  // select, and the failure mode of that is a fleet silently driven as generic_80.
+  const char* const expected[] = {
+      // Epson: T20/II/III/IV, T70/II, T82, T88IV/V/VI/VII, m10, m30/II/III, m50/II,
+      // P20/P20II, P60/II, P80/P80II (plus the Auto Cutter variant), U220/II.
+      "epson_tm_t20", "epson_tm_t20ii", "epson_tm_t20iii", "epson_tm_t20iv",
+      "epson_tm_t70", "epson_tm_t70ii", "epson_tm_t82",
+      "epson_tm_t88iv", "epson_tm_t88v", "epson_tm_t88vi", "epson_tm_t88vii",
+      "epson_tm_m10", "epson_tm_m30", "epson_tm_m30ii", "epson_tm_m30iii",
+      "epson_tm_m50", "epson_tm_m50ii",
+      "epson_tm_p20", "epson_tm_p20ii", "epson_tm_p60", "epson_tm_p60ii",
+      "epson_tm_p80", "epson_tm_p80ii", "epson_tm_p80ii_autocutter",
+      "epson_tm_u220", "epson_tm_u220ii",
+      // Star: TSP100III/IV, TSP650II, mC-Print2/3, SM-S210/220/230, SM-L200/300,
+      // SM-T300/400.
+      "star_tsp100iii", "star_tsp100iv", "star_tsp650", "star_mcprint2", "star_mcprint3",
+      "star_sm_s210", "star_sm_s220", "star_sm_s230", "star_sm_l200", "star_sm_l300",
+      "star_sm_t300", "star_sm_t400",
+      // Bixolon: SRP-330/350/350plus/380, Q200/Q300, B300, F310, 275, SPP-R200/210/310/410.
+      "bixolon_srp330", "bixolon_srp350", "bixolon_srp380", "bixolon_srp_q200",
+      "bixolon_srp_q300", "bixolon_srp_b300", "bixolon_srp_f310", "bixolon_srp_275",
+      "bixolon_spp_r200", "bixolon_spp_r210", "bixolon_spp_r310", "bixolon_spp_r410",
+      // Citizen: the CT-S families plus the CMP portables.
+      "citizen_cts_58_80", "citizen_cts_fast", "citizen_cts_wide", "citizen_cmp_20ii",
+      "citizen_cmp_30ii",
+      // Rongta, Xprinter, Partner.
+      "rongta_rp58", "rongta_rp80", "rongta_rp3xx", "rongta_rp8xx",
+      "xprinter_pos58", "xprinter_pos80", "xprinter_s_series", "xprinter_v_series",
+      "xprinter_portable", "partner_rp110", "partner_rp710",
+      // Zebra and Brother: present precisely so they can be refused rather than guessed.
+      "zebra_zq300_plus", "zebra_zq500", "zebra_zq600_plus",
+      "brother_rj2000", "brother_rj3000", "brother_rj4000",
+      // The escape hatch.
+      "generic_unknown",
+  };
+  for (const char* name : expected) {
+    CHECK(devices::exists(name));
+    CHECK_EQ(devices::byName(name).name, std::string(name));
+  }
+  CHECK(devices::names().size() >= sizeof(expected) / sizeof(expected[0]));
+}
+
+PD_TEST(catalogue_media_facts_come_from_the_brief_not_from_arithmetic) {
+  // TM-T20III (§2): 576 dots on 80 mm, 420 in the 58 mm configuration. 420 is neither
+  // 384 (the usual 58 mm figure) nor 576 x 58/80 = 417, which is exactly why it is
+  // stored rather than computed.
+  const CapabilityProfile t20iii = devices::epson_tm_t20iii();
+  CHECK_EQ(t20iii.media.printable_width_dots, escpos::kWidth80mm);
+  CHECK_EQ(t20iii.media.printable_width_dots_58mm, 420u);
+  CHECK(t20iii.media.paper_guide_58mm);
+  CHECK_EQ(static_cast<int>(t20iii.media.printable_width_mm), 72);
+
+  // TM-P20II (§6): 58 mm paper, 48 mm print width, manual tear, and two documented
+  // receive buffers — 4 KB normally, 64 KB over Bluetooth. Same printer, two numbers.
+  const CapabilityProfile p20ii = devices::epson_tm_p20ii();
+  CHECK_EQ(static_cast<int>(p20ii.media.nominal_roll_width_mm), 58);
+  CHECK_EQ(static_cast<int>(p20ii.media.printable_width_mm), 48);
+  CHECK_EQ(p20ii.media.printable_width_dots, escpos::kWidth58mm);
+  CHECK(!p20ii.media.cutter);
+  CHECK_EQ(p20ii.cut, CutVariant::None);
+  CHECK_EQ(p20ii.transport.bluetooth.receive_buffer_bytes, 4096u);
+  CHECK_EQ(p20ii.transport.bluetooth.bluetooth_receive_buffer_bytes, 65536u);
+
+  // TM-P80II: the standard unit tears, the separately-sold Auto Cutter Model cuts.
+  // Two hardware profiles, not one profile with a flag (§6).
+  CHECK(!devices::epson_tm_p80ii().media.cutter);
+  CHECK_EQ(devices::epson_tm_p80ii().cut, CutVariant::None);
+  const CapabilityProfile autocut = devices::epson_tm_p80ii_autocutter();
+  CHECK(autocut.media.cutter);
+  CHECK_EQ(autocut.cut, CutVariant::Partial);
+  // A cutter that never clears the head-to-blade gap slices the trailing QR.
+  CHECK(autocut.media.head_to_cutter_feed_dots > 0);
+  CHECK_EQ(devices::epson_tm_p80ii().media.head_to_cutter_feed_dots, 0);
+
+  // CT-S4500 (§11-§12): 112 mm media, 104 mm image. CMP-30II: 25-80 mm media, 72 mm
+  // maximum image. In both cases the roll and the raster are independent facts.
+  CHECK_EQ(static_cast<int>(devices::citizen_cts_wide().media.printable_width_mm), 104);
+  CHECK_EQ(devices::citizen_cts_wide().media.printable_width_dots, escpos::kWidth104mm);
+  CHECK_EQ(static_cast<int>(devices::citizen_cmp_30ii().media.printable_width_mm), 72);
+  CHECK_EQ(devices::citizen_cmp_30ii().media.printable_width_dots, escpos::kWidth80mm);
+  CHECK_EQ(static_cast<int>(devices::citizen_cmp_20ii().media.printable_width_mm), 48);
+
+  // TM-m30III (§4): 80/58 mm rolls and Bluetooth 5.0 Dual Mode on the Wi-Fi/BT config —
+  // Classic and LE, never a single `bluetooth` flag.
+  const CapabilityProfile m30iii = devices::epson_tm_m30iii();
+  CHECK(m30iii.media.paper_guide_58mm);
+  CHECK(m30iii.transport.bluetooth.classic_spp);
+  CHECK(m30iii.transport.bluetooth.ble);
+  CHECK(m30iii.transport.wifi);
+
+  // Impact mechanisms keep their own geometry and their own patience.
+  const CapabilityProfile srp275 = devices::bixolon_srp_275();
+  CHECK_EQ(static_cast<int>(srp275.media.dpi), 160);
+  CHECK_EQ(srp275.media.printable_width_dots, 400u);
+  CHECK(srp275.quirks.delayed_status);
+  CHECK_EQ(devices::epson_tm_u220ii().media.printable_width_dots, 400u);
+}
+
+PD_TEST(bluetooth_is_faceted_never_a_single_boolean) {
+  // docs/compatibility-brief.md §25. Five different stacks hide behind "bluetooth:
+  // true", and picking the wrong one is a printer that never connects.
+  const CapabilityProfile p20ii = devices::epson_tm_p20ii();
+  CHECK(p20ii.transport.bluetooth.classic_spp);  // TM-P20II-xxxxxx
+  CHECK(p20ii.transport.bluetooth.ble);          // TM-P20II-xxxxxx-L
+  CHECK(!p20ii.transport.bluetooth.vendor_sdk);
+  CHECK(p20ii.transport.bluetooth.any());
+
+  // Star drives its portables through the SDK, not a raw socket.
+  const CapabilityProfile s230 = devices::star_sm_s230();
+  CHECK(s230.transport.bluetooth.vendor_sdk);
+  CHECK(s230.transport.bluetooth.classic_vendor);
+  CHECK(s230.transport.bluetooth.ble);  // Bluetooth 5.2: both radios
+  CHECK(!s230.transport.bluetooth.classic_spp);
+
+  // Citizen's wide unit sells an Apple MFi option, which is a different iOS code path
+  // from BLE and cannot be inferred from either.
+  CHECK(devices::citizen_cts_wide().transport.bluetooth.mfi);
+  CHECK(devices::citizen_cmp_20ii().transport.bluetooth.mfi);
+
+  // Zebra exposes separate Classic and BLE status connections through Link-OS.
+  const CapabilityProfile zq600 = devices::zebra_zq600_plus();
+  CHECK(zq600.transport.bluetooth.classic_vendor);
+  CHECK(zq600.transport.bluetooth.ble);
+  CHECK(zq600.transport.bluetooth.vendor_sdk);
+
+  // A desktop Ethernet printer claims none of it, and `any()` says so.
+  CHECK(!devices::epson_tm_t88vi().transport.bluetooth.any());
+  CHECK(!devices::generic_80().transport.bluetooth.any());
+
+  // The Xprinter handheld documents Classic SPP only. Claiming BLE here would send an
+  // iOS app down a path that cannot work.
+  CHECK(devices::xprinter_portable().transport.bluetooth.classic_spp);
+  CHECK(!devices::xprinter_portable().transport.bluetooth.ble);
+}
+
+PD_TEST(zebra_and_brother_are_not_escpos_and_are_never_driven_as_such) {
+  // §16, §17. These are ZPL/CPCL and Brother Raster/ESC-P devices. The engine must
+  // refuse them on the language alone, before the completion mechanism is even
+  // considered — an ESC/POS engine pointed at a ZPL printer emits a metre of text.
+  for (const CapabilityProfile& refused :
+       {devices::zebra_zq300_plus(), devices::zebra_zq500(), devices::zebra_zq600_plus()}) {
+    CHECK_EQ(refused.language, CommandLanguage::Zpl);
+    CHECK(refused.languages.has(CommandLanguage::Zpl));
+    CHECK(refused.languages.has(CommandLanguage::Cpcl));
+    CHECK(!refused.languages.has(CommandLanguage::EscPos));
+    CHECK(!refused.drivableByEscposEngine());
+    CHECK_EQ(refused.completion, CompletionMechanism::None);
+    CHECK_EQ(refused.evidence().grade, ConfidenceGrade::E_TransportOnly);
+    CHECK_EQ(refused.identity.vendor, std::string("Zebra"));
+  }
+  for (const CapabilityProfile& refused :
+       {devices::brother_rj2000(), devices::brother_rj3000(), devices::brother_rj4000()}) {
+    CHECK_EQ(refused.language, CommandLanguage::BrotherRaster);
+    CHECK(refused.languages.has(CommandLanguage::EscP));
+    CHECK(!refused.languages.has(CommandLanguage::EscPos));
+    CHECK(!refused.drivableByEscposEngine());
+    CHECK_EQ(refused.identity.vendor, std::string("Brother"));
+  }
+  // The RJ-4000 adds ZPL II and CPCL on some configurations — still not ESC/POS.
+  CHECK(devices::brother_rj4000().languages.has(CommandLanguage::Zpl));
+  CHECK(devices::brother_rj4000().languages.has(CommandLanguage::Cpcl));
+  CHECK_EQ(devices::brother_rj4000().languages.count(), static_cast<size_t>(4));
+
+  // Citizen's CMP portables document three languages on one printer and ARE drivable,
+  // because ESC/POS is among them and is the one this core picks.
+  const CapabilityProfile cmp = devices::citizen_cmp_30ii();
+  CHECK_EQ(cmp.language, CommandLanguage::EscPos);
+  CHECK(cmp.languages.has(CommandLanguage::EscPos));
+  CHECK(cmp.languages.has(CommandLanguage::Cpcl));
+  CHECK(cmp.languages.has(CommandLanguage::Zpl));
+  CHECK_EQ(cmp.languages.count(), static_cast<size_t>(3));
+  CHECK(cmp.drivableByEscposEngine());
+
+  // Every language has a distinct spelling, so a report cannot conflate two of them.
+  std::set<std::string> spellings;
+  for (const CommandLanguage language : kAllCommandLanguages) {
+    CHECK(spellings.insert(to_string(language)).second);
+  }
+  CHECK_EQ(spellings.size(), kAllCommandLanguages.size());
+  CHECK_EQ(std::string(to_string(CommandLanguage::EscP)), std::string("EscP"));
+  CHECK_EQ(std::string(to_string(CommandLanguage::BrotherRaster)),
+           std::string("BrotherRaster"));
+}
+
+PD_TEST(generic_unknown_prints_and_claims_nothing) {
+  // §26's escape hatch. generic_80 says "an ordinary 80 mm ESC/POS printer";
+  // generic_unknown says "we do not know what this is", and those were previously the
+  // same entry. It still prints — refusing to print unidentified hardware would be
+  // worse — but every job on it terminates at grade E.
+  const CapabilityProfile unknown = devices::generic_unknown();
+  CHECK(unknown.drivableByEscposEngine());
+  CHECK_EQ(unknown.completion, CompletionMechanism::None);
+  CHECK_EQ(unknown.maxConfidence(), ConfidenceLevel::TransportAccepted);
+  CHECK_EQ(unknown.evidence().grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(unknown.evidence().authority, CompletionAuthority::TransportOnly);
+  CHECK(!unknown.status.dle_eot);
+  CHECK(!unknown.status.asb);
+  CHECK_EQ(unknown.completion_caps.process_id_gs_h_provenance, Provenance::Unverified);
+  // generic_80 still claims the queued fence, which is the difference.
+  CHECK_EQ(devices::generic_80().completion, CompletionMechanism::GsR1);
 }

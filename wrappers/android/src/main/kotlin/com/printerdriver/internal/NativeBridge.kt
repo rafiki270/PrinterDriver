@@ -55,6 +55,66 @@ internal object NativeBridge {
         connectTimeoutMs: Int
     ): Long
 
+    /**
+     * pd_add_printer_custom: a printer reached over a link this wrapper owns -- for now
+     * only Bluetooth Classic SPP (see com.printerdriver.BluetoothSppTransport). Returns
+     * 0L on failure (unknown [profileId], or a vtable the core refused) -- check
+     * [driverLastError].
+     *
+     * [callback] and the native context wrapping it are retained for the life of the
+     * driver, as pd.h requires ("`ctx` must remain alive until pd_destroy"). [description]
+     * is what the printer id and the diagnostics derive from, e.g.
+     * "bt-spp:00:11:22:33:44:55"; "" becomes "custom", which is fine for one printer and
+     * ambiguous for two.
+     *
+     * The core may call [callback]`.connect()` before this function's return value has
+     * reached Kotlin -- pd_add_printer_custom starts the printer's worker thread, and
+     * that thread queues a capability probe immediately. An implementation therefore
+     * cannot assume it has been told its own printer handle by the time it is first
+     * connected; see BluetoothSppTransport's handle latch.
+     */
+    @JvmStatic external fun addPrinterCustom(
+        driverHandle: Long,
+        callback: NativeTransportCallback,
+        description: String,
+        profileId: String?,
+        widthDots: Int
+    ): Long
+
+    /**
+     * pd_transport_feed_bytes: deliver [length] bytes of [data] the link received.
+     *
+     * Safe from any thread, including while a [NativeTransportCallback.write] is in
+     * flight -- that is the normal case, a status answer arriving while the next chunk
+     * goes out. Must NOT be called from inside connect/write/close.
+     *
+     * Returns `false` when nothing was listening (the core has not connected yet, or has
+     * already closed). pd.h calls that information rather than an error: bytes arriving
+     * with no reader are dropped exactly as they would be on a socket nobody is reading.
+     *
+     * Takes [driverHandle] as well as [printerHandle] purely so the native side can
+     * serialise this against pd_destroy -- pd_destroy frees every pd_printer, and a
+     * reader thread that outlived it would otherwise feed bytes through a dangling
+     * pointer.
+     */
+    @JvmStatic external fun transportFeedBytes(
+        driverHandle: Long,
+        printerHandle: Long,
+        data: ByteArray,
+        length: Int
+    ): Boolean
+
+    /** pd_transport_link_dropped: the link went away for a reason other than an explicit
+     *  close -- out of range, the OS tore the channel down, pairing was revoked. Surfaces
+     *  as [com.printerdriver.DeviceEvent.CONNECTION_LOST] and fails any job waiting on a
+     *  fence instead of leaving it to time out. Returns `false` when there was no live
+     *  transport to notify. Same lifetime guard as [transportFeedBytes]. */
+    @JvmStatic external fun transportLinkDropped(
+        driverHandle: Long,
+        printerHandle: Long,
+        message: String
+    ): Boolean
+
     @JvmStatic external fun printerId(printerHandle: Long): String
     @JvmStatic external fun printerWidthDots(printerHandle: Long): Int
     @JvmStatic external fun printerCompletionMechanism(printerHandle: Long): Int

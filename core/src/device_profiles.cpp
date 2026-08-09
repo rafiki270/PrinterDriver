@@ -6,13 +6,16 @@ namespace pd::devices {
 namespace {
 
 // 80 mm media, 72 mm printable, 576 dots at 203 dpi — the geometry shared by most of
-// the database. Recorded as three separate facts, never derived from each other.
+// the database. Recorded as three separate facts, never derived from each other
+// (docs/compatibility-brief.md §18).
 CapabilityProfile thermal80() {
   CapabilityProfile profile;
+  profile.setLanguage(CommandLanguage::EscPos);
   profile.completion = CompletionMechanism::GsR1;
   profile.completion_caps.queued_gs_r = true;
   profile.cut = CutVariant::Partial;
   profile.media.nominal_roll_width_mm = 80;
+  profile.media.printable_width_mm = 72;
   profile.media.printable_width_dots = escpos::kWidth80mm;
   profile.media.dpi = 203;
   profile.media.cutter = true;
@@ -34,8 +37,23 @@ CapabilityProfile thermal80() {
 // conservative 384 dots is used unless a model documents otherwise.
 void makeFiftyEight(CapabilityProfile& profile) {
   profile.media.nominal_roll_width_mm = 58;
+  profile.media.printable_width_mm = 48;
   profile.media.printable_width_dots = escpos::kWidth58mm;
+  profile.media.printable_width_dots_58mm = 0;  // this *is* the 58 mm configuration
+  profile.media.paper_guide_58mm = false;
   profile.media.full_cut = false;
+}
+
+// A handheld/belt printer: no autocutter, a tear bar, a battery, and a Bluetooth link
+// whose facets the caller must state explicitly (§25).
+void makePortable(CapabilityProfile& profile) {
+  profile.media.cutter = false;
+  profile.media.full_cut = false;
+  profile.media.partial_cut = false;
+  profile.cut = CutVariant::None;
+  profile.media.head_to_cutter_feed_dots = 0;  // nothing to clear: the operator tears
+  profile.transport.raw_tcp_9100 = false;
+  profile.transport.usb = true;
 }
 
 CapabilityProfile epsonBase() {
@@ -47,6 +65,18 @@ CapabilityProfile epsonBase() {
   profile.status.dle_eot = true;
   profile.status.asb = true;
   profile.status.cutter_error = true;
+  // docs/compatibility-brief.md §2 and §28. Epson publishes a model-by-model ESC/POS
+  // applicability database — not the phrase "ESC/POS compatible" — and `GS ( H` fn 48
+  // appears in it by name ("Specifies the process ID response"), alongside `DLE EOT`,
+  // `GS r` and ASB. This is the ONLY vendor in this database whose shipped defaults
+  // carry Documented, and the reason the brief calls Epson the reference
+  // implementation. A probe still matters: it verifies the *interface path* passes the
+  // response back, which documentation cannot establish.
+  profile.completion_caps.process_id_gs_h_provenance = Provenance::Documented;
+  profile.completion_caps.queued_gs_r_provenance = Provenance::Documented;
+  profile.status.dle_eot_provenance = Provenance::Documented;
+  profile.status.asb_provenance = Provenance::Documented;
+  profile.status.cutter_error_provenance = Provenance::Documented;
   profile.recovery.dle_enq_resume = true;
   profile.recovery.dle_enq_clear = true;
   profile.recovery.clear_buffers = true;  // DLE DC4 fn 8
@@ -57,6 +87,30 @@ CapabilityProfile epsonBase() {
   // tighten per model once a unit is actually probed.
   profile.media.head_to_cutter_feed_dots = 100;
   return profile;
+}
+
+// The desktop TM geometry: 576 dots on 80 mm paper, 420 once the 58 mm guide is
+// fitted. 420 is Epson's own number and is not 384 and not 576 × 58/80 — which is the
+// entire reason it is stored rather than computed (§2, §18).
+void makeEpsonDualWidth(CapabilityProfile& profile) {
+  profile.media.paper_guide_58mm = true;
+  profile.media.printable_width_dots_58mm = 420;
+}
+
+// Epson's portable Bluetooth facts, identical across the P-series units the brief
+// details: Bluetooth 5.0 Dual Mode means Classic *and* BLE, and the receive buffer is
+// 4 KB normally but 64 KB over Bluetooth (§6). Both numbers are documented; neither is
+// derivable from the other.
+void makeEpsonPortableBluetooth(CapabilityProfile& profile) {
+  profile.transport.bluetooth.classic_spp = true;
+  profile.transport.bluetooth.ble = true;
+  profile.transport.bluetooth.receive_buffer_bytes = 4 * 1024;
+  profile.transport.bluetooth.bluetooth_receive_buffer_bytes = 64 * 1024;
+  // The Wi-Fi configuration of the same model is a different machine with a different
+  // reachable surface, and raw 9100 is part of it. makePortable() cleared the flag
+  // because a Bluetooth-only handheld has no socket; a Wi-Fi unit does.
+  profile.transport.wifi = true;
+  profile.transport.raw_tcp_9100 = true;
 }
 
 CapabilityProfile rongtaBase() {
@@ -70,6 +124,14 @@ CapabilityProfile rongtaBase() {
   profile.quirks.unreliable_identity = true;
   profile.transport.usb = true;
   profile.transport.serial = true;
+  // docs/compatibility-brief.md §13, THE CORRECTION. Rongta advertises ESC/POS and
+  // OPOS, and both are documented. `GS ( H` fn 48 is not: no currently
+  // manufacturer-hosted Rongta command reference proving it was found, and an earlier
+  // revision of this database wrongly assumed it from a third-party copy of an RP80
+  // manual. Everything here is therefore Unverified until a probe says otherwise —
+  // including DLE EOT and ASB, which are equally unproven from Rongta's own material.
+  // try_process_id_gs_h stays true: the probe should still ask.
+  profile.completion_caps.try_process_id_gs_h = true;
   // The fleet quirk from docs/sdk-spec.md §9: these cut into the last printed line,
   // which the deployed stack compensates for with six feeds before the cut. CP852 is
   // the code page those installations run.
@@ -86,6 +148,9 @@ CapabilityProfile xprinterBase() {
   profile.status.cutter_error = true;
   profile.transport.usb = true;
   profile.transport.serial = true;
+  // §14: "Public documentation does not prove GS ( H." Everything stays Unverified in
+  // the shipped defaults even for the S-series, where our own hardware answers it —
+  // that finding belongs to a probe result, not to a family default.
   profile.code_page = escpos::CodePage::PC852;
   return profile;
 }
@@ -93,14 +158,18 @@ CapabilityProfile xprinterBase() {
 CapabilityProfile starBase() {
   CapabilityProfile profile = thermal80();
   profile.identity.vendor = "Star Micronics";
-  // StarPRNT, not ESC/POS: the checked-block API is the documented way to learn
-  // whether the whole data printed, and this core does not speak it. Profile data
-  // only — the engine refuses these jobs rather than driving Star's ESC/POS emulation
-  // and reporting a fence it never really got.
-  profile.language = CommandLanguage::StarPrnt;
+  // StarPRNT, not ESC/POS: beginCheckedBlock()/endCheckedBlock() is the documented way
+  // to learn whether the whole data printed, and this core does not speak it. Profile
+  // data only — the engine refuses these jobs rather than driving Star's ESC/POS
+  // emulation and reporting a fence it never really got (§7-§8).
+  profile.setLanguage(CommandLanguage::StarPrnt);
   profile.completion = CompletionMechanism::StarCheckedBlock;
   profile.completion_caps.queued_gs_r = false;
   profile.completion_caps.prefer_vendor_sdk = true;
+  // The checked block is Star's own documented API, so the mechanism is Documented even
+  // though this engine cannot drive it. Documentation and drivability are different
+  // questions and the database answers both.
+  profile.completion_caps.vendor_idle_provenance = Provenance::Documented;
   profile.status.dle_eot = false;
   profile.status.asb = false;
   profile.status.cutter_error = false;
@@ -112,8 +181,9 @@ CapabilityProfile starBase() {
 CapabilityProfile bixolonBase() {
   CapabilityProfile profile = thermal80();
   profile.identity.vendor = "Bixolon";
-  // "ESC/POS compatible" is a marketing statement, not a command table: the vendor
-  // status SDK is the documented path and GS ( H is never assumed from the phrase.
+  // §9-§10: "ESC/POS compatible" is a marketing statement, not a command table. The
+  // vendor status SDK is the documented path; DLE EOT and GS r are probe-or-document
+  // per model; GS ( H is never assumed from the phrase.
   profile.completion_caps.prefer_vendor_sdk = true;
   profile.status.dle_eot = true;
   profile.status.asb = true;
@@ -135,6 +205,89 @@ CapabilityProfile citizenBase() {
   return profile;
 }
 
+CapabilityProfile partnerBase() {
+  CapabilityProfile profile = thermal80();
+  profile.identity.vendor = "Partner Tech";
+  profile.status.dle_eot = true;
+  profile.status.asb = true;
+  profile.status.cutter_error = true;
+  profile.recovery.dle_enq_resume = true;
+  profile.recovery.dle_enq_clear = true;
+  profile.transport.usb = true;
+  profile.transport.serial = true;
+  // §15: ESC/POS-compatible, with not enough public programmer documentation for the
+  // Epson completion extensions. DLE EOT / GS r / GS ( H / ASB are ALL probe questions
+  // here — every provenance below stays Unverified, which is the honest description of
+  // a device whose manual nobody can read.
+  profile.completion_caps.try_process_id_gs_h = true;
+  return profile;
+}
+
+// Zebra and Brother are not ESC/POS at any level (§16, §17). Their entries exist so a
+// fleet can be inventoried and so that pointing this engine at one is a diagnosable
+// refusal — FailureReason::Unsupported, zero bytes written — rather than a metre of
+// garbage. Completion is None: not "no fence exists" (Zebra's Link-OS StatusConnection
+// is a real, independent status channel) but "no fence this engine can reach".
+CapabilityProfile zebraBase() {
+  CapabilityProfile profile = thermal80();
+  profile.identity.vendor = "Zebra";
+  profile.setLanguage(CommandLanguage::Zpl);
+  profile.languages.add(CommandLanguage::Cpcl);
+  profile.completion = CompletionMechanism::None;
+  profile.completion_caps.queued_gs_r = false;
+  profile.completion_caps.prefer_vendor_sdk = true;
+  profile.status.dle_eot = false;
+  profile.status.asb = false;
+  profile.status.cutter_error = false;
+  profile.quirks.response_parser = ResponseParserVariant::VendorRaw;
+  profile.media.cutter = false;
+  profile.media.full_cut = false;
+  profile.media.partial_cut = false;
+  profile.cut = CutVariant::None;
+  profile.media.head_to_cutter_feed_dots = 0;
+  profile.media.black_mark_sensor = true;
+  profile.media.gap_sensor = true;  // label stock, not receipt paper
+  profile.transport.raw_tcp_9100 = false;
+  profile.transport.usb = true;
+  // Link-OS BluetoothStatusConnection and BluetoothLeStatusConnection are separate
+  // status-only channels that do not block the print channel — which is why both
+  // facets are recorded rather than one "bluetooth" flag (§16, §25).
+  profile.transport.bluetooth.classic_vendor = true;
+  profile.transport.bluetooth.ble = true;
+  profile.transport.bluetooth.vendor_sdk = true;
+  profile.transport.wifi = true;
+  // Link-OS exposes raw 9100 on the networked configurations, and the newer ones pair
+  // Wi-Fi 6 with Bluetooth 5.3. Reachable is not the same as drivable: every job on
+  // these profiles is still refused, because the bytes would be ESC/POS.
+  profile.transport.raw_tcp_9100 = true;
+  return profile;
+}
+
+CapabilityProfile brotherBase() {
+  CapabilityProfile profile = thermal80();
+  profile.identity.vendor = "Brother";
+  profile.setLanguage(CommandLanguage::BrotherRaster);
+  profile.languages.add(CommandLanguage::EscP);
+  profile.completion = CompletionMechanism::None;
+  profile.completion_caps.queued_gs_r = false;
+  profile.completion_caps.prefer_vendor_sdk = true;
+  profile.status.dle_eot = false;
+  profile.status.asb = false;
+  profile.status.cutter_error = false;
+  profile.quirks.response_parser = ResponseParserVariant::VendorRaw;
+  profile.media.cutter = false;
+  profile.media.full_cut = false;
+  profile.media.partial_cut = false;
+  profile.cut = CutVariant::None;
+  profile.media.head_to_cutter_feed_dots = 0;
+  profile.media.black_mark_sensor = true;
+  profile.transport.raw_tcp_9100 = false;
+  profile.transport.usb = true;
+  profile.transport.bluetooth.classic_vendor = true;
+  profile.transport.bluetooth.vendor_sdk = true;
+  return profile;
+}
+
 struct Entry {
   const char* name;
   CapabilityProfile (*build)();
@@ -143,31 +296,87 @@ struct Entry {
 const std::vector<Entry>& table() {
   static const std::vector<Entry> entries{
       {"epson_tm_t20", &epson_tm_t20},
+      {"epson_tm_t20ii", &epson_tm_t20ii},
+      {"epson_tm_t20iii", &epson_tm_t20iii},
+      {"epson_tm_t20iv", &epson_tm_t20iv},
       {"epson_tm_t70", &epson_tm_t70},
+      {"epson_tm_t70ii", &epson_tm_t70ii},
+      {"epson_tm_t82", &epson_tm_t82},
       {"epson_tm_t88", &epson_tm_t88},
+      {"epson_tm_t88iv", &epson_tm_t88iv},
+      {"epson_tm_t88v", &epson_tm_t88v},
+      {"epson_tm_t88vi", &epson_tm_t88vi},
+      {"epson_tm_t88vii", &epson_tm_t88vii},
       {"epson_tm_m", &epson_tm_m},
+      {"epson_tm_m10", &epson_tm_m10},
+      {"epson_tm_m30", &epson_tm_m30},
+      {"epson_tm_m30ii", &epson_tm_m30ii},
+      {"epson_tm_m30iii", &epson_tm_m30iii},
+      {"epson_tm_m50", &epson_tm_m50},
+      {"epson_tm_m50ii", &epson_tm_m50ii},
+      {"epson_tm_p20", &epson_tm_p20},
+      {"epson_tm_p20ii", &epson_tm_p20ii},
+      {"epson_tm_p60", &epson_tm_p60},
+      {"epson_tm_p60ii", &epson_tm_p60ii},
+      {"epson_tm_p80", &epson_tm_p80},
+      {"epson_tm_p80ii", &epson_tm_p80ii},
+      {"epson_tm_p80ii_autocutter", &epson_tm_p80ii_autocutter},
       {"epson_tm_u220", &epson_tm_u220},
+      {"epson_tm_u220ii", &epson_tm_u220ii},
       {"epson_tm_i", &epson_tm_i},
       {"rongta_rp58", &rongta_rp58},
       {"rongta_rp80", &rongta_rp80},
       {"rongta_rp3xx", &rongta_rp3xx},
+      {"rongta_rp8xx", &rongta_rp8xx},
       {"xprinter_pos58", &xprinter_pos58},
       {"xprinter_pos80", &xprinter_pos80},
       {"xprinter_s_series", &xprinter_s_series},
+      {"xprinter_v_series", &xprinter_v_series},
+      {"xprinter_portable", &xprinter_portable},
       {"sewoo_slk_ts", &sewoo_slk_ts},
       {"partner_rp110", &partner_rp110},
+      {"partner_rp710", &partner_rp710},
       {"star_tsp100", &star_tsp100},
+      {"star_tsp100iii", &star_tsp100iii},
+      {"star_tsp100iv", &star_tsp100iv},
       {"star_tsp650", &star_tsp650},
       {"star_mcprint", &star_mcprint},
+      {"star_mcprint2", &star_mcprint2},
+      {"star_mcprint3", &star_mcprint3},
+      {"star_sm_s210", &star_sm_s210},
+      {"star_sm_s220", &star_sm_s220},
+      {"star_sm_s230", &star_sm_s230},
+      {"star_sm_l200", &star_sm_l200},
+      {"star_sm_l300", &star_sm_l300},
+      {"star_sm_t300", &star_sm_t300},
+      {"star_sm_t400", &star_sm_t400},
       {"bixolon_srp330", &bixolon_srp330},
       {"bixolon_srp350", &bixolon_srp350},
       {"bixolon_srp380", &bixolon_srp380},
       {"bixolon_q_series", &bixolon_q_series},
+      {"bixolon_srp_q200", &bixolon_srp_q200},
+      {"bixolon_srp_q300", &bixolon_srp_q300},
+      {"bixolon_srp_b300", &bixolon_srp_b300},
+      {"bixolon_srp_f310", &bixolon_srp_f310},
+      {"bixolon_srp_275", &bixolon_srp_275},
+      {"bixolon_spp_r200", &bixolon_spp_r200},
+      {"bixolon_spp_r210", &bixolon_spp_r210},
+      {"bixolon_spp_r310", &bixolon_spp_r310},
+      {"bixolon_spp_r410", &bixolon_spp_r410},
       {"citizen_cts_58_80", &citizen_cts_58_80},
       {"citizen_cts_fast", &citizen_cts_fast},
       {"citizen_cts_wide", &citizen_cts_wide},
+      {"citizen_cmp_20ii", &citizen_cmp_20ii},
+      {"citizen_cmp_30ii", &citizen_cmp_30ii},
+      {"zebra_zq300_plus", &zebra_zq300_plus},
+      {"zebra_zq500", &zebra_zq500},
+      {"zebra_zq600_plus", &zebra_zq600_plus},
+      {"brother_rj2000", &brother_rj2000},
+      {"brother_rj3000", &brother_rj3000},
+      {"brother_rj4000", &brother_rj4000},
       {"generic_80", &generic_80},
       {"generic_58", &generic_58},
+      {"generic_unknown", &generic_unknown},
   };
   return entries;
 }
@@ -180,9 +389,35 @@ CapabilityProfile epson_tm_t20() {
   CapabilityProfile profile = epsonBase();
   profile.name = "epson_tm_t20";
   profile.identity.model = "TM-T20 series";
-  // 58 mm operation is a paper-guide configuration of the same mechanism, printing
-  // 420 dots — a separate fact from the 576 the 80 mm setup prints.
-  profile.media.paper_guide_58mm = true;
+  makeEpsonDualWidth(profile);
+  return profile;
+}
+
+CapabilityProfile epson_tm_t20ii() {
+  CapabilityProfile profile = epson_tm_t20();
+  profile.name = "epson_tm_t20ii";
+  profile.identity.model = "TM-T20II";
+  return profile;
+}
+
+CapabilityProfile epson_tm_t20iii() {
+  CapabilityProfile profile = epson_tm_t20();
+  profile.name = "epson_tm_t20iii";
+  profile.identity.model = "TM-T20III";
+  // The reference unit of docs/compatibility-brief.md §2, verified against Epson's own
+  // model command table: 203x203 dpi; 80 mm = 72 mm = 576 dots; 58 mm = 52.5 mm =
+  // 420 dots; 250 mm/s; USB 2.0 Full Speed bidirectional bulk IN/OUT; ESC/POS plus
+  // ePOS-Print XML. `GS ( H` fn 48 appears in that table by name, which is what makes
+  // Documented the right provenance here and nowhere outside Epson.
+  profile.transport.epos = true;
+  profile.status.extended_asb = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_t20iv() {
+  CapabilityProfile profile = epson_tm_t20iii();
+  profile.name = "epson_tm_t20iv";
+  profile.identity.model = "TM-T20IV";
   return profile;
 }
 
@@ -193,14 +428,82 @@ CapabilityProfile epson_tm_t70() {
   return profile;
 }
 
+CapabilityProfile epson_tm_t70ii() {
+  CapabilityProfile profile = epson_tm_t70();
+  profile.name = "epson_tm_t70ii";
+  profile.identity.model = "TM-T70II";
+  makeEpsonDualWidth(profile);
+  profile.transport.epos = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_t82() {
+  CapabilityProfile profile = epsonBase();
+  profile.name = "epson_tm_t82";
+  profile.identity.model = "TM-T82 series";
+  makeEpsonDualWidth(profile);
+  return profile;
+}
+
 CapabilityProfile epson_tm_t88() {
   CapabilityProfile profile = epsonBase();
   profile.name = "epson_tm_t88";
   profile.identity.model = "TM-T88 series";
   profile.status.extended_asb = true;  // FS ( e
   profile.media.near_end_sensor = true;
-  profile.media.paper_guide_58mm = true;
+  makeEpsonDualWidth(profile);
   profile.transport.epos = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_t88iv() {
+  CapabilityProfile profile = epson_tm_t88();
+  profile.name = "epson_tm_t88iv";
+  profile.identity.model = "TM-T88IV";
+  // The one Epson entry that does NOT claim GS ( H. §3 names the T88V command table,
+  // the T88VI's inclusion in Epson's GS ( H applicability and the T88VII's coverage —
+  // it does not extend either to this generation, which predates the extension. So the
+  // fence drops to the queued GS r 1 that the same documentation does cover, and the
+  // probe is left to promote a unit whose firmware turns out to answer.
+  profile.completion = CompletionMechanism::GsR1;
+  profile.completion_caps.process_id_gs_h = false;
+  profile.completion_caps.try_process_id_gs_h = true;
+  profile.completion_caps.process_id_gs_h_provenance = Provenance::Unverified;
+  profile.status.extended_asb = false;
+  profile.transport.epos = false;
+  return profile;
+}
+
+CapabilityProfile epson_tm_t88v() {
+  CapabilityProfile profile = epson_tm_t88();
+  profile.name = "epson_tm_t88v";
+  profile.identity.model = "TM-T88V";
+  // Huge installed base, and Epson maintains an explicit command table for it (§3).
+  return profile;
+}
+
+CapabilityProfile epson_tm_t88vi() {
+  CapabilityProfile profile = epson_tm_t88();
+  profile.name = "epson_tm_t88vi";
+  profile.identity.model = "TM-T88VI";
+  // §3: USB bulk bidirectional, dedicated current technical reference guide and command
+  // table, explicitly included in Epson's `GS ( H` applicability, `GS ( E` serial/USB
+  // configuration readback, and OmniLink documentation listing ESC/POS plus the
+  // ePOS-Print Service.
+  profile.transport.epos = true;
+  profile.transport.wifi = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_t88vii() {
+  CapabilityProfile profile = epson_tm_t88vi();
+  profile.name = "epson_tm_t88vii";
+  profile.identity.model = "TM-T88VII";
+  // Up to 500 mm/s with the appropriate energising configuration; 450 mm/s standard
+  // high speed, and 58 mm operation is limited to 450 (§3). Covered by `GS ( H`.
+  // Nothing about speed changes the fence, but a faster mechanism finishes a long
+  // ticket inside a shorter completion budget.
+  profile.completion_timeout_ms = 12000;
   return profile;
 }
 
@@ -209,9 +512,152 @@ CapabilityProfile epson_tm_m() {
   profile.name = "epson_tm_m";
   profile.identity.model = "TM-m series";
   profile.status.extended_asb = true;
-  profile.media.paper_guide_58mm = true;
+  makeEpsonDualWidth(profile);
   profile.transport.epos = true;
-  profile.transport.bluetooth_spp = true;
+  profile.transport.wifi = true;
+  profile.transport.bluetooth.classic_spp = true;
+  profile.transport.bluetooth.ble = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_m10() {
+  CapabilityProfile profile = epson_tm_m();
+  profile.name = "epson_tm_m10";
+  profile.identity.model = "TM-m10";
+  // The 58 mm member of the mPOS family: this is its native width, not a guide
+  // configuration of an 80 mm mechanism, so the dual-width numbers do not apply.
+  makeFiftyEight(profile);
+  profile.media.full_cut = false;
+  return profile;
+}
+
+CapabilityProfile epson_tm_m30() {
+  CapabilityProfile profile = epson_tm_m();
+  profile.name = "epson_tm_m30";
+  profile.identity.model = "TM-m30";
+  return profile;
+}
+
+CapabilityProfile epson_tm_m30ii() {
+  CapabilityProfile profile = epson_tm_m30();
+  profile.name = "epson_tm_m30ii";
+  profile.identity.model = "TM-m30II";
+  return profile;
+}
+
+CapabilityProfile epson_tm_m30iii() {
+  CapabilityProfile profile = epson_tm_m30ii();
+  profile.name = "epson_tm_m30iii";
+  profile.identity.model = "TM-m30III";
+  // §4, from Epson's official specification: 80 and 58 mm rolls, maximum 83 mm roll
+  // diameter, ~300 mm/s, USB-A, USB-B and USB-C with USB-PD, 10/100 Ethernet, Wi-Fi on
+  // applicable configurations, **Bluetooth 5.0 Dual Mode on the Wi-Fi/BT config**,
+  // microSD there, and a cash-drawer port. Which is precisely why interfaces are
+  // represented separately from model identity: one model number, several machines.
+  profile.transport.bluetooth.classic_spp = true;
+  profile.transport.bluetooth.ble = true;
+  profile.media.near_end_sensor = true;
+  profile.completion_timeout_ms = 12000;
+  return profile;
+}
+
+CapabilityProfile epson_tm_m50() {
+  CapabilityProfile profile = epson_tm_m();
+  profile.name = "epson_tm_m50";
+  profile.identity.model = "TM-m50";
+  profile.media.near_end_sensor = true;
+  profile.completion_timeout_ms = 12000;
+  return profile;
+}
+
+CapabilityProfile epson_tm_m50ii() {
+  CapabilityProfile profile = epson_tm_m50();
+  profile.name = "epson_tm_m50ii";
+  profile.identity.model = "TM-m50II";
+  return profile;
+}
+
+CapabilityProfile epson_tm_p20() {
+  CapabilityProfile profile = epsonBase();
+  profile.name = "epson_tm_p20";
+  profile.identity.model = "TM-P20";
+  makeFiftyEight(profile);
+  makePortable(profile);
+  makeEpsonPortableBluetooth(profile);
+  profile.media.paper_end_sensor = true;
+  profile.media.cover_sensor = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_p20ii() {
+  CapabilityProfile profile = epson_tm_p20();
+  profile.name = "epson_tm_p20ii";
+  profile.identity.model = "TM-P20II";
+  // §6, from Epson's model-specific P20II command table: 58 mm paper, **48 mm print
+  // width**, 203 dpi, manual tear, optical paper-end and cover detectors, USB-C;
+  // Wi-Fi model 802.11 a/b/g/n/ac on 2.4 and 5 GHz; BT model **Bluetooth 5.0 Dual Mode
+  // (Classic + BLE)**, Class 2, up to 8 stored pairings, **one simultaneous
+  // connection**; **4 KB receive buffer normally, 64 KB for Bluetooth**; 384 KB NV
+  // graphics; USB 2.0 FS bulk IN+OUT. Bluetooth naming is `TM-P20II-xxxxxx` for Classic
+  // and `TM-P20II-xxxxxx-L` for BLE — two names, one printer, which is why §25 forbids
+  // a single `bluetooth` boolean.
+  profile.media.printable_width_mm = 48;
+  profile.media.printable_width_dots = escpos::kWidth58mm;
+  profile.completion_caps.one_job_in_flight = true;  // one simultaneous connection
+  return profile;
+}
+
+CapabilityProfile epson_tm_p60() {
+  CapabilityProfile profile = epson_tm_p20();
+  profile.name = "epson_tm_p60";
+  profile.identity.model = "TM-P60";
+  // The brief details the P20II and P80II specifically; the P60 line is carried with
+  // the family's portable defaults rather than invented facts. Manual tear, 58 mm.
+  return profile;
+}
+
+CapabilityProfile epson_tm_p60ii() {
+  CapabilityProfile profile = epson_tm_p60();
+  profile.name = "epson_tm_p60ii";
+  profile.identity.model = "TM-P60II";
+  return profile;
+}
+
+CapabilityProfile epson_tm_p80() {
+  CapabilityProfile profile = epsonBase();
+  profile.name = "epson_tm_p80";
+  profile.identity.model = "TM-P80";
+  makePortable(profile);
+  makeEpsonPortableBluetooth(profile);
+  profile.media.black_mark_sensor = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_p80ii() {
+  CapabilityProfile profile = epson_tm_p80();
+  profile.name = "epson_tm_p80ii";
+  profile.identity.model = "TM-P80II";
+  // §6: 80 mm, direct thermal, USB-C, Wi-Fi a/b/g/n/ac on the Wi-Fi unit, Bluetooth 5
+  // Dual Mode on the BT unit; paper-end, black-mark and cover detectors; the same
+  // 4 KB / 64 KB buffers; 384 KB NV; barcodes plus PDF417, QR, MaxiCode, DataMatrix,
+  // Aztec and GS1. **The normal unit is manual tear.**
+  return profile;
+}
+
+CapabilityProfile epson_tm_p80ii_autocutter() {
+  CapabilityProfile profile = epson_tm_p80ii();
+  profile.name = "epson_tm_p80ii_autocutter";
+  profile.identity.model = "TM-P80II Auto Cutter Model";
+  // §6: the Auto Cutter Model is separately sold hardware, so it is **a distinct
+  // capability profile**, not a runtime flag on the standard unit. Getting this wrong
+  // in either direction is expensive: assume a cutter that is not there and every
+  // receipt stays attached; assume a tear bar on a unit that has a blade and the engine
+  // never clears the head-to-cutter gap, which is how a trailing QR gets sliced.
+  profile.media.cutter = true;
+  profile.media.partial_cut = true;
+  profile.media.full_cut = false;
+  profile.cut = CutVariant::Partial;
+  profile.media.head_to_cutter_feed_dots = 100;
   return profile;
 }
 
@@ -222,16 +668,28 @@ CapabilityProfile epson_tm_u220() {
   // Dot impact, not thermal: 76 mm paper, 63.5 mm print width, 400 dots at 160 dpi.
   // Nothing about this geometry follows from the thermal 8-dots-per-mm rule.
   profile.media.nominal_roll_width_mm = 76;
+  profile.media.printable_width_mm = 63;
   profile.media.printable_width_dots = 400;
   profile.media.dpi = 160;
   profile.media.full_cut = false;  // the mechanism's autocutter is partial-cut only
   profile.completion = CompletionMechanism::GsR1;
   profile.completion_caps.process_id_gs_h = false;
   profile.completion_caps.try_process_id_gs_h = false;
+  // Epson's applicability database covers the U220, but the brief does not record it as
+  // carrying the process-ID extension, so the flag is false and its provenance is
+  // Unverified rather than "documented absent" — those are different claims.
+  profile.completion_caps.process_id_gs_h_provenance = Provenance::Unverified;
   // Impact printing is slow enough that a completion wait sized for thermal speeds
   // times out on a long ticket.
   profile.completion_timeout_ms = 30000;
   profile.quirks.delayed_status = true;
+  return profile;
+}
+
+CapabilityProfile epson_tm_u220ii() {
+  CapabilityProfile profile = epson_tm_u220();
+  profile.name = "epson_tm_u220ii";
+  profile.identity.model = "TM-U220II";
   return profile;
 }
 
@@ -240,11 +698,16 @@ CapabilityProfile epson_tm_i() {
   profile.name = "epson_tm_i";
   profile.identity.model = "TM-i / DT series";
   // Both paths are real on this hardware. The ESC/POS fence stays the drivable
-  // default; the ePOS JobID is the stronger mechanism once that transport exists,
-  // and its result comes from the spooler rather than from the mechanism
-  // (docs/capability-profiles.md §4).
+  // default; the ePOS JobID is the stronger mechanism once that transport exists
+  // (§5: submission returns immediately with the spooler enabled and the result is
+  // retrieved later by JobID), and its result comes from the spooler rather than from
+  // the mechanism (docs/capability-profiles.md §4). That retrieval is what §24 grades
+  // A+; until this core can perform it, nothing here claims that grade.
   profile.completion_caps.epos_job_id = true;
+  profile.completion_caps.epos_job_id_provenance = Provenance::Documented;
+  profile.languages.add(CommandLanguage::EposXml);
   profile.transport.epos = true;
+  profile.transport.wifi = true;
   profile.status.extended_asb = true;
   return profile;
 }
@@ -267,18 +730,28 @@ CapabilityProfile rongta_rp80() {
   CapabilityProfile profile = rongtaBase();
   profile.name = "rongta_rp80";
   profile.identity.model = "RP80 family";
-  // The family manual documents GS ( H fn 48, but firmware varies across RP80/802/
-  // 803/807/820/850, so the shipped default stays on the queued fence and the probe
-  // decides per unit.
-  profile.completion_caps.try_process_id_gs_h = true;
+  // Firmware varies across RP80/802/803/807/820/850. With the GS ( H documentation
+  // withdrawn (§13), the shipped default is the queued fence for every one of them.
   return profile;
 }
 
 CapabilityProfile rongta_rp3xx() {
   CapabilityProfile profile = rongtaBase();
   profile.name = "rongta_rp3xx";
-  profile.identity.model = "RP3xx series";
-  profile.completion_caps.try_process_id_gs_h = true;
+  profile.identity.model = "RP326 / RP331";
+  // §13, from Rongta's current official page for the RP326: 79.5 +/- 0.5 mm roll,
+  // 72 mm and 48 mm print widths, 576 and 384 dots, 203 dpi, 250 mm/s,
+  // USB/serial/Ethernet with optional Bluetooth and Wi-Fi customs, a 1.5 M-cut cutter,
+  // ESC/POS and OPOS. The RP331 is the same geometry.
+  profile.media.printable_width_dots_58mm = escpos::kWidth58mm;
+  profile.media.paper_guide_58mm = true;
+  return profile;
+}
+
+CapabilityProfile rongta_rp8xx() {
+  CapabilityProfile profile = rongtaBase();
+  profile.name = "rongta_rp8xx";
+  profile.identity.model = "RP8xx series";
   return profile;
 }
 
@@ -308,10 +781,18 @@ CapabilityProfile xprinter_s_series() {
   CapabilityProfile profile = xprinterBase();
   profile.name = "xprinter_s_series";
   profile.identity.model = "S series (S200/S260/S300)";
-  // XP-S260M: GS ( H proven on our unit by probe and a 100-receipt soak
-  // (docs/capability-profiles.md §7).
-  profile.completion = CompletionMechanism::GsParenH;
-  profile.completion_caps.process_id_gs_h = true;
+  // §14, the case the whole provenance system exists for. Xprinter's official material
+  // gives 79.5 +/- 0.5 mm media, <= 72 mm print width, 576 dots, 203 dpi, <= 260 mm/s,
+  // USB + serial + Ethernet, paper-end / cover-open / black-mark sensing, a partial
+  // cutter, 256 KB NV flash, ESC/POS, and an input buffer listed as 128 KB in the
+  // current table but 64 KB on another page revision — which is why firmware and
+  // hardware identity belong in the profile.
+  //
+  // It does NOT document `GS ( H`. Our XP-S260M answers it anyway, confirmed by probe
+  // and a 100-receipt soak. That finding lives in xp_s260m() (Provenance::Probed) and
+  // in the findings store; this *family* default stays on the queued fence with
+  // Unverified provenance, because one interrogated unit is not a family, and firmware
+  // varies. try_process_id_gs_h asks the question on every probe.
   profile.completion_caps.try_process_id_gs_h = true;
   profile.completion_caps.vendor_idle = true;  // Xprinter one-ticket-one-control
   profile.media.black_mark_sensor = true;
@@ -319,34 +800,66 @@ CapabilityProfile xprinter_s_series() {
   return profile;
 }
 
+CapabilityProfile xprinter_v_series() {
+  CapabilityProfile profile = xprinterBase();
+  profile.name = "xprinter_v_series";
+  profile.identity.model = "V series";
+  profile.completion_caps.try_process_id_gs_h = true;
+  profile.final_feed_lines = 6;
+  return profile;
+}
+
+CapabilityProfile xprinter_portable() {
+  CapabilityProfile profile = xprinterBase();
+  profile.name = "xprinter_portable";
+  profile.identity.model = "portable (58 mm handheld)";
+  makeFiftyEight(profile);
+  makePortable(profile);
+  // Classic SPP only: this class does not document BLE, and claiming it would send an
+  // iOS app down a code path that cannot work.
+  profile.transport.bluetooth.classic_spp = true;
+  profile.chunk_bytes = 512;
+  profile.inter_chunk_delay_ms = 30;
+  profile.final_feed_lines = 6;
+  return profile;
+}
+
 // --- Sewoo / Partner Tech -----------------------------------------------------------
 
 CapabilityProfile sewoo_slk_ts() {
-  CapabilityProfile profile = thermal80();
+  CapabilityProfile profile = partnerBase();
   profile.name = "sewoo_slk_ts";
   profile.identity.vendor = "Sewoo";
   profile.identity.model = "SLK-TS series";
-  profile.status.dle_eot = true;
-  profile.status.asb = true;
-  profile.status.cutter_error = true;
-  profile.recovery.dle_enq_resume = true;
-  profile.recovery.dle_enq_clear = true;
-  profile.transport.usb = true;
-  profile.transport.serial = true;
-  // No authoritative public programmer's manual was found for this platform, so
-  // GS ( H is a probe question rather than a default (docs/capability-profiles.md §6).
-  profile.completion_caps.try_process_id_gs_h = true;
   return profile;
 }
 
 CapabilityProfile partner_rp110() {
-  CapabilityProfile profile = sewoo_slk_ts();
+  CapabilityProfile profile = partnerBase();
   profile.name = "partner_rp110";
-  profile.identity.vendor = "Partner Tech";
   profile.identity.model = "RP-110";
-  // ENERGY STAR certification records group RP-110/RP-110B/RP-110W with SLK-TS200
-  // under one product family, so the Sewoo profile is the honest starting point.
+  // §15, from Partner Tech's current manufacturer page: 80 mm maximum media,
+  // 72 +/- 0.5 mm print width, 203 dpi, direct thermal, USB-B + RS-232 + Ethernet all
+  // standard, project-specific Bluetooth Smart Ready / BT 5 + BLE, project-specific
+  // 802.11 a/b/g/n, paper-end and cover-open sensing, black-mark capability,
+  // full/partial guillotine rated 1.5 M cuts, ESC/POS-compatible.
+  //
+  // ENERGY STAR certification records group RP-110/RP-110B/RP-110W with the Sewoo
+  // SLK-TS200 under one product family, which is why the Sewoo profile is the honest
+  // starting point. "Project-specific" is why the Bluetooth facets are recorded but
+  // the transport flags stay conservative: the unit on the counter may have none of it.
   profile.media.near_end_sensor = true;
+  profile.media.black_mark_sensor = true;
+  profile.transport.bluetooth.classic_spp = true;
+  profile.transport.bluetooth.ble = true;
+  profile.transport.wifi = true;
+  return profile;
+}
+
+CapabilityProfile partner_rp710() {
+  CapabilityProfile profile = partner_rp110();
+  profile.name = "partner_rp710";
+  profile.identity.model = "RP-710";
   return profile;
 }
 
@@ -360,13 +873,38 @@ CapabilityProfile star_tsp100() {
   return profile;
 }
 
+CapabilityProfile star_tsp100iii() {
+  CapabilityProfile profile = star_tsp100();
+  profile.name = "star_tsp100iii";
+  profile.identity.model = "TSP100III";
+  profile.transport.wifi = true;
+  profile.transport.bluetooth.classic_vendor = true;
+  profile.transport.bluetooth.vendor_sdk = true;
+  return profile;
+}
+
+CapabilityProfile star_tsp100iv() {
+  CapabilityProfile profile = star_tsp100();
+  profile.name = "star_tsp100iv";
+  profile.identity.model = "TSP100IV";
+  // §7-§8: 80 and 58 mm (guide), direct thermal, StarPRNT, 250 mm/s, USB-C host, USB-A
+  // peripheral/Android, Ethernet; the wireless variant adds 2.4/5 GHz Wi-Fi and
+  // Bluetooth.
+  profile.transport.wifi = true;
+  profile.transport.bluetooth.classic_vendor = true;
+  profile.transport.bluetooth.ble = true;
+  profile.transport.bluetooth.vendor_sdk = true;
+  return profile;
+}
+
 CapabilityProfile star_tsp650() {
   CapabilityProfile profile = starBase();
   profile.name = "star_tsp650";
   profile.identity.model = "TSP650II";
   profile.media.paper_guide_58mm = true;
   profile.transport.serial = true;
-  profile.transport.bluetooth_spp = true;
+  profile.transport.bluetooth.classic_vendor = true;
+  profile.transport.bluetooth.vendor_sdk = true;
   return profile;
 }
 
@@ -375,7 +913,110 @@ CapabilityProfile star_mcprint() {
   profile.name = "star_mcprint";
   profile.identity.model = "mC-Print series";
   profile.media.paper_guide_58mm = true;
-  profile.transport.bluetooth_spp = true;
+  profile.transport.bluetooth.classic_vendor = true;
+  profile.transport.bluetooth.vendor_sdk = true;
+  return profile;
+}
+
+CapabilityProfile star_mcprint2() {
+  CapabilityProfile profile = star_mcprint();
+  profile.name = "star_mcprint2";
+  profile.identity.model = "mC-Print2";
+  // The 2-inch member: 58 mm is its native width, not a guide setting.
+  makeFiftyEight(profile);
+  profile.media.cutter = true;
+  profile.media.partial_cut = true;
+  return profile;
+}
+
+CapabilityProfile star_mcprint3() {
+  CapabilityProfile profile = star_mcprint();
+  profile.name = "star_mcprint3";
+  profile.identity.model = "mC-Print3";
+  // §7-§8: 80 and 58 mm, front exit, print areas of 72, ~51 and 48 mm **by paper
+  // setup**, USB, Ethernet, Bluetooth on variants, up to 400 mm/s on newer versions.
+  // Three print widths for one mechanism is the clearest possible argument against
+  // deriving raster width from roll width.
+  profile.media.printable_width_dots_58mm = escpos::kWidth58mm;
+  profile.transport.wifi = true;
+  return profile;
+}
+
+CapabilityProfile star_sm_s210() {
+  CapabilityProfile profile = starBase();
+  profile.name = "star_sm_s210";
+  profile.identity.model = "SM-S210i";
+  makeFiftyEight(profile);
+  makePortable(profile);
+  // §8: the SDK-listed portables use Bluetooth transports with model-specific
+  // emulations, and several support StarPRNT *and* an EscPosMobile mode. The
+  // emulation is not the documented path — the SDK is — so the profile stays StarPRNT
+  // and the engine keeps refusing, rather than reaching for a mode that answers no
+  // checked block.
+  profile.transport.bluetooth.classic_vendor = true;
+  profile.transport.bluetooth.vendor_sdk = true;
+  return profile;
+}
+
+CapabilityProfile star_sm_s220() {
+  CapabilityProfile profile = star_sm_s210();
+  profile.name = "star_sm_s220";
+  profile.identity.model = "SM-S220i";
+  return profile;
+}
+
+CapabilityProfile star_sm_s230() {
+  CapabilityProfile profile = star_sm_s210();
+  profile.name = "star_sm_s230";
+  profile.identity.model = "SM-S230i";
+  // §8, the current model: 58 mm paper, 48 mm print width, 80 mm/s, **Bluetooth 5.2**,
+  // USB 2.0 Full Speed, ~217 g with battery, ~15 h at Star's 5-minute-interval test.
+  // Bluetooth 5.2 means both radios are present, so BLE is recorded alongside Classic.
+  profile.transport.bluetooth.ble = true;
+  return profile;
+}
+
+CapabilityProfile star_sm_l200() {
+  CapabilityProfile profile = star_sm_s210();
+  profile.name = "star_sm_l200";
+  profile.identity.model = "SM-L200";
+  // §8: 58 mm, the Bluetooth 3.0/4.0 dual-mode generation, USB 2.0, ~220 g; the current
+  // SDK identifies it as BLE-capable and StarPRNT-capable.
+  profile.transport.bluetooth.ble = true;
+  return profile;
+}
+
+CapabilityProfile star_sm_l300() {
+  CapabilityProfile profile = star_sm_l200();
+  profile.name = "star_sm_l300";
+  profile.identity.model = "SM-L300";
+  // The 3-inch member of the L line: 80 mm media, 72 mm image.
+  profile.media.nominal_roll_width_mm = 80;
+  profile.media.printable_width_mm = 72;
+  profile.media.printable_width_dots = escpos::kWidth80mm;
+  return profile;
+}
+
+CapabilityProfile star_sm_t300() {
+  CapabilityProfile profile = star_sm_s210();
+  profile.name = "star_sm_t300";
+  profile.identity.model = "SM-T300i";
+  profile.media.nominal_roll_width_mm = 80;
+  profile.media.printable_width_mm = 72;
+  profile.media.printable_width_dots = escpos::kWidth80mm;
+  profile.media.black_mark_sensor = true;
+  return profile;
+}
+
+CapabilityProfile star_sm_t400() {
+  CapabilityProfile profile = star_sm_t300();
+  profile.name = "star_sm_t400";
+  profile.identity.model = "SM-T400i";
+  // The 4-inch member: 112 mm media, 104 mm image — the same two-independent-numbers
+  // rule as the Citizen CT-S4500.
+  profile.media.nominal_roll_width_mm = 112;
+  profile.media.printable_width_mm = 104;
+  profile.media.printable_width_dots = escpos::kWidth104mm;
   return profile;
 }
 
@@ -385,6 +1026,10 @@ CapabilityProfile bixolon_srp330() {
   CapabilityProfile profile = bixolonBase();
   profile.name = "bixolon_srp330";
   profile.identity.model = "SRP-330III/332III";
+  // Bixolon publishes an actual command manual for the SRP-330II, which is what makes
+  // DLE EOT and GS r documented-per-model questions rather than guesses — but the
+  // manual has not been loaded and validated here, so the provenance stays Unverified
+  // (§9-§10 policy) instead of borrowing credibility from its existence.
   return profile;
 }
 
@@ -393,6 +1038,8 @@ CapabilityProfile bixolon_srp350() {
   profile.name = "bixolon_srp350";
   profile.identity.model = "SRP-350III/V, 352, 350plus";
   profile.media.paper_guide_58mm = true;
+  // The SRP-350V documentation lists USB, Ethernet, serial, dual serial and parallel.
+  profile.transport.serial = true;
   return profile;
 }
 
@@ -410,7 +1057,106 @@ CapabilityProfile bixolon_q_series() {
   // The Q line spans both widths; 80 mm is the Q300 default and a Q200 must be
   // configured to 58 mm rather than inferred.
   profile.media.paper_guide_58mm = true;
-  profile.transport.bluetooth_spp = true;
+  profile.transport.bluetooth.classic_spp = true;
+  return profile;
+}
+
+CapabilityProfile bixolon_srp_q200() {
+  CapabilityProfile profile = bixolon_q_series();
+  profile.name = "bixolon_srp_q200";
+  profile.identity.model = "SRP-Q200";
+  return profile;
+}
+
+CapabilityProfile bixolon_srp_q300() {
+  CapabilityProfile profile = bixolon_q_series();
+  profile.name = "bixolon_srp_q300";
+  profile.identity.model = "SRP-Q300";
+  // Bixolon publishes a command manual for this one specifically (§9).
+  return profile;
+}
+
+CapabilityProfile bixolon_srp_b300() {
+  CapabilityProfile profile = bixolonBase();
+  profile.name = "bixolon_srp_b300";
+  profile.identity.model = "SRP-B300";
+  return profile;
+}
+
+CapabilityProfile bixolon_srp_f310() {
+  CapabilityProfile profile = bixolonBase();
+  profile.name = "bixolon_srp_f310";
+  profile.identity.model = "SRP-F310";
+  profile.media.paper_guide_58mm = true;
+  return profile;
+}
+
+CapabilityProfile bixolon_srp_275() {
+  CapabilityProfile profile = bixolonBase();
+  profile.name = "bixolon_srp_275";
+  profile.identity.model = "SRP-275III (impact)";
+  // Dot impact, like the TM-U220 and for the same reason: 76 mm paper, a narrower
+  // image, coarser dots, and a mechanism slow enough that a thermal completion budget
+  // expires on a long ticket.
+  profile.media.nominal_roll_width_mm = 76;
+  profile.media.printable_width_mm = 63;
+  profile.media.printable_width_dots = 400;
+  profile.media.dpi = 160;
+  profile.media.full_cut = false;
+  profile.completion_timeout_ms = 30000;
+  profile.quirks.delayed_status = true;
+  return profile;
+}
+
+CapabilityProfile bixolon_spp_r200() {
+  CapabilityProfile profile = bixolonBase();
+  profile.name = "bixolon_spp_r200";
+  profile.identity.model = "SPP-R200III";
+  // §10: 2-inch / 58 mm; Bixolon publishes user, command **and Bluetooth** manuals for
+  // it; serial and USB plus Bluetooth Class 2 v3.0+EDR. First-class, not "generic
+  // Bluetooth ESC/POS".
+  makeFiftyEight(profile);
+  makePortable(profile);
+  profile.transport.serial = true;
+  profile.transport.bluetooth.classic_spp = true;
+  return profile;
+}
+
+CapabilityProfile bixolon_spp_r210() {
+  CapabilityProfile profile = bixolon_spp_r200();
+  profile.name = "bixolon_spp_r210";
+  profile.identity.model = "SPP-R210";
+  return profile;
+}
+
+CapabilityProfile bixolon_spp_r310() {
+  CapabilityProfile profile = bixolon_spp_r200();
+  profile.name = "bixolon_spp_r310";
+  profile.identity.model = "SPP-R310";
+  // §10: 3-inch / 80 mm class, 203 dpi, print width <= 72 mm, <= 100 mm/s on receipt,
+  // USB 2.0 Full Speed and serial standard, Bluetooth or WLAN variants, NFC-assisted
+  // pairing, paper-end and cover-open sensing with optional black-mark/gap, 8 MB SDRAM
+  // and 4 MB flash, Android/iOS/Windows/Linux SDKs, and a published
+  // `Command Manual_SPP-R310` alongside a Bluetooth manual.
+  profile.media.nominal_roll_width_mm = 80;
+  profile.media.printable_width_mm = 72;
+  profile.media.printable_width_dots = escpos::kWidth80mm;
+  profile.media.black_mark_sensor = true;
+  // The WLAN variant of the R310; the Bluetooth variant is a different unit with the
+  // same model number, which is why interfaces are a facet and not part of identity.
+  profile.transport.wifi = true;
+  profile.transport.raw_tcp_9100 = true;
+  return profile;
+}
+
+CapabilityProfile bixolon_spp_r410() {
+  CapabilityProfile profile = bixolon_spp_r310();
+  profile.name = "bixolon_spp_r410";
+  profile.identity.model = "SPP-R410";
+  // The 4-inch member: 112 mm media, 104 mm image.
+  profile.media.nominal_roll_width_mm = 112;
+  profile.media.printable_width_mm = 104;
+  profile.media.printable_width_dots = escpos::kWidth104mm;
   return profile;
 }
 
@@ -428,7 +1174,11 @@ CapabilityProfile citizen_cts_fast() {
   CapabilityProfile profile = citizenBase();
   profile.name = "citizen_cts_fast";
   profile.identity.model = "CT-S801III / CT-S851III";
+  // §11-§12: 500 mm/s; top exit on the 801III and front exit on the 851III; USB
+  // standard with Wi-Fi, serial, Bluetooth, Ethernet and parallel optional; an LCD
+  // status UI.
   profile.media.near_end_sensor = true;
+  profile.completion_timeout_ms = 12000;
   return profile;
 }
 
@@ -436,12 +1186,137 @@ CapabilityProfile citizen_cts_wide() {
   CapabilityProfile profile = citizenBase();
   profile.name = "citizen_cts_wide";
   profile.identity.model = "CT-S4500 / CT-S4000";
-  // Accepts 58-112 mm media and prints at most 104 mm. The two numbers are unrelated
-  // and a renderer that derives one from the other clips every wide receipt.
+  // §11-§12: media 58-112 mm, **maximum print width 104 mm**, 203 dpi, <= 200 mm/s,
+  // USB 2.0 FS standard, optional Bluetooth including **Apple MFi**, optional serial,
+  // LAN and Wi-Fi; gap, black-mark and paper-end sensing; a guillotine doing full and
+  // partial cuts. "Do not derive raster width from roll width" is written about this
+  // exact printer.
   profile.media.nominal_roll_width_mm = 112;
+  profile.media.printable_width_mm = 104;
   profile.media.printable_width_dots = escpos::kWidth104mm;
   profile.media.black_mark_sensor = true;
+  profile.media.gap_sensor = true;
   profile.media.near_end_sensor = true;
+  profile.transport.wifi = true;
+  profile.transport.bluetooth.classic_spp = true;
+  profile.transport.bluetooth.mfi = true;
+  return profile;
+}
+
+CapabilityProfile citizen_cmp_20ii() {
+  CapabilityProfile profile = citizenBase();
+  profile.name = "citizen_cmp_20ii";
+  profile.identity.model = "CMP-20II";
+  // §11-§12: 58 mm media, 48 mm print width, 203 dpi, 80 mm/s, RS-232 and USB,
+  // Bluetooth Class 2 in a 4.2 configuration, an MFi option, a Wi-Fi option,
+  // **ESC/POS + CPCL + ZPL2**, paper-end sensing, 7.4 V / 1800 mAh. Citizen publishes
+  // the actual CMP20II ESC/POS command reference, so ESC/POS here is a real document
+  // rather than a compatibility claim — but the Epson feedback extensions are not in
+  // it, so every completion provenance stays Unverified.
+  makeFiftyEight(profile);
+  makePortable(profile);
+  profile.languages.add(CommandLanguage::Cpcl);
+  profile.languages.add(CommandLanguage::Zpl);
+  profile.transport.serial = true;
+  profile.transport.bluetooth.classic_spp = true;
+  profile.transport.bluetooth.mfi = true;
+  // Wi-Fi is an option on this model rather than a configuration of it, so the socket
+  // is claimed alongside it and not instead of the Bluetooth facets.
+  profile.transport.wifi = true;
+  profile.transport.raw_tcp_9100 = true;
+  profile.completion_caps.try_process_id_gs_h = true;
+  return profile;
+}
+
+CapabilityProfile citizen_cmp_30ii() {
+  CapabilityProfile profile = citizen_cmp_20ii();
+  profile.name = "citizen_cmp_30ii";
+  profile.identity.model = "CMP-30II";
+  // §11-§12: media 25-80 mm, **maximum print width 72 mm**, 203 dpi, 100 mm/s, RS-232
+  // and USB, Bluetooth Class 2 / 4.2 variants, MFi, Wi-Fi, ESC/POS + CPCL + ZPL2,
+  // paper-end plus a reflective black mark sensor, 7.4 V / 2600 mAh, IP42. Citizen
+  // publishes CMP30II ESC/POS, CMP30II CPCL and CMP ZPL command references —
+  // unusually good material for protocol-level work, and the reason a profile carries
+  // a set of languages rather than one.
+  profile.media.nominal_roll_width_mm = 80;
+  profile.media.printable_width_mm = 72;
+  profile.media.printable_width_dots = escpos::kWidth80mm;
+  profile.media.black_mark_sensor = true;
+  return profile;
+}
+
+// --- Zebra --------------------------------------------------------------------------
+
+CapabilityProfile zebra_zq300_plus() {
+  CapabilityProfile profile = zebraBase();
+  profile.name = "zebra_zq300_plus";
+  profile.identity.model = "ZQ310 Plus / ZQ320 Plus";
+  // §16: the ZQ310 Plus is the 2-inch member and the ZQ320 Plus the 3-inch one; the
+  // narrower geometry is recorded because assuming the wider one clips.
+  makeFiftyEight(profile);
+  makePortable(profile);
+  profile.media.cutter = false;
+  return profile;
+}
+
+CapabilityProfile zebra_zq500() {
+  CapabilityProfile profile = zebraBase();
+  profile.name = "zebra_zq500";
+  profile.identity.model = "ZQ511 / ZQ521";
+  makePortable(profile);
+  return profile;
+}
+
+CapabilityProfile zebra_zq600_plus() {
+  CapabilityProfile profile = zebraBase();
+  profile.name = "zebra_zq600_plus";
+  profile.identity.model = "ZQ610/620/630 Plus";
+  makePortable(profile);
+  // §16: the ZQ630 Plus documents ZPL, CPCL **and EPL**, and newer configurations pair
+  // Wi-Fi 6 with Bluetooth 5.3. Link-OS supplies a separate `StatusConnection` —
+  // including `BluetoothStatusConnection` and `BluetoothLeStatusConnection` — a
+  // status-only channel that does not block the print channel. That is a genuinely
+  // better design than anything in the ESC/POS world, and worth implementing natively;
+  // until it is, this profile refuses rather than pretending.
+  profile.transport.bluetooth.ble = true;
+  return profile;
+}
+
+// --- Brother ------------------------------------------------------------------------
+
+CapabilityProfile brother_rj2000() {
+  CapabilityProfile profile = brotherBase();
+  profile.name = "brother_rj2000";
+  profile.identity.model = "RJ-2030 / RJ-2050 / RJ-2140 / RJ-2150";
+  makeFiftyEight(profile);
+  makePortable(profile);
+  return profile;
+}
+
+CapabilityProfile brother_rj3000() {
+  CapabilityProfile profile = brotherBase();
+  profile.name = "brother_rj3000";
+  profile.identity.model = "RJ-3230B / RJ-3230BL";
+  makePortable(profile);
+  return profile;
+}
+
+CapabilityProfile brother_rj4000() {
+  CapabilityProfile profile = brotherBase();
+  profile.name = "brother_rj4000";
+  profile.identity.model = "RJ-4230B / RJ-4250WB";
+  makePortable(profile);
+  // §17: 4-inch class, USB, WLAN and Bluetooth documented. Brother publishes Raster
+  // Command References and ESC/P references, and some models/configurations add ZPL II
+  // and CPCL — none of which is ESC/POS. `Brother != generic_escpos`.
+  profile.media.nominal_roll_width_mm = 112;
+  profile.media.printable_width_mm = 104;
+  profile.media.printable_width_dots = escpos::kWidth104mm;
+  profile.languages.add(CommandLanguage::Zpl);
+  profile.languages.add(CommandLanguage::Cpcl);
+  profile.transport.wifi = true;
+  profile.transport.raw_tcp_9100 = true;
+  profile.transport.bluetooth.ble = true;
   return profile;
 }
 
@@ -472,6 +1347,31 @@ CapabilityProfile generic_58() {
   profile.status.cutter_error = false;
   profile.chunk_bytes = 512;
   profile.inter_chunk_delay_ms = 30;
+  profile.final_feed_lines = 6;
+  return profile;
+}
+
+CapabilityProfile generic_unknown() {
+  CapabilityProfile profile = generic_80();
+  profile.name = "generic_unknown";
+  profile.identity.model = "unidentified";
+  // The escape hatch of docs/compatibility-brief.md §26, and the most honest entry in
+  // the database: it prints, it cuts, and it claims nothing. No ordered fence, no
+  // status queries, so every job on it terminates at grade E — transport only — which
+  // is exactly what is known about a device nobody has identified. generic_80 says
+  // "an ordinary 80 mm ESC/POS printer"; this says "we do not know what this is", and
+  // those are different statements that were previously the same entry.
+  profile.completion = CompletionMechanism::None;
+  profile.completion_caps.queued_gs_r = false;
+  profile.completion_caps.try_process_id_gs_h = true;  // the probe should still ask
+  profile.status.dle_eot = false;
+  profile.status.asb = false;
+  profile.status.cutter_error = false;
+  profile.media.black_mark_sensor = false;
+  profile.media.near_end_sensor = false;
+  profile.chunk_bytes = 512;
+  profile.inter_chunk_delay_ms = 30;
+  profile.completion_timeout_ms = 20000;
   profile.final_feed_lines = 6;
   return profile;
 }

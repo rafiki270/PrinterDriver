@@ -90,11 +90,44 @@ enum class JobOutcome {
 // CutProcessed on grade B and Done at CutProcessed on grade D, and those are not the
 // same claim.
 enum class ConfidenceGrade {
-  A_JobLevelConfirmation,   // GS ( H, ePOS JobID result, Star checked block
+  // docs/compatibility-brief.md §24, top of the hierarchy: a durable, queryable
+  // printer-side job — Epson ePOS submits, returns a JobID, and the result is
+  // retrievable afterwards, which is the only mechanism here that survives the
+  // application losing the connection between submission and answer.
+  //
+  // NOTHING PRODUCES THIS GRADE YET. The ePOS transport does not exist in this core,
+  // so no JobResult can carry it: a profile that records epos_job_id is describing
+  // hardware, not a claim this engine ever makes. The member is defined now because
+  // the enum is closed and mirrored into four wrappers (docs/api.md §1.3) — adding it
+  // later would renumber every mirror a second time. evidenceFor() therefore grades an
+  // EposJobId profile A, not A+: A+ is the *retrieved* result, not the capability.
+  APlus_DurableQueryableJob,
+  A_JobLevelConfirmation,   // GS ( H, Star checked block, documented vendor equivalent
   B_OrderedDeviceResponse,  // GS r, vendor idle query
   C_DeviceStatusAround,     // DLE EOT, ASB, SNMP taken around the transmission
   D_SpoolerCompleted,       // CUPS/Windows spooler/IPP gateway said completed
   E_TransportOnly,          // the write succeeded and nothing else is known
+};
+
+// docs/compatibility-brief.md §28. Where the claim that a device has a capability
+// actually comes from. This is the distinction the whole brief turns on: recognising
+// ESC/POS print commands does not prove the Epson feedback extensions, so "the manual
+// says so", "we asked the hardware and it answered" and "nobody has checked" must never
+// collapse into one boolean.
+//
+// The three are independent, not ordered: a probe can contradict documentation (an
+// interface path that swallows the response), and documentation can cover a model the
+// probe never reached. Both columns are reported side by side by `pdctl probe`.
+enum class Provenance {
+  // The manufacturer's own command documentation lists it for this model. Epson is the
+  // only family here where GS ( H fn 48 is documented rather than inferred.
+  Documented,
+  // This driver asked the installed hardware over the installed interface path and it
+  // answered. Stronger than marketing, and specific to the path it was measured on.
+  Probed,
+  // Neither. A shipped default nobody has confirmed — which is what "ESC/POS
+  // compatible" on a datasheet amounts to.
+  Unverified,
 };
 
 // Who is actually making the claim carried by a JobResult. The whole point of
@@ -151,10 +184,16 @@ constexpr std::array<JobOutcome, 3> kAllJobOutcomes{
     JobOutcome::Unknown,
 };
 
-constexpr std::array<ConfidenceGrade, 5> kAllConfidenceGrades{
-    ConfidenceGrade::A_JobLevelConfirmation, ConfidenceGrade::B_OrderedDeviceResponse,
-    ConfidenceGrade::C_DeviceStatusAround,   ConfidenceGrade::D_SpoolerCompleted,
-    ConfidenceGrade::E_TransportOnly,
+constexpr std::array<ConfidenceGrade, 6> kAllConfidenceGrades{
+    ConfidenceGrade::APlus_DurableQueryableJob, ConfidenceGrade::A_JobLevelConfirmation,
+    ConfidenceGrade::B_OrderedDeviceResponse,   ConfidenceGrade::C_DeviceStatusAround,
+    ConfidenceGrade::D_SpoolerCompleted,        ConfidenceGrade::E_TransportOnly,
+};
+
+constexpr std::array<Provenance, 3> kAllProvenances{
+    Provenance::Documented,
+    Provenance::Probed,
+    Provenance::Unverified,
 };
 
 constexpr std::array<CompletionAuthority, 5> kAllCompletionAuthorities{
@@ -170,8 +209,9 @@ const char* to_string(FailureReason) noexcept;
 const char* to_string(JobOutcome) noexcept;
 const char* to_string(ConfidenceGrade) noexcept;
 const char* to_string(CompletionAuthority) noexcept;
+const char* to_string(Provenance) noexcept;
 
-// "A".."E" for reports, where the enumerator name is too long to tabulate.
+// "A+", "A".."E" for reports, where the enumerator name is too long to tabulate.
 const char* gradeLetter(ConfidenceGrade) noexcept;
 
 // What kind of evidence produced a result, and who produced it

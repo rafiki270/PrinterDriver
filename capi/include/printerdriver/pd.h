@@ -145,13 +145,59 @@ typedef enum pd_job_outcome {
  * and Done at PD_CONFIDENCE_CUT_PROCESSED on grade D are not the same claim.
  */
 typedef enum pd_confidence_grade {
-  PD_GRADE_A_JOB_LEVEL_CONFIRMATION = 0,  /* GS ( H, ePOS JobID, Star checked block */
-  PD_GRADE_B_ORDERED_DEVICE_RESPONSE = 1, /* GS r, vendor idle query */
-  PD_GRADE_C_DEVICE_STATUS_AROUND = 2,    /* DLE EOT / ASB / SNMP around the send */
-  PD_GRADE_D_SPOOLER_COMPLETED = 3,       /* a spooler or IPP gateway said completed */
-  PD_GRADE_E_TRANSPORT_ONLY = 4,          /* the write succeeded, nothing else is known */
-  PD_GRADE_COUNT = 5
+  /*
+   * A durable, queryable printer-side job: ePOS submits, returns a JobID, and the
+   * result is retrievable afterwards — the only mechanism here that survives the
+   * application losing its connection between submission and answer.
+   *
+   * NOTHING PRODUCES THIS GRADE YET: the ePOS transport does not exist in this core, so
+   * no pd_job_result can carry it. It is defined now because these enums are closed and
+   * mirrored by four wrappers, and adding a member later would renumber every mirror a
+   * second time. A profile that reports epos_job_id is describing hardware, not making
+   * a claim, and is graded A.
+   */
+  PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB = 0,
+  PD_GRADE_A_JOB_LEVEL_CONFIRMATION = 1,  /* GS ( H, Star checked block */
+  PD_GRADE_B_ORDERED_DEVICE_RESPONSE = 2, /* GS r, vendor idle query */
+  PD_GRADE_C_DEVICE_STATUS_AROUND = 3,    /* DLE EOT / ASB / SNMP around the send */
+  PD_GRADE_D_SPOOLER_COMPLETED = 4,       /* a spooler or IPP gateway said completed */
+  PD_GRADE_E_TRANSPORT_ONLY = 5,          /* the write succeeded, nothing else is known */
+  PD_GRADE_COUNT = 6
 } pd_confidence_grade;
+
+/*
+ * pd::Provenance — where the claim that a printer has a capability comes from
+ * (docs/compatibility-brief.md §28). Recognising ESC/POS print commands does not prove
+ * the Epson feedback extensions, so "the manufacturer's manual says so", "we asked the
+ * hardware and it answered" and "nobody has checked" are three answers, not one
+ * boolean. The three are independent rather than ordered: a probe can contradict
+ * documentation when the interface path swallows responses, and documentation can cover
+ * a model no probe has reached.
+ */
+typedef enum pd_provenance {
+  PD_PROVENANCE_DOCUMENTED = 0, /* the manufacturer's command documentation lists it */
+  PD_PROVENANCE_PROBED = 1,     /* this driver asked the installed hardware */
+  PD_PROVENANCE_UNVERIFIED = 2, /* neither — a default nobody has confirmed */
+  PD_PROVENANCE_COUNT = 3
+} pd_provenance;
+
+/*
+ * pd::CommandLanguage — what the device actually speaks (docs/compatibility-brief.md
+ * §1). Only PD_LANGUAGE_ESC_POS is implemented; the rest exist so a fleet containing
+ * them can be described rather than misdriven. A profile naming ZPL, CPCL, Brother
+ * raster or ESC/P is refused with PD_REASON_UNSUPPORTED before a byte is written.
+ */
+typedef enum pd_command_language {
+  PD_LANGUAGE_ESC_POS = 0,
+  PD_LANGUAGE_STAR_PRNT = 1,
+  PD_LANGUAGE_STAR_LINE = 2,
+  PD_LANGUAGE_EPOS_XML = 3,
+  PD_LANGUAGE_ZPL = 4,
+  PD_LANGUAGE_CPCL = 5,
+  PD_LANGUAGE_BROTHER_RASTER = 6,
+  PD_LANGUAGE_ESC_P = 7, /* Brother ESC/P — a different language from Epson ESC/POS */
+  PD_LANGUAGE_COUNT = 8
+} pd_command_language;
 
 /*
  * pd::CompletionAuthority — who is actually making the claim. "Completed" from a print
@@ -381,6 +427,64 @@ typedef struct pd_tcp_config {
   uint32_t connect_timeout_ms; /* 0 -> 3000 */
 } pd_tcp_config;
 
+/* --- Custom transports: Bluetooth and anything else the platform owns -------------- */
+
+/*
+ * docs/compatibility-brief.md §25. Bluetooth cannot live in this core and should not:
+ * on Apple it is CoreBluetooth or ExternalAccessory (MFi), on Android a BluetoothSocket
+ * over RFCOMM, on Linux a BlueZ AF_BLUETOOTH socket. Each is a platform framework with
+ * its own permissions model, its own pairing UI and its own threading, and linking any
+ * of them would make a portable C++17 core unportable in order to buy one transport.
+ *
+ * So the split is: THE PLATFORM OWNS THE SOCKET, THE CORE OWNS THE PROTOCOL. A wrapper
+ * implements three operations and pushes received bytes in. Everything that makes this
+ * SDK worth using — the ordered fence, the GS ( H correlation token, preflight, the
+ * journal, the confidence grading, the refusal to overclaim — stays on this side of the
+ * boundary and behaves identically over Bluetooth, TCP or a test double. A wrapper
+ * cannot weaken a completion guarantee by accident, because a wrapper never makes one.
+ *
+ * -- Thread contract -----------------------------------------------------------------
+ *
+ *   - connect/write/close are invoked on the core's worker thread for this printer, one
+ *     at a time, never concurrently with each other.
+ *   - pd_transport_feed_bytes may be called from ANY thread — typically the wrapper's
+ *     own RX thread, delegate queue or coroutine — INCLUDING while write is in flight.
+ *     That is the normal case: a status answer arrives while the next chunk goes out.
+ *   - pd_transport_feed_bytes must NOT be called from inside connect/write/close: those
+ *     run on the thread that would have to service the delivery.
+ *   - No callback may call back into any pd_* function on the same driver, for the
+ *     reason given under "Callback threads" above.
+ *   - The registration outlives individual connections. The core reconnects after a
+ *     link drop by calling connect again; the wrapper keeps feeding the same printer
+ *     handle and never has to learn about it.
+ */
+
+/* Open the link. Non-zero for success, 0 for failure. */
+typedef int32_t (*pd_transport_connect_fn)(void* ctx);
+
+/*
+ * Hand `size` bytes to the link. Returns the number of bytes actually transferred, or a
+ * negative value for a hard failure. A short write is reported honestly rather than
+ * rounded up: zero bytes out is a known failure and one byte out is Unknown
+ * (docs/api.md §4), and that difference decides whether an operator should reprint.
+ */
+typedef int64_t (*pd_transport_write_fn)(void* ctx, const uint8_t* data, size_t size);
+
+/* Close the link. Called once per successful connect, and again is harmless. */
+typedef void (*pd_transport_close_fn)(void* ctx);
+
+typedef struct pd_transport_vtable {
+  pd_transport_connect_fn connect;
+  pd_transport_write_fn write;
+  pd_transport_close_fn close;
+  /*
+   * What the printer id and the diagnostics derive from when no id is supplied, e.g.
+   * "bt-spp:00:11:22:33:44:55". Copied before pd_add_printer_custom returns. NULL or ""
+   * becomes "custom", which is fine for one printer and ambiguous for two.
+   */
+  const char* description;
+} pd_transport_vtable;
+
 typedef struct pd_job_options {
   const char* key;      /* NULL or "" -> generated; no dedupe protection then */
   pd_cut cut;
@@ -449,9 +553,63 @@ const char* const* pd_profile_ids(void);
 
 pd_printer* pd_add_printer_tcp(pd_driver* driver, const pd_tcp_config* config);
 
+/*
+ * A printer reached over a link the caller owns — Bluetooth Classic SPP, BLE, MFi, a
+ * vendor SDK channel, a USB bulk pipe, a test double. See the thread contract above
+ * pd_transport_vtable.
+ *
+ * `vtable` is copied before this returns; the function pointers it holds must remain
+ * valid, and `ctx` must remain alive, until pd_destroy. `profile_id` accepts the same
+ * ids as pd_tcp_config (see pd_profile_ids()); NULL or "" selects "generic".
+ * `width_dots` of 0 selects 576.
+ *
+ * NULL on failure; see pd_last_error.
+ */
+pd_printer* pd_add_printer_custom(pd_driver* driver, const pd_transport_vtable* vtable,
+                                  void* ctx, const char* profile_id, uint32_t width_dots);
+
+/*
+ * Deliver bytes the link received. Safe from any thread; see the contract above.
+ * Returns 1 when the bytes reached the core's response parser, and 0 when nothing was
+ * listening — the core has not connected yet, or has already closed. That is
+ * information rather than an error: bytes arriving with no reader are dropped, exactly
+ * as they would be on a socket nobody is reading.
+ */
+int32_t pd_transport_feed_bytes(pd_printer* printer, const uint8_t* data, size_t size);
+
+/*
+ * Report that the link dropped for a reason other than an explicit close — the peer
+ * went out of range, the OS tore the channel down, pairing was revoked. Surfaces as
+ * PD_DEVICE_CONNECTION_LOST and fails any job waiting on a fence, instead of leaving it
+ * to time out. Returns 1 when a live transport was notified, 0 when there was none.
+ */
+int32_t pd_transport_link_dropped(pd_printer* printer, const char* message);
+
 const char* pd_printer_id(pd_printer* printer);
 uint32_t pd_printer_width_dots(pd_printer* printer);
 pd_completion_mechanism pd_printer_completion(pd_printer* printer);
+
+/*
+ * What the fence pd_printer_completion reports is actually worth
+ * (docs/compatibility-brief.md §28).
+ *
+ * PD_PROVENANCE_DOCUMENTED means the manufacturer's own command documentation lists the
+ * mechanism for this model — in the shipped database that is Epson and nobody else.
+ * PD_PROVENANCE_PROBED means this driver asked the installed hardware over the installed
+ * interface path and it answered, which is a stronger claim than any datasheet and is
+ * specific to that path. PD_PROVENANCE_UNVERIFIED means neither: a default nobody has
+ * confirmed, which is what "ESC/POS compatible" on a datasheet amounts to.
+ *
+ * This is not a confidence level and does not change what a job reports. It answers a
+ * different question — "should I trust this printer's fence before I have printed
+ * anything?" — and it is the answer that tells an integrator whether running
+ * `pdctl probe` against a site's hardware is worth doing.
+ */
+pd_provenance pd_printer_completion_provenance(pd_printer* printer);
+
+/* The language this printer's profile is driven in. Anything but PD_LANGUAGE_ESC_POS is
+ * refused with PD_REASON_UNSUPPORTED, before a byte is written. */
+pd_command_language pd_printer_language(pd_printer* printer);
 
 pd_device_status pd_printer_status(pd_driver* driver, pd_printer* printer);
 
@@ -547,7 +705,9 @@ const char* pd_failure_reason_name(pd_failure_reason value);
 const char* pd_job_outcome_name(pd_job_outcome value);
 const char* pd_confidence_grade_name(pd_confidence_grade value);
 const char* pd_completion_authority_name(pd_completion_authority value);
-/* "A".."E" — the letter a report tabulates, where the member name is too long. */
+const char* pd_provenance_name(pd_provenance value);
+const char* pd_command_language_name(pd_command_language value);
+/* "A+", "A".."E" — the letter a report tabulates, where the member name is too long. */
 const char* pd_confidence_grade_letter(pd_confidence_grade value);
 const char* pd_payload_kind_name(pd_payload_kind value);
 const char* pd_completion_mechanism_name(pd_completion_mechanism value);

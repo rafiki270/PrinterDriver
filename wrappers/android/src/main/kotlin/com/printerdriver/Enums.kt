@@ -267,20 +267,35 @@ enum class CutVariant(internal val raw: Int) {
  * and Done at CUT_PROCESSED on grade D are not the same claim.
  */
 enum class ConfidenceGrade(internal val raw: Int, val letter: String) {
+    /**
+     * A durable, queryable printer-side job (docs/compatibility-brief.md §24): ePOS
+     * submits, returns a JobID, and the result stays retrievable afterwards -- the only
+     * grade whose evidence survives the app losing its connection between submission and
+     * answer.
+     *
+     * NOTHING PRODUCES THIS GRADE. The ePOS transport does not exist in the core this
+     * wrapper binds, so no [JobResult] can ever carry it today; it is mirrored now only
+     * because pd_confidence_grade is a closed enum shared by four wrappers, and adding a
+     * member later would renumber every one of them a second time. A profile that merely
+     * reports an ePOS JobID is describing hardware rather than making a claim, and is
+     * graded [A_JOB_LEVEL_CONFIRMATION].
+     */
+    APLUS_DURABLE_QUERYABLE_JOB(0, "A+"),
+
     /** GS(H), an ePOS JobID result, a Star checked block. */
-    A_JOB_LEVEL_CONFIRMATION(0, "A"),
+    A_JOB_LEVEL_CONFIRMATION(1, "A"),
 
     /** GS r, a vendor idle query. */
-    B_ORDERED_DEVICE_RESPONSE(1, "B"),
+    B_ORDERED_DEVICE_RESPONSE(2, "B"),
 
     /** DLE EOT, ASB or SNMP taken around the transmission. */
-    C_DEVICE_STATUS_AROUND(2, "C"),
+    C_DEVICE_STATUS_AROUND(3, "C"),
 
     /** A spooler or IPP gateway said completed. */
-    D_SPOOLER_COMPLETED(3, "D"),
+    D_SPOOLER_COMPLETED(4, "D"),
 
     /** The write succeeded and nothing else is known. */
-    E_TRANSPORT_ONLY(4, "E"),
+    E_TRANSPORT_ONLY(5, "E"),
     UNRECOGNIZED(-1, "?");
 
     companion object {
@@ -312,6 +327,75 @@ enum class CompletionAuthority(internal val raw: Int) {
     companion object {
         internal fun fromRaw(raw: Int): CompletionAuthority = entries.firstOrNull { it.raw == raw } ?: run {
             PdLog.w("Unrecognized pd_completion_authority raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}
+
+/**
+ * pd::Provenance -- where the claim that a printer has a capability comes from
+ * (docs/compatibility-brief.md §28).
+ *
+ * The three are independent answers, not a ranking: a probe can contradict the
+ * manufacturer's documentation when the interface path swallows responses, and
+ * documentation can cover a model no probe has ever reached. Collapsing them into one
+ * boolean is the classic ESC/POS mistake §28 names -- assuming that recognising the
+ * print commands implies the Epson feedback extensions.
+ *
+ * Mirrored for completeness: as of this contract version pd.h defines the enum and
+ * pd_provenance_name(), but no pd_* accessor returns one, so nothing in this wrapper
+ * produces a value yet. It ships now for the same reason [CutVariant] does -- the enum
+ * is closed, and mirroring it later would be a second renumbering pass across four
+ * wrappers.
+ */
+enum class Provenance(internal val raw: Int) {
+    /** The manufacturer's own command documentation lists it. */
+    DOCUMENTED(0),
+
+    /** This driver asked the installed hardware, over the interface path in use. */
+    PROBED(1),
+
+    /** Neither -- a default nobody has confirmed. Not the same as "absent". */
+    UNVERIFIED(2),
+    UNRECOGNIZED(-1);
+
+    companion object {
+        internal fun fromRaw(raw: Int): Provenance = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_provenance raw value: $raw")
+            UNRECOGNIZED
+        }
+    }
+}
+
+/**
+ * pd::CommandLanguage -- what the device actually speaks
+ * (docs/compatibility-brief.md §1).
+ *
+ * Only [ESC_POS] is implemented by the core. The rest exist so that a fleet containing
+ * them can be *described* rather than misdriven: a profile naming [ZPL], [CPCL],
+ * [BROTHER_RASTER] or [ESC_P] is refused with [FailureReason.UNSUPPORTED] before a byte
+ * is written, which is the whole point of enumerating them (§16, §17 -- Zebra and
+ * Brother mobiles are never driven down the generic ESC/POS codepath).
+ *
+ * Mirrored for completeness on the same terms as [Provenance]: pd.h defines the enum and
+ * pd_command_language_name(), but no pd_* accessor returns one yet.
+ */
+enum class CommandLanguage(internal val raw: Int) {
+    ESC_POS(0),
+    STAR_PRNT(1),
+    STAR_LINE(2),
+    EPOS_XML(3),
+    ZPL(4),
+    CPCL(5),
+    BROTHER_RASTER(6),
+
+    /** Brother ESC/P -- a different language from Epson's ESC/POS, despite the name. */
+    ESC_P(7),
+    UNRECOGNIZED(-1);
+
+    companion object {
+        internal fun fromRaw(raw: Int): CommandLanguage = entries.firstOrNull { it.raw == raw } ?: run {
+            PdLog.w("Unrecognized pd_command_language raw value: $raw")
             UNRECOGNIZED
         }
     }

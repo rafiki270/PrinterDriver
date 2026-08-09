@@ -28,8 +28,12 @@ public sealed class EnumBridgeTests
         /// The PD_*_COUNT constant from capi/include/printerdriver/pd.h, transcribed.
         int HeaderCount,
         Type EnumType,
-        /// Null for the enums the core gives no to_string.
-        bool HasCoreNames);
+        /// False where the C# spelling cannot be compared with the core's character for
+        /// character: either the core has no to_string, or -- ConfidenceGrade alone -- it
+        /// separates the grade letter with an underscore ("A_JobLevelConfirmation"), which
+        /// is not a C# identifier. ConfidenceGrade's spelling is checked in
+        /// TheGradeLadderGainedAPlusAtItsTop instead, with the underscores taken out.
+        bool HasComparableCoreNames);
 
     private static readonly Mirror[] Mirrors =
     [
@@ -46,6 +50,8 @@ public sealed class EnumBridgeTests
         new(BridgedEnum.Alignment, 3, typeof(Alignment), false),
         new(BridgedEnum.CodePage, 5, typeof(CodePage), false),
         new(BridgedEnum.Binarization, 2, typeof(Binarization), false),
+        new(BridgedEnum.ConfidenceGrade, 6, typeof(ConfidenceGrade), false),
+        new(BridgedEnum.CompletionAuthority, 5, typeof(CompletionAuthority), true),
     ];
 
     public EnumBridgeTests() => NativeFixture.Bind();
@@ -53,9 +59,9 @@ public sealed class EnumBridgeTests
     [Fact]
     public void EveryBridgedEnumIsMirrored()
     {
-        // PD_TEST_ENUM_TOTAL is 13: if the bridge grows an entry and this table does not,
+        // PD_TEST_ENUM_TOTAL is 15: if the bridge grows an entry and this table does not,
         // the new enum would simply never be checked.
-        Assert.Equal(13, Mirrors.Length);
+        Assert.Equal(15, Mirrors.Length);
         Assert.Equal(Mirrors.Length, Mirrors.Select(m => m.Bridge).Distinct().Count());
     }
 
@@ -98,7 +104,7 @@ public sealed class EnumBridgeTests
     [Fact]
     public void MemberNamesAgreeWithTheCoresOwnSpelling()
     {
-        foreach (var mirror in Mirrors.Where(m => m.HasCoreNames))
+        foreach (var mirror in Mirrors.Where(m => m.HasComparableCoreNames))
         {
             var label = TestNative.ReadUtf8(TestNative.pd_test_enum_label((int)mirror.Bridge));
             var names = Enum.GetNames(mirror.EnumType);
@@ -128,6 +134,46 @@ public sealed class EnumBridgeTests
         AssertNames<PayloadKind>(NativeMethods.pd_payload_kind_name);
         AssertNames<CompletionMechanism>(NativeMethods.pd_completion_mechanism_name);
         AssertNames<CutVariant>(NativeMethods.pd_cut_variant_name);
+        AssertNames<CompletionAuthority>(NativeMethods.pd_completion_authority_name);
+
+        // Provenance and CommandLanguage are not in the test bridge of
+        // capi/tests/pd_test_support.h, so these helpers are the only independent
+        // statement of what the core calls their members -- which is also the route an
+        // application takes when it puts a grade or a language in front of a person.
+        AssertNames<Provenance>(NativeMethods.pd_provenance_name);
+        AssertNames<CommandLanguage>(NativeMethods.pd_command_language_name);
+    }
+
+    [Fact]
+    public void TheGradeLadderGainedAPlusAtItsTop()
+    {
+        // docs/compatibility-brief.md §24. A+ took value 0 and pushed A..E down by one, so
+        // the ladder still reads strongest-first and two grades can be compared
+        // numerically. Anything that had hardcoded "A is 0" is wrong now, which is why
+        // the values are asserted rather than assumed to have stayed put.
+        Assert.Equal(0, (int)ConfidenceGrade.APlusDurableQueryableJob);
+        Assert.Equal(1, (int)ConfidenceGrade.AJobLevelConfirmation);
+        Assert.Equal(5, (int)ConfidenceGrade.ETransportOnly);
+        Assert.Equal(6, Enum.GetValues<ConfidenceGrade>().Length);
+
+        // The letter is what a report tabulates, and it is the one place A+ has to survive
+        // as two characters rather than being rounded to "A".
+        Assert.Equal(
+            new[] { "A+", "A", "B", "C", "D", "E" },
+            Enum.GetValues<ConfidenceGrade>()
+                .Select(grade => TestNative.ReadUtf8(
+                    NativeMethods.pd_confidence_grade_letter((int)grade)))
+                .ToArray());
+
+        // The core splits the grade letter off with an underscore
+        // ("A_JobLevelConfirmation"); a C# member cannot. That underscore is the only
+        // difference this compares away -- everything else has to match character for
+        // character, so a member renamed in the core still fails here.
+        foreach (var grade in Enum.GetValues<ConfidenceGrade>())
+        {
+            var core = TestNative.ReadUtf8(NativeMethods.pd_confidence_grade_name((int)grade));
+            Assert.Equal(core.Replace("_", string.Empty), Enum.GetName(grade));
+        }
     }
 
     [Fact]
@@ -173,6 +219,7 @@ public sealed class AbiLayoutTests
     {
         Assert.Equal(32, Marshal.SizeOf<PdConfig>());          // ptr, int+pad, ptr, ptr
         Assert.Equal(40, Marshal.SizeOf<PdTcpConfig>());       // ptr, ptr, u16+pad, u32+pad, ptr, u32+pad
+        Assert.Equal(32, Marshal.SizeOf<PdTransportVtable>()); // 3 fn ptrs, ptr
         Assert.Equal(40, Marshal.SizeOf<PdJobOptions>());      // ptr, 7 x int, +pad
         Assert.Equal(24, Marshal.SizeOf<PdJobEvent>());        // 4 x int, u64
         Assert.Equal(32, Marshal.SizeOf<PdJobResult>());       // 5 x int, +pad, ptr

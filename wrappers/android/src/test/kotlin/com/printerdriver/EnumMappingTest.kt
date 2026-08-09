@@ -68,12 +68,57 @@ class EnumMappingTest {
 
     @Test
     fun `ConfidenceGrade fromRaw matches pd_confidence_grade`() {
-        assertEquals(ConfidenceGrade.A_JOB_LEVEL_CONFIRMATION, ConfidenceGrade.fromRaw(0))
-        assertEquals(ConfidenceGrade.B_ORDERED_DEVICE_RESPONSE, ConfidenceGrade.fromRaw(1))
-        assertEquals(ConfidenceGrade.C_DEVICE_STATUS_AROUND, ConfidenceGrade.fromRaw(2))
-        assertEquals(ConfidenceGrade.D_SPOOLER_COMPLETED, ConfidenceGrade.fromRaw(3))
-        assertEquals(ConfidenceGrade.E_TRANSPORT_ONLY, ConfidenceGrade.fromRaw(4))
-        assertEquals(ConfidenceGrade.UNRECOGNIZED, ConfidenceGrade.fromRaw(5))
+        // A+ occupies raw 0, so every letter grade sits one above its pre-A+ value. A
+        // wrapper that kept the old numbering would report every A-graded job as A+ --
+        // an upgrade of the strongest claim in the SDK, made by an off-by-one.
+        assertEquals(ConfidenceGrade.APLUS_DURABLE_QUERYABLE_JOB, ConfidenceGrade.fromRaw(0))
+        assertEquals(ConfidenceGrade.A_JOB_LEVEL_CONFIRMATION, ConfidenceGrade.fromRaw(1))
+        assertEquals(ConfidenceGrade.B_ORDERED_DEVICE_RESPONSE, ConfidenceGrade.fromRaw(2))
+        assertEquals(ConfidenceGrade.C_DEVICE_STATUS_AROUND, ConfidenceGrade.fromRaw(3))
+        assertEquals(ConfidenceGrade.D_SPOOLER_COMPLETED, ConfidenceGrade.fromRaw(4))
+        assertEquals(ConfidenceGrade.E_TRANSPORT_ONLY, ConfidenceGrade.fromRaw(5))
+        assertEquals(ConfidenceGrade.UNRECOGNIZED, ConfidenceGrade.fromRaw(6))
+    }
+
+    @Test
+    fun `ConfidenceGrade letters match pd_confidence_grade_letter`() {
+        // The letter is what a report tabulates, so it is a second, independent way for
+        // the shift to go wrong: an enum could carry the right raw values and still
+        // print "A" next to a grade that is not A.
+        assertEquals("A+", ConfidenceGrade.APLUS_DURABLE_QUERYABLE_JOB.letter)
+        assertEquals("A", ConfidenceGrade.A_JOB_LEVEL_CONFIRMATION.letter)
+        assertEquals("B", ConfidenceGrade.B_ORDERED_DEVICE_RESPONSE.letter)
+        assertEquals("C", ConfidenceGrade.C_DEVICE_STATUS_AROUND.letter)
+        assertEquals("D", ConfidenceGrade.D_SPOOLER_COMPLETED.letter)
+        assertEquals("E", ConfidenceGrade.E_TRANSPORT_ONLY.letter)
+        assertEquals("?", ConfidenceGrade.UNRECOGNIZED.letter)
+    }
+
+    @Test
+    fun `Provenance fromRaw matches pd_provenance`() {
+        assertEquals(Provenance.DOCUMENTED, Provenance.fromRaw(0))
+        assertEquals(Provenance.PROBED, Provenance.fromRaw(1))
+        assertEquals(Provenance.UNVERIFIED, Provenance.fromRaw(2))
+        // UNVERIFIED is a real pd_provenance member meaning "nobody has checked";
+        // UNRECOGNIZED means this wrapper has never heard of the raw int. Same trap as
+        // FailureReason.UNKNOWN below.
+        assertEquals(Provenance.UNRECOGNIZED, Provenance.fromRaw(3))
+    }
+
+    @Test
+    fun `CommandLanguage fromRaw matches pd_command_language`() {
+        assertEquals(CommandLanguage.ESC_POS, CommandLanguage.fromRaw(0))
+        assertEquals(CommandLanguage.STAR_PRNT, CommandLanguage.fromRaw(1))
+        assertEquals(CommandLanguage.STAR_LINE, CommandLanguage.fromRaw(2))
+        assertEquals(CommandLanguage.EPOS_XML, CommandLanguage.fromRaw(3))
+        assertEquals(CommandLanguage.ZPL, CommandLanguage.fromRaw(4))
+        assertEquals(CommandLanguage.CPCL, CommandLanguage.fromRaw(5))
+        assertEquals(CommandLanguage.BROTHER_RASTER, CommandLanguage.fromRaw(6))
+        // Brother ESC/P, not Epson ESC/POS. Mapping raw 7 onto ESC_POS is the exact
+        // confusion docs/compatibility-brief.md §17 exists to prevent, and it would
+        // route a Brother mobile down the generic ESC/POS codepath.
+        assertEquals(CommandLanguage.ESC_P, CommandLanguage.fromRaw(7))
+        assertEquals(CommandLanguage.UNRECOGNIZED, CommandLanguage.fromRaw(8))
     }
 
     @Test
@@ -140,8 +185,11 @@ class EnumMappingTest {
     fun `CompletionMechanism fromRaw matches pd_completion_mechanism`() {
         assertEquals(CompletionMechanism.GS_PAREN_H, CompletionMechanism.fromRaw(0))
         assertEquals(CompletionMechanism.GS_R1, CompletionMechanism.fromRaw(1))
-        assertEquals(CompletionMechanism.NONE, CompletionMechanism.fromRaw(2))
-        assertEquals(CompletionMechanism.UNRECOGNIZED, CompletionMechanism.fromRaw(3))
+        assertEquals(CompletionMechanism.VENDOR_IDLE, CompletionMechanism.fromRaw(2))
+        assertEquals(CompletionMechanism.EPOS_JOB_ID, CompletionMechanism.fromRaw(3))
+        assertEquals(CompletionMechanism.STAR_CHECKED_BLOCK, CompletionMechanism.fromRaw(4))
+        assertEquals(CompletionMechanism.NONE, CompletionMechanism.fromRaw(5))
+        assertEquals(CompletionMechanism.UNRECOGNIZED, CompletionMechanism.fromRaw(6))
     }
 
     @Test
@@ -169,19 +217,23 @@ class EnumMappingTest {
     fun `every enum's entries count matches its pd h _COUNT (minus UNRECOGNIZED)`() {
         // A cheap tripwire against a member being silently dropped or added without
         // updating fromRaw: pd.h's own _COUNT constants, restated here as the expected
-        // sizes (JobState 11, ConfidenceLevel 6, DeviceEvent 12, FailureReason 11,
-        // Cut 4, Preflight 2, Alignment 3, CodePage 5, Binarization 2,
-        // CompletionMechanism 3, CutVariant 3).
-        assertEquals(11, JobState.entries.size - 1)
-        assertEquals(6, ConfidenceLevel.entries.size - 1)
-        assertEquals(12, DeviceEvent.entries.size - 1)
-        assertEquals(11, FailureReason.entries.size - 1)
-        assertEquals(4, Cut.entries.size - 1)
-        assertEquals(2, Preflight.entries.size - 1)
-        assertEquals(3, Alignment.entries.size - 1)
-        assertEquals(5, CodePage.entries.size - 1)
-        assertEquals(2, Binarization.entries.size - 1)
-        assertEquals(3, CompletionMechanism.entries.size - 1)
-        assertEquals(3, CutVariant.entries.size - 1)
+        // sizes. Every number below is transcribed from a PD_*_COUNT in
+        // capi/include/printerdriver/pd.h -- if one of them disagrees with the header,
+        // this test is what is wrong, not the header.
+        assertEquals(11, JobState.entries.size - 1)              // PD_JOB_STATE_COUNT
+        assertEquals(6, ConfidenceLevel.entries.size - 1)        // PD_CONFIDENCE_COUNT
+        assertEquals(13, DeviceEvent.entries.size - 1)           // PD_DEVICE_EVENT_COUNT
+        assertEquals(11, FailureReason.entries.size - 1)         // PD_REASON_COUNT
+        assertEquals(4, Cut.entries.size - 1)                    // PD_CUT_COUNT
+        assertEquals(2, Preflight.entries.size - 1)              // PD_PREFLIGHT_COUNT
+        assertEquals(3, Alignment.entries.size - 1)              // PD_ALIGN_COUNT
+        assertEquals(5, CodePage.entries.size - 1)               // PD_CODE_PAGE_COUNT
+        assertEquals(2, Binarization.entries.size - 1)           // PD_BINARIZATION_COUNT
+        assertEquals(6, CompletionMechanism.entries.size - 1)    // PD_COMPLETION_COUNT
+        assertEquals(3, CutVariant.entries.size - 1)             // PD_CUT_VARIANT_COUNT
+        assertEquals(6, ConfidenceGrade.entries.size - 1)        // PD_GRADE_COUNT
+        assertEquals(5, CompletionAuthority.entries.size - 1)    // PD_AUTHORITY_COUNT
+        assertEquals(3, Provenance.entries.size - 1)             // PD_PROVENANCE_COUNT
+        assertEquals(8, CommandLanguage.entries.size - 1)        // PD_LANGUAGE_COUNT
     }
 }

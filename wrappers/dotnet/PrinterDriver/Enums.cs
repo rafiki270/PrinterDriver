@@ -114,23 +114,112 @@ public enum DeviceEvent
     ForeignWriterDetected = 12,
 }
 
-/// <summary>What class of evidence backs a result — docs/device-database.md.</summary>
+/// <summary>
+/// What class of evidence backs a result — docs/compatibility-brief.md §24.
+/// </summary>
+/// <remarks>
+/// Orthogonal to <see cref="ConfidenceLevel"/>: the level says how far up the evidence
+/// ladder a job climbed, the grade says what the claim is made of. Done at
+/// <see cref="ConfidenceLevel.CutProcessed"/> on grade A and Done at
+/// <see cref="ConfidenceLevel.CutProcessed"/> on grade D are not the same claim. The
+/// members are ordered strongest-first, so a caller may compare them numerically.
+/// </remarks>
 public enum ConfidenceGrade
 {
-    /// <summary>Job-level confirmation from the mechanism (GS(H) echo, ePOS JobID).</summary>
-    AJobLevelConfirmation = 0,
+    /// <summary>
+    /// A durable, queryable printer-side job: ePOS submits, returns a JobID, and the
+    /// result is retrievable afterwards — the only mechanism in the hierarchy that
+    /// survives the application losing its connection between submission and answer.
+    /// <para>
+    /// Nothing produces this grade yet. The ePOS transport does not exist in this core, so
+    /// no <see cref="JobResult"/> can carry it. It is declared now because the ABI's enums
+    /// are closed and mirrored by four wrappers, and adding a member later would renumber
+    /// every mirror a second time. A profile that reports an ePOS JobID is describing
+    /// hardware, not making a claim, and is graded <see cref="AJobLevelConfirmation"/>.
+    /// </para>
+    /// </summary>
+    APlusDurableQueryableJob = 0,
 
-    /// <summary>Ordered device response with weaker semantics (GS r 1).</summary>
-    BOrderedDeviceResponse = 1,
+    /// <summary>Job-level confirmation: GS(H) fn48, a Star checked block.</summary>
+    AJobLevelConfirmation = 1,
 
-    /// <summary>Device status around transmission (DLE EOT, ASB).</summary>
-    CDeviceStatusAround = 2,
+    /// <summary>Ordered device response with weaker semantics (GS r, a vendor idle query).</summary>
+    BOrderedDeviceResponse = 2,
 
-    /// <summary>A spooler said completed.</summary>
-    DSpoolerCompleted = 3,
+    /// <summary>Device status around transmission (DLE EOT, ASB, SNMP).</summary>
+    CDeviceStatusAround = 3,
+
+    /// <summary>A spooler or IPP gateway said completed.</summary>
+    DSpoolerCompleted = 4,
 
     /// <summary>Transport only: a write succeeded somewhere.</summary>
-    ETransportOnly = 4,
+    ETransportOnly = 5,
+}
+
+/// <summary>
+/// Where the claim that a printer has a capability comes from —
+/// docs/compatibility-brief.md §28.
+/// </summary>
+/// <remarks>
+/// Recognising ESC/POS <em>print</em> commands does not prove the Epson <em>feedback</em>
+/// extensions, so "the manufacturer's manual says so", "we asked the hardware and it
+/// answered" and "nobody has checked" are three answers rather than one boolean. The
+/// three are independent rather than ordered: a probe can contradict documentation when
+/// the interface path swallows responses, and documentation can cover a model no probe
+/// has reached.
+/// </remarks>
+public enum Provenance
+{
+    /// <summary>The manufacturer's own command documentation lists it for this model.</summary>
+    Documented = 0,
+
+    /// <summary>
+    /// This driver asked the installed hardware over the installed interface path and it
+    /// answered. Specific to the path it was measured on, and stronger than marketing.
+    /// </summary>
+    Probed = 1,
+
+    /// <summary>
+    /// Neither — a shipped default nobody has confirmed, which is what "ESC/POS
+    /// compatible" on a datasheet amounts to.
+    /// </summary>
+    Unverified = 2,
+}
+
+/// <summary>
+/// What a device actually speaks — docs/compatibility-brief.md §1.
+/// </summary>
+/// <remarks>
+/// Only <see cref="EscPos"/> is implemented. The rest exist so a fleet containing them can
+/// be described rather than misdriven: a profile naming ZPL, CPCL, Brother raster or ESC/P
+/// is refused with <see cref="FailureReason.Unsupported"/> before a byte is written,
+/// because an ESC/POS engine pointed at a Zebra prints a metre of text instead of a label.
+/// </remarks>
+public enum CommandLanguage
+{
+    /// <summary>Epson ESC/POS, the only language this core drives.</summary>
+    EscPos = 0,
+
+    /// <summary>Star's native command set.</summary>
+    StarPrnt = 1,
+
+    /// <summary>Star line mode.</summary>
+    StarLine = 2,
+
+    /// <summary>Epson ePOS XML, spoken by the intelligent printers over their own transport.</summary>
+    EposXml = 3,
+
+    /// <summary>Zebra Programming Language (Link-OS).</summary>
+    Zpl = 4,
+
+    /// <summary>Comtec/Zebra mobile, also documented by the Citizen CMP portables.</summary>
+    Cpcl = 5,
+
+    /// <summary>Brother's raster command reference.</summary>
+    BrotherRaster = 6,
+
+    /// <summary>Brother ESC/P — a different language from Epson ESC/POS, despite the name.</summary>
+    EscP = 7,
 }
 
 /// <summary>Who is authoritative for the completion claim.</summary>

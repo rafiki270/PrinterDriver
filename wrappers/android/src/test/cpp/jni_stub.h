@@ -90,6 +90,8 @@ class _JNIEnv {
   jmethodID GetMethodID(jclass clazz, const char* name, const char* sig);
 
   void CallVoidMethod(jobject obj, jmethodID methodID, ...);
+  jboolean CallBooleanMethod(jobject obj, jmethodID methodID, ...);
+  jint CallIntMethod(jobject obj, jmethodID methodID, ...);
 
   jobject NewGlobalRef(jobject obj);
   void DeleteGlobalRef(jobject globalRef);
@@ -103,8 +105,10 @@ class _JNIEnv {
 
   jsize GetArrayLength(jarray array);
 
+  jbyteArray NewByteArray(jsize len);
   jbyte* GetByteArrayElements(jbyteArray array, jboolean* isCopy);
   void ReleaseByteArrayElements(jbyteArray array, jbyte* elems, jint mode);
+  void SetByteArrayRegion(jbyteArray array, jsize start, jsize len, const jbyte* buf);
 
   jint* GetIntArrayElements(jintArray array, jboolean* isCopy);
   void ReleaseIntArrayElements(jintArray array, jint* elems, jint mode);

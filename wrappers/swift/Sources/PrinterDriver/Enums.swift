@@ -119,16 +119,27 @@ public enum ConfidenceLevel: UInt32, ABIMirroredEnum {
 /// ``ConfidenceLevel/cutProcessed`` on grade A and one that is done at
 /// ``ConfidenceLevel/cutProcessed`` on grade D are not making the same claim.
 public enum ConfidenceGrade: UInt32, ABIMirroredEnum {
-  /// `GS ( H`, an ePOS JobID result, a Star checked block.
-  case aJobLevelConfirmation = 0
+  /// A durable, queryable printer-side job: ePOS submits, returns a JobID, and the result
+  /// is retrievable afterwards — the only mechanism in the hierarchy that survives the
+  /// app losing its connection between submission and answer
+  /// (docs/compatibility-brief.md §24).
+  ///
+  /// - Important: **Nothing produces this grade yet.** The ePOS transport does not exist
+  ///   in the core, so no ``JobResult`` can carry it. It is declared now because the ABI's
+  ///   enums are closed and mirrored by four wrappers, and adding a member later would
+  ///   renumber every mirror a second time. A profile that reports an ePOS JobID is
+  ///   describing hardware, not making a claim, and is graded ``aJobLevelConfirmation``.
+  case aPlusDurableQueryableJob = 0
+  /// `GS ( H`, a Star checked block, a documented vendor equivalent.
+  case aJobLevelConfirmation = 1
   /// `GS r`, a vendor idle query.
-  case bOrderedDeviceResponse = 1
+  case bOrderedDeviceResponse = 2
   /// `DLE EOT`, ASB or SNMP taken around the transmission.
-  case cDeviceStatusAround = 2
+  case cDeviceStatusAround = 3
   /// A spooler or IPP gateway said completed.
-  case dSpoolerCompleted = 3
+  case dSpoolerCompleted = 4
   /// The write succeeded and nothing else is known.
-  case eTransportOnly = 4
+  case eTransportOnly = 5
 
   public static let abiTypeName = "ConfidenceGrade"
   /// The weakest grade there is. An unrecognized one must never read as stronger
@@ -140,9 +151,75 @@ public enum ConfidenceGrade: UInt32, ABIMirroredEnum {
     String(cString: pd_confidence_grade_name(pd_confidence_grade(rawValue)))
   }
 
-  /// "A"..."E" — the letter a report tabulates, from `pd_confidence_grade_letter`.
+  /// `"A+"`, `"A"`…`"E"` — the letter a report tabulates, from
+  /// `pd_confidence_grade_letter`.
   public var letter: String {
     String(cString: pd_confidence_grade_letter(pd_confidence_grade(rawValue)))
+  }
+}
+
+// MARK: - Provenance
+
+/// Where the claim that a printer has a capability comes from —
+/// `pd_provenance`, docs/compatibility-brief.md §28.
+///
+/// Recognising ESC/POS *print* commands does not prove the Epson *feedback* extensions,
+/// which is the mistake the whole compatibility brief is arranged around. So "the
+/// manufacturer's manual says so", "we asked the hardware and it answered" and "nobody
+/// has checked" are three answers rather than one boolean.
+///
+/// The three are independent, not ordered. A probe can contradict documentation when the
+/// interface path swallows responses; documentation can cover a model no probe has
+/// reached. `pdctl probe` prints both columns side by side for exactly that reason.
+public enum Provenance: UInt32, ABIMirroredEnum {
+  /// The manufacturer's own command documentation lists it for this model. Epson is the
+  /// only family in the shipped database whose defaults ever claim this.
+  case documented = 0
+  /// This driver asked the installed hardware over the installed interface path and it
+  /// answered. Specific to the path it was measured on — and stronger than marketing.
+  case probed = 1
+  /// Neither. A shipped default nobody has confirmed, which is what "ESC/POS compatible"
+  /// on a datasheet amounts to.
+  case unverified = 2
+
+  public static let abiTypeName = "Provenance"
+  /// Claims the least: an unrecognized provenance has established nothing.
+  public static let unrecognizedFallback = Provenance.unverified
+
+  /// The core's own spelling, from `pd_provenance_name`.
+  public var abiName: String { String(cString: pd_provenance_name(pd_provenance(rawValue))) }
+}
+
+// MARK: - CommandLanguage
+
+/// What a device actually speaks — `pd_command_language`,
+/// docs/compatibility-brief.md §1.
+///
+/// Only ``escPos`` is implemented. The rest exist so a fleet containing them can be
+/// described rather than misdriven: a profile naming ZPL, CPCL, Brother raster or ESC/P
+/// is refused with ``FailureReason/unsupported`` before a byte is written, because an
+/// ESC/POS engine pointed at a Zebra prints a metre of text instead of a label.
+public enum CommandLanguage: UInt32, ABIMirroredEnum {
+  case escPos = 0
+  case starPrnt = 1
+  case starLine = 2
+  case eposXml = 3
+  /// Zebra Programming Language (Link-OS).
+  case zpl = 4
+  /// Comtec/Zebra mobile, also documented by the Citizen CMP portables.
+  case cpcl = 5
+  case brotherRaster = 6
+  /// Brother ESC/P — a different language from Epson ESC/POS, despite the name.
+  case escP = 7
+
+  public static let abiTypeName = "CommandLanguage"
+  /// Not a safe default in the usual sense, but the only member this core can drive; an
+  /// unrecognized language is caught by the debug trap in ``ABIMirroredEnum``.
+  public static let unrecognizedFallback = CommandLanguage.escPos
+
+  /// The core's own spelling, from `pd_command_language_name`.
+  public var abiName: String {
+    String(cString: pd_command_language_name(pd_command_language(rawValue)))
   }
 }
 

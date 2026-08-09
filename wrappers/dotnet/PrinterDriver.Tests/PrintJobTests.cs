@@ -294,6 +294,35 @@ public sealed class PrintJobTests
         Assert.All(ids, id => Assert.False(string.IsNullOrWhiteSpace(id)));
     }
 
+    [Theory]
+    [InlineData("epson_tm_t88vi", Provenance.Documented, CommandLanguage.EscPos)]
+    [InlineData("epson_tm_p20ii", Provenance.Documented, CommandLanguage.EscPos)]
+    [InlineData("xp-s260m", Provenance.Probed, CommandLanguage.EscPos)]
+    [InlineData("xprinter_s_series", Provenance.Unverified, CommandLanguage.EscPos)]
+    [InlineData("rongta_rp80", Provenance.Unverified, CommandLanguage.EscPos)]
+    [InlineData("partner_rp110", Provenance.Unverified, CommandLanguage.EscPos)]
+    [InlineData("generic_unknown", Provenance.Unverified, CommandLanguage.EscPos)]
+    [InlineData("zebra_zq600_plus", Provenance.Unverified, CommandLanguage.Zpl)]
+    [InlineData("brother_rj4000", Provenance.Unverified, CommandLanguage.BrotherRaster)]
+    public void AProfileSaysWhereItsFenceCameFromAndWhatTheDeviceSpeaks(
+        string profileId, Provenance provenance, CommandLanguage language)
+    {
+        // docs/compatibility-brief.md §28. Provenance is not a confidence level and changes
+        // nothing about what a job reports; it answers a different question, before anything
+        // is printed -- should this printer's fence be trusted on the strength of its
+        // profile alone? Epson is the only family whose shipped defaults say Documented, and
+        // xp-s260m is Probed because that one unit answered GS ( H on the bench, which its
+        // manufacturer's documentation never promised (§14).
+        using var driver = TestDriver.Open();
+
+        // Attaching does not connect, so this reads the profile without a printer present.
+        var printer = driver.AddPrinterTcp(new TcpPrinterConfig("192.0.2.1",
+                                                                ProfileId: profileId));
+
+        Assert.Equal(provenance, printer.CompletionProvenance);
+        Assert.Equal(language, printer.Language);
+    }
+
     [Fact]
     public void AnUnreachablePrinterFailsTheJobRatherThanTheDriver()
     {

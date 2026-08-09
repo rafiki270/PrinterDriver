@@ -31,6 +31,7 @@ import 'src/allocation.dart';
 import 'src/bindings.dart';
 import 'src/enums.dart';
 import 'src/library_loader.dart';
+import 'src/transport.dart';
 import 'src/types.dart';
 
 export 'src/enums.dart';
@@ -40,6 +41,7 @@ export 'src/library_loader.dart'
         defaultLibraryFileName,
         loadPrinterDriverLibrary,
         printerDriverLibPathVariable;
+export 'src/transport.dart';
 export 'src/types.dart';
 
 /// An operation the native library refused, carrying the driver's own explanation.
@@ -125,6 +127,10 @@ final class PrinterDriver {
   final Map<int, PrintJob> _jobs = <int, PrintJob>{};
   final Map<int, Printer> _printers = <int, Printer>{};
 
+  /// Held for the driver's whole life: pd.h requires a custom transport's `ctx` and
+  /// function pointers to stay valid until `pd_destroy`.
+  final List<CustomTransport> _transports = <CustomTransport>[];
+
   bool _disposed = false;
 
   /// Whether [dispose] has run. Every other member throws once it has.
@@ -173,6 +179,49 @@ final class PrinterDriver {
     if (handle == nullptr) {
       throw PrinterDriverException(lastError);
     }
+    return _internPrinter(handle);
+  }
+
+  /// Adds a printer reached over a link the application owns — Bluetooth Classic SPP,
+  /// BLE, MFi, a vendor SDK channel, a USB bulk pipe (docs/compatibility-brief.md §25).
+  ///
+  /// The core drives it exactly as it drives a TCP printer: same ordered fence, same
+  /// preflight, same journal, same grading. See [CustomTransport] for the thread
+  /// contract and for why the three operations are native pointers.
+  ///
+  /// [profileId] takes the same ids as [addTcpPrinter]; an unknown one throws rather
+  /// than falling back to `generic`, because a caller that asked for a TM-T88VI and
+  /// silently got the unknown-device profile would be told a weaker completion story
+  /// than it asked for, with nothing in the result explaining why. Zero [widthDots]
+  /// means 576.
+  ///
+  /// The driver retains [transport] until [dispose], which is what keeps its `ctx` and
+  /// any Dart close hook alive for as long as the core may call them.
+  Printer addCustomPrinter(
+    CustomTransport transport, {
+    String? profileId,
+    int widthDots = 0,
+  }) {
+    _checkAlive();
+    final handle = Arena.using((arena) {
+      final vtable =
+          arena.allocate<PdTransportVtable>(sizeOf<PdTransportVtable>());
+      transport.fillNative(arena, vtable);
+      return _bindings.addPrinterCustom(
+        _handle,
+        vtable,
+        transport.ctx,
+        arena.string(profileId),
+        widthDots,
+      );
+    });
+    if (handle == nullptr) {
+      // Nothing took ownership, so the close hook would otherwise outlive its only
+      // possible caller.
+      transport.release();
+      throw PrinterDriverException(lastError);
+    }
+    _transports.add(transport);
     return _internPrinter(handle);
   }
 
@@ -254,6 +303,37 @@ final class PrinterDriver {
     return _internPrinter(handle);
   }
 
+  /// Test support: a scripted printer sitting on the far side of a transport vtable the
+  /// caller supplies, for exercising a Bluetooth or vendor-SDK link without hardware.
+  ///
+  /// The counterpart of [addScriptedPrinterForTesting] for the other half of
+  /// docs/compatibility-brief.md §25. That one scripts a device the core reaches on its
+  /// own; this one scripts a device the *application* reaches, so a POS integration can
+  /// test the transport it wrote — including that its `write` reports short writes
+  /// honestly — against a printer that answers the completion fence properly.
+  ///
+  /// [script] is `ok` (a healthy `GS ( H` printer) or `gsr1` (queued fence only). The
+  /// returned link owns a reader thread and is **not** owned by this driver: call
+  /// [ScriptedLink.destroy] after [dispose], never before, since the core may still be
+  /// writing to it until then.
+  ScriptedLink scriptedLinkForTesting({required String script}) {
+    _checkAlive();
+    if (!_bindings.hasTestSupport) {
+      throw PrinterDriverException(
+        'this native library exports no pd_test_link_create: it was built from '
+        'printerdriver_capi_shared, which by design carries no test doubles. Build '
+        'the printerdriver_capi_testing target and point PRINTERDRIVER_LIB_PATH at it.',
+      );
+    }
+    final handle = Arena.using(
+      (arena) => _bindings.testLinkCreate(arena.string(script)),
+    );
+    if (handle == nullptr) {
+      throw PrinterDriverException('unknown scripted link id: $script');
+    }
+    return ScriptedLink._(_bindings, handle);
+  }
+
   /// Stops every printer worker, waits for in-flight jobs to reach a terminal state and
   /// frees every handle this driver ever returned.
   ///
@@ -276,6 +356,12 @@ final class PrinterDriver {
     _jobs.clear();
     _printers.clear();
     _logCallback?.close();
+    // After pd_destroy, which has already closed every link: a close hook released
+    // while the core could still invoke it is a call into a freed trampoline.
+    for (final transport in _transports) {
+      transport.release();
+    }
+    _transports.clear();
   }
 
   Printer _internPrinter(Pointer<PdPrinter> handle) =>
@@ -315,6 +401,74 @@ final class Printer {
   CompletionMechanism get completion {
     _driver._checkAlive();
     return CompletionMechanism.fromNative(_bindings.printerCompletion(_handle));
+  }
+
+  /// What [completion] is worth before anything has been printed
+  /// (docs/compatibility-brief.md §28).
+  ///
+  /// Not a confidence level, and it changes nothing about what a job reports: it answers
+  /// the earlier question of whether this printer's fence should be trusted on the
+  /// strength of a profile alone. [Provenance.documented] means the manufacturer's own
+  /// command documentation lists the mechanism — in the shipped database, Epson and
+  /// nobody else. [Provenance.unverified] is what "ESC/POS compatible" on a datasheet
+  /// amounts to, and is the answer that makes running a probe against a site's actual
+  /// hardware worth the trip.
+  Provenance get completionProvenance {
+    _driver._checkAlive();
+    return Provenance.fromNative(
+        _bindings.printerCompletionProvenance(_handle));
+  }
+
+  /// The language this printer's profile is driven in.
+  ///
+  /// Anything but [CommandLanguage.escPos] is refused with
+  /// [FailureReason.unsupported] before a byte is written, so this is readable up front
+  /// rather than discovered from a failed job — or, worse, from a label roll spooled
+  /// with ESC/POS.
+  CommandLanguage get language {
+    _driver._checkAlive();
+    return CommandLanguage.fromNative(_bindings.printerLanguage(_handle));
+  }
+
+  /// Delivers bytes the link received, for a printer added with
+  /// [PrinterDriver.addCustomPrinter].
+  ///
+  /// Safe from any isolate and at any time, including while a job is being written —
+  /// that is the normal case, a status answer arriving as the next chunk goes out.
+  /// pd.h's one restriction, that this must never be called from inside the transport's
+  /// connect/write/close, cannot be violated from Dart: see [CustomTransport].
+  ///
+  /// False means nothing was listening — the core has not connected yet, has already
+  /// closed, or this printer is not a custom transport at all. That is information
+  /// rather than an error: bytes arriving with no reader are dropped, exactly as they
+  /// would be on a socket nobody is reading.
+  bool feedBytes(List<int> bytes) {
+    _driver._checkAlive();
+    if (bytes.isEmpty) return false;
+    return Arena.using(
+          (arena) => _bindings.transportFeedBytes(
+            _handle,
+            arena.bytes(bytes),
+            bytes.length,
+          ),
+        ) !=
+        0;
+  }
+
+  /// Reports that the link dropped for a reason other than an explicit close: the peer
+  /// went out of range, the OS tore the channel down, pairing was revoked.
+  ///
+  /// Surfaces as [DeviceEvent.connectionLost] and fails any job waiting on a fence
+  /// instead of leaving it to time out — the difference between an operator learning
+  /// now and learning after the completion budget expires. False when there was no live
+  /// transport to notify.
+  bool reportLinkDropped([String? message]) {
+    _driver._checkAlive();
+    return Arena.using(
+          (arena) =>
+              _bindings.transportLinkDropped(_handle, arena.string(message)),
+        ) !=
+        0;
   }
 
   /// The last known device state. A snapshot, never a live query, so it cannot block
@@ -525,6 +679,95 @@ final class ScriptedDevice {
               .testReceivedContains(_printer._handle, arena.string(needle)),
         ) !=
         0;
+  }
+}
+
+/// Test support: the scripted printer on the far side of a caller-supplied transport.
+///
+/// Backed by `capi/tests/pd_test_support.h`, which exists only in the library built from
+/// the `printerdriver_capi_testing` target. Its three operations have exactly the
+/// signatures `pd_transport_vtable` wants, so a test wires them up with
+/// [CustomTransport.fromLibrary] and the symbol names below — no forwarding shim.
+final class ScriptedLink {
+  ScriptedLink._(this._bindings, this._handle);
+
+  /// The symbol implementing `pd_transport_connect_fn` against this link.
+  static const String connectSymbol = 'pd_test_link_connect';
+
+  /// The symbol implementing `pd_transport_write_fn` against this link.
+  static const String writeSymbol = 'pd_test_link_write';
+
+  /// The symbol implementing `pd_transport_close_fn` against this link.
+  static const String closeSymbol = 'pd_test_link_close';
+
+  final PrinterDriverBindings _bindings;
+  final Pointer<PdTestLink> _handle;
+
+  bool _destroyed = false;
+
+  /// The `ctx` to register the transport with: the link is what the three operations
+  /// act on.
+  Pointer<Void> get ctx => _handle.cast<Void>();
+
+  /// Points the link's reader thread at [printer], so the responses it produces reach
+  /// the core.
+  ///
+  /// Call it after [PrinterDriver.addCustomPrinter]. The thread is the point: the
+  /// answers arrive from somewhere other than the thread that called `write`, which is
+  /// both what pd.h requires and what every real stack does.
+  void bindTo(Printer printer) {
+    _checkAlive();
+    _bindings.testLinkBind(_handle, printer._handle);
+  }
+
+  /// Makes the next connect fail, as an unpaired or out-of-range device would.
+  void refuseConnections() {
+    _checkAlive();
+    _bindings.testLinkRefuseConnections(_handle);
+  }
+
+  /// How many times the transport was asked to open the link.
+  int get connects => _count(_bindings.testLinkConnects);
+
+  /// How many times it was asked to close it.
+  int get closes => _count(_bindings.testLinkCloses);
+
+  /// Every byte the vtable's `write` was handed, framing included.
+  int get bytesWritten => _count(_bindings.testLinkBytesWritten);
+
+  /// How many cuts the scripted printer performed.
+  int get cuts => _count(_bindings.testLinkCuts);
+
+  /// Whether [needle] appears anywhere in what the scripted printer received.
+  bool received(String needle) {
+    _checkAlive();
+    return Arena.using(
+          (arena) =>
+              _bindings.testLinkReceivedContains(_handle, arena.string(needle)),
+        ) !=
+        0;
+  }
+
+  /// Stops the reader thread and frees the link. Idempotent.
+  ///
+  /// Only after the driver that used it has been disposed: until then the core may
+  /// still call `write` on it, and the counters above are the evidence a test asserts
+  /// on afterwards.
+  void destroy() {
+    if (_destroyed) return;
+    _destroyed = true;
+    _bindings.testLinkDestroy(_handle);
+  }
+
+  int _count(int Function(Pointer<PdTestLink>) read) {
+    _checkAlive();
+    return read(_handle);
+  }
+
+  void _checkAlive() {
+    if (_destroyed) {
+      throw StateError('this ScriptedLink has been destroyed');
+    }
   }
 }
 

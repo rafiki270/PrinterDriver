@@ -42,10 +42,20 @@ italic the hardware cannot do, a barcode this milestone does not draw, a model p
 is not there — comes back in a render report rather than disappearing. `pdctl render`
 prints that report and a character approximation of the paper without touching a printer.
 
-Not built yet: Bluetooth/USB/serial transports, the ePOS and StarPRNT transports (their
-profiles are data only — Star printers refuse honestly instead of printing unfenced),
-network discovery in the core, and the DSL's raster path (wrapper-side text rendering
-and barcode symbologies).
+**Bluetooth** goes through a custom-transport ABI rather than into the core
+([docs/compatibility-brief.md](docs/compatibility-brief.md) §25): the platform owns the
+socket — CoreBluetooth or ExternalAccessory on Apple, `BluetoothSocket` RFCOMM on
+Android, BlueZ on Linux — and the core owns the protocol, so a Bluetooth job gets the
+same fence, the same correlated token and the same grade a TCP job gets, and a wrapper
+cannot weaken a completion guarantee because a wrapper never makes one. The Apple and
+Android implementations are written and unit-tested against scripted transports; neither
+has been run against a paired printer, and the BlueZ transport is syntax-checked only
+(`scripts/check_linux_bluetooth_syntax.sh`).
+
+Not built yet: USB and serial transports, the ePOS and StarPRNT transports (their
+profiles are data only — Star, Zebra and Brother printers refuse honestly instead of
+printing unfenced), network discovery in the core, and the DSL's raster path
+(wrapper-side text rendering and barcode symbologies).
 
 The **Windows port** ([docs/platforms.md](docs/platforms.md)) is written but not built:
 the Winsock2 transport and the `FlushFileBuffers`/`ReplaceFile` journal path are
@@ -155,11 +165,25 @@ Every result names what backs it ([docs/device-database.md](docs/device-database
 
 | Grade | Meaning | Example |
 |---|---|---|
-| A | job-level confirmation from the mechanism | `GS ( H` echo, ePOS JobID |
+| A+ | a durable, queryable printer-side job | ePOS JobID with a retrievable result |
+| A | job-level confirmation from the mechanism | `GS ( H` echo, Star checked block |
 | B | ordered device response, weaker semantics | `GS r 1` |
 | C | device status around transmission | DLE EOT, ASB |
 | D | a spooler said completed | CUPS, Windows spooler |
 | E | transport only | TCP write succeeded |
+
+Nothing produces A+ yet — it needs the ePOS transport, which does not exist here. The
+grade is defined because these enums are closed and mirrored by four wrappers, so adding
+a member later would renumber every mirror a second time.
+
+Every capability in the device database also carries its **provenance**
+([docs/compatibility-brief.md](docs/compatibility-brief.md) §28): `Documented` where the
+manufacturer's own command documentation lists it, `Probed` where this driver asked the
+hardware and it answered, `Unverified` where neither. Epson is the only family whose
+shipped defaults claim Documented — it publishes a model-by-model ESC/POS applicability
+database naming `GS ( H` fn 48. "ESC/POS compatible" on anybody's datasheet is
+Unverified, and `pdctl probe` prints the documentation and the probe as two separate
+columns because either can say yes while the other says no.
 
 ## pdctl
 
@@ -196,12 +220,16 @@ core/include/printerdriver/   public headers
   response_parser.hpp         incremental parser for the interleaved return stream
   capability_profile.hpp      compositional profile: identity, transport, completion,
                               status, recovery, quirks, media
-  device_profiles.hpp         the device database, one entry per printer family
+  device_profiles.hpp         the device database: 83 entries across Epson, Star,
+                              Bixolon, Citizen, Rongta, Xprinter, Partner, Zebra and
+                              Brother, per family and per model
   identity.hpp                GS I parsing, MAC OUI table, multi-signal identify()
   capability_probe.hpp        non-destructive interrogation, findings, promotion,
                               and the findings cache
   job_store.hpp               append-only durable job journal
-  transport.hpp               Transport interface and the TCP implementation
+  transport.hpp               Transport interface, the TCP implementation, and the
+                              embedder-owned custom transport Bluetooth arrives through
+  transport_bluez.hpp         Linux BlueZ RFCOMM (syntax-checked only)
   driver.hpp                  PrinterDriver / Printer / PrintJob — the public API
 core/src/                     implementation
 core/tests/                   test harness, scriptable fake printer, test binaries

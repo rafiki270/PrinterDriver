@@ -40,6 +40,15 @@
 // Kotlin side of a different call (checking pd_job_is_terminal from a Flow collector's
 // own coroutine, never from inside the callback that feeds it).
 //
+// The custom-transport vtable (pd_add_printer_custom, docs/compatibility-brief.md §25)
+// runs the same way but in both directions, and the direction matters. connect/write/
+// close are calls INTO the JVM on the printer's worker thread, so they use the same
+// attach/detach path as the trampolines above and, like them, call no pd_* function.
+// pd_transport_feed_bytes is the opposite: a call OUT of the JVM from a thread this
+// wrapper created (a Kotlin transport's reader), which is the only place this file
+// enters the ABI from a thread the core does not own. That is why JniDriverHandle
+// carries a lifecycle mutex — see the comment on it.
+//
 // -- Handle representation -----------------------------------------------------------
 //
 // pd_printer* and pd_job* cross to Kotlin as `jlong` via a direct reinterpret_cast --
@@ -116,6 +125,23 @@ struct DeviceCallbackContext {
   jobject callbackGlobalRef = nullptr;
 };
 
+// One per pd_add_printer_custom registration; `this` is the `ctx` the core hands back to
+// every vtable call, so it must outlive the driver (pd.h: "`ctx` must remain alive until
+// pd_destroy"). Unlike the event trampolines, the method IDs are resolved once here
+// rather than per call: connect/write/close run on the printer's worker thread, and
+// `write` in particular sits on the byte path of every receipt, where a
+// GetObjectClass + GetMethodID pair per chunk would be pure overhead. Holding a global
+// ref to the class is what makes the cached jmethodIDs safe -- they stay valid only while
+// the class is not unloaded.
+struct CustomTransportContext {
+  JavaVM* jvm = nullptr;
+  jobject callbackGlobalRef = nullptr;
+  jclass callbackClassGlobalRef = nullptr;
+  jmethodID connectMethod = nullptr;
+  jmethodID writeMethod = nullptr;
+  jmethodID closeMethod = nullptr;
+};
+
 struct JniDriverHandle {
   pd_driver* driver = nullptr;
   JavaVM* jvm = nullptr;
@@ -124,6 +150,17 @@ struct JniDriverHandle {
   std::mutex callbacksMutex;
   std::vector<std::unique_ptr<JobCallbackContext>> jobCallbacks;
   std::vector<std::unique_ptr<DeviceCallbackContext>> deviceCallbacks;
+  std::vector<std::unique_ptr<CustomTransportContext>> transportCallbacks;
+
+  // Guards pd_transport_feed_bytes / pd_transport_link_dropped against pd_destroy.
+  // Those two are the only pd_* entry points this wrapper calls from a thread it does
+  // not control -- a custom transport's reader thread -- and pd_destroy frees every
+  // pd_printer handle, so a reader still running when the app calls close() would
+  // otherwise dereference freed memory. driverDestroy takes this lock only to set
+  // `destroyed`, then drops it before pd_destroy: a feed already inside the ABI finishes
+  // first, and no new one can start.
+  std::mutex lifecycleMutex;
+  bool destroyed = false;
 };
 
 JniDriverHandle* AsDriverHandle(jlong handle) {
@@ -269,6 +306,104 @@ void LogTrampoline(const char* message, void* ctx) {
   }
 }
 
+// --- Trampolines: pd_transport_vtable (docs/compatibility-brief.md §25) ---------------
+//
+// The platform owns the socket, the core owns the protocol. These three run on the
+// printer's worker thread, one at a time, never concurrently with each other -- pd.h's
+// thread contract above pd_transport_vtable -- so they need the same attach/detach
+// treatment as the event trampolines and, like those, never call back into any pd_*
+// function. Received bytes travel the other way, through
+// Java_..._transportFeedBytes below, on the Kotlin transport's own reader thread.
+//
+// A dropped callback is reported as a transport failure rather than silently swallowed:
+// returning "connected" or "wrote everything" because the JVM was unreachable would
+// manufacture exactly the unearned confidence the whole SDK exists to refuse.
+
+int32_t TransportConnectTrampoline(void* ctx) {
+  auto* transportCtx = static_cast<CustomTransportContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(transportCtx->jvm, &didAttach);
+  if (env == nullptr) {
+    return 0;
+  }
+
+  jboolean connected = JNI_FALSE;
+  if (transportCtx->connectMethod != nullptr) {
+    connected = env->CallBooleanMethod(transportCtx->callbackGlobalRef,
+                                       transportCtx->connectMethod);
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+      connected = JNI_FALSE; // An exception left the return value undefined.
+    }
+  }
+
+  if (didAttach) {
+    transportCtx->jvm->DetachCurrentThread();
+  }
+  return connected != JNI_FALSE ? 1 : 0;
+}
+
+int64_t TransportWriteTrampoline(void* ctx, const uint8_t* data, size_t size) {
+  auto* transportCtx = static_cast<CustomTransportContext*>(ctx);
+  if (data == nullptr || size == 0) {
+    return 0;
+  }
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(transportCtx->jvm, &didAttach);
+  if (env == nullptr) {
+    return -1;
+  }
+
+  int64_t written = -1;
+  jbyteArray buffer = env->NewByteArray(static_cast<jsize>(size));
+  if (buffer != nullptr && transportCtx->writeMethod != nullptr) {
+    // A fresh copy per write rather than a reused direct ByteBuffer: the Kotlin side is
+    // free to hand this array to a blocking OutputStream, and the core's `data` pointer
+    // is only guaranteed for the duration of this call.
+    env->SetByteArrayRegion(buffer, 0, static_cast<jsize>(size),
+                            reinterpret_cast<const jbyte*>(data));
+    const jint result = env->CallIntMethod(transportCtx->callbackGlobalRef,
+                                           transportCtx->writeMethod, buffer);
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+      written = -1;
+    } else {
+      written = static_cast<int64_t>(result);
+    }
+  }
+  if (buffer != nullptr) {
+    env->DeleteLocalRef(buffer);
+  }
+
+  if (didAttach) {
+    transportCtx->jvm->DetachCurrentThread();
+  }
+  return written;
+}
+
+void TransportCloseTrampoline(void* ctx) {
+  auto* transportCtx = static_cast<CustomTransportContext*>(ctx);
+  bool didAttach = false;
+  JNIEnv* env = AttachOrGetEnv(transportCtx->jvm, &didAttach);
+  if (env == nullptr) {
+    return;
+  }
+
+  if (transportCtx->closeMethod != nullptr) {
+    env->CallVoidMethod(transportCtx->callbackGlobalRef, transportCtx->closeMethod);
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+    }
+  }
+
+  if (didAttach) {
+    transportCtx->jvm->DetachCurrentThread();
+  }
+}
+
 // --- pd_device_status packing --------------------------------------------------------
 //
 // Packed as 9 ints, in exactly this field order, matching DeviceStatus.fromRaw on the
@@ -365,6 +500,15 @@ JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_driverDestro
   if (handle == nullptr) {
     return;
   }
+  // Close the door on the custom-transport reader threads before pd_destroy frees the
+  // pd_printer handles they feed. Set under the lock so a feed already inside the ABI
+  // completes first; released before pd_destroy, which itself blocks on those workers
+  // and must not be holding a lock a reader thread is waiting for.
+  {
+    std::lock_guard<std::mutex> lock(handle->lifecycleMutex);
+    handle->destroyed = true;
+  }
+
   // Stops every printer worker and waits for in-flight jobs to reach a terminal state
   // (pd_destroy's documented contract) -- no more callbacks can fire once this
   // returns, so releasing every GlobalRef below is safe.
@@ -375,6 +519,10 @@ JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_driverDestro
   }
   for (auto& callback : handle->deviceCallbacks) {
     env->DeleteGlobalRef(callback->callbackGlobalRef);
+  }
+  for (auto& transport : handle->transportCallbacks) {
+    env->DeleteGlobalRef(transport->callbackGlobalRef);
+    env->DeleteGlobalRef(transport->callbackClassGlobalRef);
   }
   if (handle->logCallbackGlobalRef != nullptr) {
     env->DeleteGlobalRef(handle->logCallbackGlobalRef);
@@ -434,6 +582,116 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_addPrinterT
 
   pd_printer* printer = pd_add_printer_tcp(handle->driver, &config);
   return printer != nullptr ? reinterpret_cast<jlong>(printer) : 0;
+}
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_addPrinterCustom(
+    JNIEnv* env, jclass, jlong driverHandle, jobject callback, jstring description,
+    jstring profileId, jint widthDots) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr || callback == nullptr) {
+    return 0;
+  }
+
+  auto context = std::make_unique<CustomTransportContext>();
+  context->jvm = handle->jvm;
+  context->callbackGlobalRef = env->NewGlobalRef(callback);
+
+  jclass localClass = env->GetObjectClass(callback);
+  context->callbackClassGlobalRef = static_cast<jclass>(env->NewGlobalRef(localClass));
+  // NativeTransportCallback.connect(): Boolean / write(data: ByteArray): Int / close():
+  // Unit -- see that interface's KDoc for the signature derivation.
+  context->connectMethod = env->GetMethodID(localClass, "connect", "()Z");
+  context->writeMethod = env->GetMethodID(localClass, "write", "([B)I");
+  context->closeMethod = env->GetMethodID(localClass, "close", "()V");
+  env->DeleteLocalRef(localClass);
+
+  if (context->connectMethod == nullptr || context->writeMethod == nullptr ||
+      context->closeMethod == nullptr) {
+    // Refuse the registration rather than register a transport that can only fail at
+    // the first write: an UnsatisfiedLinkError-shaped problem surfacing as a printer
+    // that mysteriously never connects is far harder to diagnose than a null handle.
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag,
+                         "NativeTransportCallback connect/write/close not found -- check "
+                         "consumer-rules.pro keep rules if R8 is enabled");
+    env->ExceptionClear();
+    env->DeleteGlobalRef(context->callbackGlobalRef);
+    env->DeleteGlobalRef(context->callbackClassGlobalRef);
+    return 0;
+  }
+
+  const std::string descriptionStorage = JStringToStd(env, description);
+  const std::string profileIdStorage = JStringToStd(env, profileId);
+
+  pd_transport_vtable vtable{};
+  vtable.connect = &TransportConnectTrampoline;
+  vtable.write = &TransportWriteTrampoline;
+  vtable.close = &TransportCloseTrampoline;
+  // Copied before pd_add_printer_custom returns (pd.h), so the local string is enough.
+  vtable.description = descriptionStorage.c_str();
+
+  CustomTransportContext* rawContext = context.get();
+  // Registered before the call, not after: pd_add_printer_custom starts the printer's
+  // worker thread, which can invoke TransportConnectTrampoline before this function
+  // returns. The context must already be reachable and fully built by then.
+  {
+    std::lock_guard<std::mutex> lock(handle->callbacksMutex);
+    handle->transportCallbacks.push_back(std::move(context));
+  }
+
+  pd_printer* printer =
+      pd_add_printer_custom(handle->driver, &vtable, rawContext,
+                            profileId != nullptr ? profileIdStorage.c_str() : nullptr,
+                            static_cast<uint32_t>(widthDots));
+  // A failed registration leaves its context in the vector rather than freeing it: the
+  // core may already have copied the pointer, and there is no pd_remove_printer to
+  // undo that. It is released with every other one in driverDestroy.
+  return printer != nullptr ? reinterpret_cast<jlong>(printer) : 0;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_printerdriver_internal_NativeBridge_transportFeedBytes(
+    JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jbyteArray data,
+    jint length) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr || data == nullptr || length <= 0) {
+    return JNI_FALSE;
+  }
+
+  // Held across the whole ABI call -- see JniDriverHandle::lifecycleMutex. This is the
+  // one pd_* call this wrapper makes from a thread the core does not own, so it is the
+  // one that has to be serialised against pd_destroy.
+  std::lock_guard<std::mutex> lock(handle->lifecycleMutex);
+  if (handle->destroyed) {
+    return JNI_FALSE;
+  }
+
+  jbyte* elements = env->GetByteArrayElements(data, nullptr);
+  if (elements == nullptr) {
+    return JNI_FALSE;
+  }
+  const jsize available = env->GetArrayLength(data);
+  const jsize count = length < available ? length : available;
+  const int32_t delivered = pd_transport_feed_bytes(
+      printer, reinterpret_cast<const uint8_t*>(elements), static_cast<size_t>(count));
+  env->ReleaseByteArrayElements(data, elements, JNI_ABORT); // read-only use.
+  return delivered != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_printerdriver_internal_NativeBridge_transportLinkDropped(
+    JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jstring message) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr) {
+    return JNI_FALSE;
+  }
+  const std::string messageStorage = JStringToStd(env, message);
+
+  std::lock_guard<std::mutex> lock(handle->lifecycleMutex);
+  if (handle->destroyed) {
+    return JNI_FALSE;
+  }
+  return pd_transport_link_dropped(printer, messageStorage.c_str()) != 0 ? JNI_TRUE
+                                                                        : JNI_FALSE;
 }
 
 JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_printerId(

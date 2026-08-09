@@ -31,6 +31,8 @@ final class EnumBridgeTests: XCTestCase {
     assertCount(Binarization.self, PD_BINARIZATION_COUNT.rawValue)
     assertCount(ConfidenceGrade.self, PD_GRADE_COUNT.rawValue)
     assertCount(CompletionAuthority.self, PD_AUTHORITY_COUNT.rawValue)
+    assertCount(Provenance.self, PD_PROVENANCE_COUNT.rawValue)
+    assertCount(CommandLanguage.self, PD_LANGUAGE_COUNT.rawValue)
   }
 
   func testEveryMirroredEnumMatchesTheCoreMemberForMember() {
@@ -173,8 +175,35 @@ final class EnumBridgeTests: XCTestCase {
       ConfidenceGrade.allCases.map(\.abiName), PD_TEST_ENUM_CONFIDENCE_GRADE)
     assertSpellings(
       CompletionAuthority.allCases.map(\.abiName), PD_TEST_ENUM_COMPLETION_AUTHORITY)
-    // "A".."E", the letter a report tabulates, straight from the ABI.
-    XCTAssertEqual(ConfidenceGrade.allCases.map(\.letter), ["A", "B", "C", "D", "E"])
+    // "A+", "A".."E", the letter a report tabulates, straight from the ABI.
+    XCTAssertEqual(ConfidenceGrade.allCases.map(\.letter), ["A+", "A", "B", "C", "D", "E"])
+    // Provenance and CommandLanguage have no kAll* array reachable from this target, so
+    // their spellings are checked against the ABI's own name tables instead.
+    XCTAssertEqual(Provenance.allCases.map(\.abiName), ["Documented", "Probed", "Unverified"])
+    XCTAssertEqual(
+      CommandLanguage.allCases.map(\.abiName),
+      ["EscPos", "StarPrnt", "StarLine", "EposXml", "Zpl", "Cpcl", "BrotherRaster", "EscP"])
+  }
+
+  func testGradeHierarchyGainedAPlusWithoutRenumberingAnythingElseWrongly() {
+    // docs/compatibility-brief.md §24. A+ takes value 0 and A..E shift by one, so the
+    // enum still reads strongest-first and a caller can compare grades numerically.
+    XCTAssertEqual(ConfidenceGrade.aPlusDurableQueryableJob.rawValue, 0)
+    XCTAssertEqual(ConfidenceGrade.aJobLevelConfirmation.rawValue, 1)
+    XCTAssertEqual(ConfidenceGrade.eTransportOnly.rawValue, 5)
+    XCTAssertEqual(ConfidenceGrade.allCases.count, 6)
+    XCTAssertTrue(
+      ConfidenceGrade.aPlusDurableQueryableJob.rawValue
+        < ConfidenceGrade.aJobLevelConfirmation.rawValue)
+    XCTAssertEqual(
+      ConfidenceGrade.aPlusDurableQueryableJob.abiName, "APlus_DurableQueryableJob")
+
+    // Nothing produces A+ yet: the ePOS transport that would retrieve a JobID result does
+    // not exist. Asserting the absence keeps the claim honest until it does, at which
+    // point this test has to change deliberately rather than drift.
+    XCTAssertEqual(
+      ConfidenceGrade.aPlusDurableQueryableJob.rawValue,
+      PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB.rawValue)
   }
 
   // MARK: - The awkward corners
@@ -214,6 +243,8 @@ final class EnumBridgeTests: XCTestCase {
     assertBridgesEveryMember(Binarization.self)
     assertBridgesEveryMember(ConfidenceGrade.self)
     assertBridgesEveryMember(CompletionAuthority.self)
+    assertBridgesEveryMember(Provenance.self)
+    assertBridgesEveryMember(CommandLanguage.self)
   }
 
   func testUnrecognizedFallbacksNeverClaimMoreThanIsKnown() {
@@ -231,6 +262,8 @@ final class EnumBridgeTests: XCTestCase {
     XCTAssertEqual(Preflight.unrecognizedFallback, .strict)
     XCTAssertEqual(ConfidenceGrade.unrecognizedFallback, .eTransportOnly)
     XCTAssertEqual(CompletionAuthority.unrecognizedFallback, .transportOnly)
+    // An unrecognized provenance has established nothing, which is exactly Unverified.
+    XCTAssertEqual(Provenance.unrecognizedFallback, .unverified)
   }
 
   // MARK: - Helpers

@@ -38,6 +38,49 @@ size_t pd_test_print_data_bytes(pd_printer* printer);
 size_t pd_test_cuts(pd_printer* printer);
 int pd_test_received_contains(pd_printer* printer, const char* needle);
 
+/* --- Scripted link behind a caller-supplied transport vtable ---------------------- */
+
+/*
+ * The other half of the custom-transport test (docs/compatibility-brief.md §25). The C
+ * test writes the pd_transport_vtable itself — that is the thing under test — and this
+ * object plays the printer on the far side of it.
+ *
+ * It exists because the responses have to come back on a DIFFERENT thread from the one
+ * that called write(), which is both what pd.h requires and what every real Bluetooth
+ * stack does (a CoreBluetooth delegate queue, an Android reader thread, a BlueZ recv
+ * loop). A C11 test cannot portably spawn a thread, so the thread lives here, in C++,
+ * next to the scripted device it is pumping. Nothing about the ABI under test is
+ * hidden by that: the vtable, the ctx, the pd_add_printer_custom call and the assertions
+ * are all in test_capi.c.
+ *
+ * Usage: create, pd_add_printer_custom with a vtable that forwards to
+ * pd_test_link_connect/write/close, then pd_test_link_bind so the reader thread knows
+ * which printer to feed. Destroy after pd_destroy.
+ */
+typedef struct pd_test_link pd_test_link;
+
+/* script_id: "ok" (GS ( H, healthy) or "gsr1" (queued fence only). NULL for unknown. */
+pd_test_link* pd_test_link_create(const char* script_id);
+void pd_test_link_destroy(pd_test_link* link);
+
+/* Tells the reader thread where to deliver bytes. Call after pd_add_printer_custom. */
+void pd_test_link_bind(pd_test_link* link, pd_printer* printer);
+
+/* Make the next connect fail, as an unpaired or out-of-range device would. */
+void pd_test_link_refuse_connections(pd_test_link* link);
+
+/* The three operations a vtable forwards to. */
+int32_t pd_test_link_connect(pd_test_link* link);
+int64_t pd_test_link_write(pd_test_link* link, const uint8_t* data, size_t size);
+void pd_test_link_close(pd_test_link* link);
+
+/* What the scripted printer on the far side saw. */
+size_t pd_test_link_connects(pd_test_link* link);
+size_t pd_test_link_closes(pd_test_link* link);
+size_t pd_test_link_bytes_written(pd_test_link* link);
+size_t pd_test_link_cuts(pd_test_link* link);
+int pd_test_link_received_contains(pd_test_link* link, const char* needle);
+
 /* --- Enum bridge ------------------------------------------------------------------ */
 
 typedef enum pd_test_enum {
