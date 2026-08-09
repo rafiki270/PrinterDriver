@@ -12,6 +12,7 @@
 // their own, because a wrapper that only serializes documents should not have to
 // compile the renderer.
 
+#include "printerdriver/dsl/barcode.hpp"
 #include "printerdriver/dsl/bind.hpp"
 #include "printerdriver/dsl/document.hpp"
 #include "printerdriver/dsl/format.hpp"

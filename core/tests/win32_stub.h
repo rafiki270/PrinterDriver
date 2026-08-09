@@ -102,6 +102,9 @@ constexpr int AF_UNSPEC = 0;
 constexpr int AF_INET = 2;
 constexpr int AF_INET6 = 23;
 constexpr int SOCK_STREAM = 1;
+// Discovery's local-subnet probe opens a connected UDP socket to ask the routing table
+// which source address a remote one would use; it never transmits (core/src/discovery.cpp).
+constexpr int SOCK_DGRAM = 2;
 constexpr int IPPROTO_TCP = 6;
 constexpr int SOL_SOCKET = 0xffff;
 constexpr int SO_ERROR = 0x1007;

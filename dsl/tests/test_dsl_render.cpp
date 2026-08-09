@@ -211,6 +211,9 @@ PD_TEST(qr_feed_cut_and_drawer_reach_the_encoder) {
       .qr("7F3A-92C1", 6, pd::escpos::QrErrorCorrection::M)
       .feedLines(2)
       .feedDots(48)
+      // The blade clearance, fed immediately before every cut this renderer emits —
+      // the same max(profile, caller) rule the engine applies to the trailing cut.
+      .feedDots(RenderProfile::forWidth(576).head_to_cutter_feed_dots)
       .cut(pd::escpos::CutMode::Partial)
       .kickCashDrawer(0, 25, 25)
       .align(pd::escpos::Alignment::Left)
@@ -229,21 +232,103 @@ PD_TEST(a_cut_as_the_final_block_is_noted_not_dropped) {
   CHECK_EQ(bytes[bytes.size() - 1], static_cast<uint8_t>(0x00));
 }
 
-PD_TEST(barcodes_are_declared_missing_never_silently_dropped) {
+PD_TEST(an_ean13_block_reaches_the_wire_as_gs_k) {
   const char* source =
       R"({"blocks":[{"text":"before"},)"
-      R"({"barcode":"5901234123457","symbology":"ean13","hri":"below"},)"
+      R"({"barcode":"5901234123457","symbology":"ean13","hri":"below",)"
+      R"("height":64,"moduleWidth":2},)"
+      R"({"text":"after"}]})";
+  const RenderOutput output = render(parseDocument(source), at(576));
+  CHECK(output.report.empty());
+  CHECK_BYTES(output.bytes(), 'b', 'e', 'f', 'o', 'r', 'e', 0x0A,
+              0x1D, 0x68, 0x40,        // GS h 64
+              0x1D, 0x77, 0x02,        // GS w 2
+              0x1D, 0x48, 0x02,        // GS H 2 — HRI below
+              0x1D, 0x6B, 0x43, 0x0D,  // GS k 67 13 — EAN-13
+              '5', '9', '0', '1', '2', '3', '4', '1', '2', '3', '4', '5', '7',
+              'a', 'f', 't', 'e', 'r', 0x0A);
+}
+
+PD_TEST(a_code128_block_reaches_the_wire_in_the_optimised_subset) {
+  const char* source =
+      R"({"blocks":[{"barcode":"ORDER-7F3A","symbology":"code128","align":"center"}]})";
+  const RenderOutput output = render(parseDocument(source), at(576));
+  CHECK(output.report.empty());
+  CHECK_BYTES(output.bytes(), 0x1B, 0x61, 0x01,  // ESC a 1 — centred
+              0x1D, 0x68, 0x40, 0x1D, 0x77, 0x02, 0x1D, 0x48, 0x00,
+              0x1D, 0x6B, 0x49, 0x0C,  // GS k 73 12 — Code 128
+              0x7B, 0x42, 'O', 'R', 'D', 'E', 'R', '-', '7', 'F', '3', 'A');
+}
+
+PD_TEST(unsupported_symbologies_are_declared_missing_never_silently_dropped) {
+  const char* source =
+      R"({"blocks":[{"text":"before"},)"
+      R"({"barcode":"5901234123457","symbology":"pdf417","hri":"below"},)"
       R"({"text":"after"}]})";
   const RenderOutput output = render(parseDocument(source), at(576));
   CHECK_EQ(output.report.count(ReportKind::UnsupportedBlock), static_cast<size_t>(1));
   const ReportEntry& entry = output.report.entries.front();
   CHECK_EQ(entry.block, std::string("blocks[1]"));
-  CHECK_EQ(entry.requested, std::string("barcode:ean13 \"5901234123457\""));
+  CHECK_EQ(entry.requested, std::string("barcode:pdf417 \"5901234123457\""));
   CHECK_EQ(entry.delivered, std::string("omitted"));
   CHECK(entry.path == RenderPath::NotRendered);
   // The surrounding receipt is unaffected.
   CHECK_BYTES(output.bytes(), 'b', 'e', 'f', 'o', 'r', 'e', 0x0A, 'a', 'f', 't', 'e', 'r',
               0x0A);
+}
+
+PD_TEST(barcode_data_the_symbology_refuses_is_declared_not_half_drawn) {
+  // A wrong EAN check digit would otherwise print a scannable symbol for the wrong
+  // article: nothing is emitted, and the reason says which digit was expected.
+  const RenderOutput output = render(
+      parseDocument(R"({"blocks":[{"barcode":"5901234123450","symbology":"ean13"}]})"),
+      at(576));
+  CHECK_EQ(output.report.count(ReportKind::UnsupportedBlock), static_cast<size_t>(1));
+  CHECK(output.report.entries.front().detail.find("expected 7") != std::string::npos);
+  CHECK(output.bytes().empty());
+
+  // A profile with no barcode support declares the omission the same way.
+  RenderOptions no_barcodes = at(576);
+  no_barcodes.profile.barcodes = false;
+  const RenderOutput off = render(
+      parseDocument(R"({"blocks":[{"barcode":"96385074","symbology":"ean8"}]})"),
+      no_barcodes);
+  CHECK_EQ(off.report.count(ReportKind::UnsupportedBlock), static_cast<size_t>(1));
+  CHECK(off.bytes().empty());
+}
+
+PD_TEST(a_mid_document_cut_feeds_the_blade_clearance_first) {
+  // kimix finding: the trailing cut cleared the head-to-blade gap and a mid-document
+  // cut did not, so a two-ticket document clipped the bottom of every ticket but the
+  // last. Same max() rule, same unconditional floor.
+  RenderOptions options = at(576);
+  options.profile.head_to_cutter_feed_dots = 150;
+  const RenderOutput output = render(
+      parseDocument(R"({"blocks":[{"text":"a"},{"cut":"partial"},{"text":"b"}]})"),
+      options);
+  CHECK_BYTES(output.bytes(), 'a', 0x0A,
+              0x1B, 0x4A, 0x96,  // ESC J 150 — the clearance
+              0x1D, 0x56, 0x01,  // GS V 1 — partial cut
+              'b', 0x0A);
+
+  // A caller asking for more whitespace gets it; asking for less is refused, because
+  // the clearance floor is what stops the blade from taking the last content line.
+  options.cut_clearance_dots = 200;
+  const RenderOutput wider = render(
+      parseDocument(R"({"blocks":[{"cut":"partial"}]})"), options);
+  CHECK_BYTES(wider.bytes(), 0x1B, 0x4A, 0xC8, 0x1D, 0x56, 0x01);
+
+  options.cut_clearance_dots = 8;
+  const RenderOutput floored = render(
+      parseDocument(R"({"blocks":[{"cut":"partial"}]})"), options);
+  CHECK_BYTES(floored.bytes(), 0x1B, 0x4A, 0x96, 0x1D, 0x56, 0x01);
+}
+
+PD_TEST(the_blade_clearance_comes_from_the_capability_profile) {
+  pd::CapabilityProfile capability;
+  capability.media.head_to_cutter_feed_dots = 96;
+  const RenderProfile profile = RenderProfile::from(capability, 576);
+  CHECK_EQ(profile.head_to_cutter_feed_dots, static_cast<uint16_t>(96));
 }
 
 PD_TEST(images_render_through_the_encoder_raster_path) {
@@ -345,7 +430,7 @@ PD_TEST(the_preview_and_the_bytes_come_from_one_layout_pass) {
   CHECK_EQ(preview.lines[1], std::string("a") + std::string(27, ' ') + "   1");
   CHECK_EQ(preview.lines[2], std::string("[qr 4/M \"x\"]"));
   CHECK_EQ(preview.lines[3], std::string());
-  CHECK_EQ(preview.lines[5], std::string("[cut partial]"));
+  CHECK_EQ(preview.lines[5], std::string("[cut partial after 120 dots clearance]"));
   CHECK_EQ(preview.lines[6], std::string("[raw 1 bytes]"));
   CHECK(preview.text().find("[qr 4/M \"x\"]\n") != std::string::npos);
 }

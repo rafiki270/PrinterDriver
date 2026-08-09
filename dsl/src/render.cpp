@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "printerdriver/dsl/barcode.hpp"
 #include "printerdriver/dsl/text.hpp"
 
 namespace pd::dsl {
@@ -263,6 +264,14 @@ class Layout {
         op.kind = LayoutOp::Kind::Cut;
         op.cut = block.cut;
         op.source = where;
+        // The print head sits ahead of the blade, so content printed right up to a cut
+        // is sliced by the mechanism meant to free it. The engine feeds
+        // max(head_to_cutter_feed_dots, bottom_feed_dots) before its trailing cut
+        // (docs/receipt-dsl.md "Margins"); a mid-document cut is the same geometry and
+        // gets the same max(), with the caller's figure in place of the job's.
+        op.cut_clearance_dots =
+            std::max<uint32_t>(options_.profile.head_to_cutter_feed_dots,
+                               options_.cut_clearance_dots);
         out_->ops.push_back(std::move(op));
         return;
       }
@@ -323,14 +332,7 @@ class Layout {
         return;
       }
       case Block::Kind::Barcode:
-        // docs/receipt-dsl.md degradation rules: nothing silently disappears. The
-        // symbology commands are a later milestone, so the block is declared missing
-        // rather than dropped or half-drawn.
-        out_->report.add(ReportKind::UnsupportedBlock, where,
-                         std::string("barcode:") + to_string(block.symbology) + " \"" +
-                             block.content + "\"",
-                         "omitted", RenderPath::NotRendered,
-                         "barcode rendering is not implemented in this milestone");
+        barcode(block, where);
         return;
       case Block::Kind::Image:
         image(block, where);
@@ -391,6 +393,78 @@ class Layout {
       emitText(text::pad(line, line_columns, Align::Left), style, line_columns, true,
                where);
     }
+  }
+
+  // docs/receipt-dsl.md degradation rules: nothing silently disappears. A symbology
+  // this build cannot emit, and data the symbology refuses, both leave a declared
+  // entry and no bytes — never a half-drawn symbol, which would scan as something.
+  void barcode(const Block& block, const std::string& where) {
+    const std::string requested = std::string("barcode:") +
+                                  to_string(block.symbology) + " \"" + block.content +
+                                  "\"";
+    if (!options_.profile.barcodes) {
+      out_->report.add(ReportKind::UnsupportedBlock, where, requested, "omitted",
+                       RenderPath::NotRendered, "this profile has no barcode support");
+      return;
+    }
+    if (!isBarcodeSupported(block.symbology)) {
+      out_->report.add(ReportKind::UnsupportedBlock, where, requested, "omitted",
+                       RenderPath::NotRendered,
+                       "the hardware path implements code128, ean13 and ean8");
+      return;
+    }
+    const BarcodeEncoding encoding = encodeBarcode(block.symbology, block.content);
+    if (!encoding.ok) {
+      out_->report.add(ReportKind::UnsupportedBlock, where, requested, "omitted",
+                       RenderPath::NotRendered, encoding.message);
+      return;
+    }
+
+    bool clamped = false;
+    std::vector<uint8_t> command =
+        barcodeCommands(encoding, block.barcode_height_dots, block.barcode_module_width,
+                        block.hri, &clamped);
+    if (command.empty()) {
+      out_->report.add(ReportKind::UnsupportedBlock, where, requested, "omitted",
+                       RenderPath::NotRendered, "the symbol produced no command bytes");
+      return;
+    }
+    if (clamped) {
+      out_->report.add(ReportKind::Truncated, where,
+                       "height " + std::to_string(block.barcode_height_dots) +
+                           " dots, module width " +
+                           std::to_string(block.barcode_module_width),
+                       "clamped to the GS h / GS w operand ranges",
+                       RenderPath::Hardware, "height 1..255, module width 1..6");
+    }
+
+    const int module_width = std::clamp(block.barcode_module_width, 1, 6);
+    const int64_t symbol_dots = static_cast<int64_t>(encoding.modules) * module_width;
+    if (symbol_dots > static_cast<int64_t>(options_.profile.width_dots)) {
+      // Still emitted: the printer prints what it can, and an operator who can see the
+      // clipped symbol and read this line knows to lower the module width.
+      out_->report.add(ReportKind::Note, where, requested, "emitted", RenderPath::Hardware,
+                       "about " + std::to_string(symbol_dots) + " dots wide at module " +
+                           std::to_string(module_width) + ", wider than the " +
+                           std::to_string(options_.profile.width_dots) + " dot media");
+    }
+    if (encoding.text != block.content) {
+      // EAN with the check digit computed for the caller.
+      out_->report.add(ReportKind::Note, where, requested, encoding.text,
+                       RenderPath::Hardware, "check digit computed");
+    }
+
+    LayoutOp op;
+    op.kind = LayoutOp::Kind::Barcode;
+    op.source = where;
+    op.style.align = block.align;
+    op.symbology = block.symbology;
+    op.barcode_height_dots = std::clamp(block.barcode_height_dots, 1, 255);
+    op.barcode_module_width = module_width;
+    op.hri = block.hri;
+    op.barcode_command = std::move(command);
+    op.barcode_text = encoding.text;
+    out_->ops.push_back(std::move(op));
   }
 
   void image(const Block& block, const std::string& where) {
@@ -590,6 +664,7 @@ RenderProfile RenderProfile::from(const CapabilityProfile& capability,
   profile.dpi = capability.media.dpi;
   profile.code_page = capability.code_page;
   profile.cutter = capability.media.cutter;
+  profile.head_to_cutter_feed_dots = capability.media.head_to_cutter_feed_dots;
   return profile;
 }
 
@@ -655,10 +730,18 @@ RenderOutput render(const Document& document, const RenderOptions& options) {
                                static_cast<uint8_t>(op.drawer_pulse),
                                static_cast<uint8_t>(op.drawer_pulse));
         break;
+      case LayoutOp::Kind::Barcode:
+        out.ops.align(toEncoderAlignment(op.style.align));
+        out.ops.raw(op.barcode_command);
+        break;
       case LayoutOp::Kind::Raw:
         out.ops.raw(op.raw);
         break;
       case LayoutOp::Kind::Cut:
+        if (op.cut_clearance_dots > 0) {
+          out.ops.feedDots(
+              static_cast<uint16_t>(std::min<uint32_t>(op.cut_clearance_dots, 0xFFFF)));
+        }
         out.ops.cut(op.cut == CutKind::Full ? escpos::CutMode::Full
                                             : escpos::CutMode::Partial);
         break;
@@ -700,11 +783,20 @@ TextPreview renderText(const Document& document, const RenderOptions& options) {
       case LayoutOp::Kind::DrawerKick:
         preview.lines.push_back("[drawer kick pin " + std::to_string(op.drawer_pin) + "]");
         break;
+      case LayoutOp::Kind::Barcode:
+        preview.lines.push_back(std::string("[barcode ") + to_string(op.symbology) +
+                                " \"" + op.barcode_text + "\" hri:" +
+                                to_string(op.hri) + "]");
+        break;
       case LayoutOp::Kind::Raw:
         preview.lines.push_back("[raw " + std::to_string(op.raw.size()) + " bytes]");
         break;
       case LayoutOp::Kind::Cut:
-        preview.lines.push_back(op.cut == CutKind::Full ? "[cut full]" : "[cut partial]");
+        // The clearance is part of what the cut does, so it rides on the cut's own
+        // marker rather than becoming blank lines the paper will not actually show.
+        preview.lines.push_back(
+            std::string(op.cut == CutKind::Full ? "[cut full" : "[cut partial") +
+            " after " + std::to_string(op.cut_clearance_dots) + " dots clearance]");
         break;
     }
   }

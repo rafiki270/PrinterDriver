@@ -40,6 +40,13 @@ struct RenderProfile {
   bool images = true;
   bool cutter = true;
   bool drawer_kick = true;
+  bool barcodes = true;
+
+  // The blade-clearance floor of docs/receipt-dsl.md "Margins", taken from the
+  // capability profile's media. Every cut this renderer emits is preceded by at least
+  // this much feed, exactly as the engine does for the trailing cut — a mid-document
+  // cut clips content just as happily as a final one.
+  uint16_t head_to_cutter_feed_dots = 120;
 
   uint32_t charDots(const ResolvedStyle& style) const noexcept;
   uint32_t charsPerLine(const ResolvedStyle& style) const noexcept;
@@ -66,12 +73,18 @@ struct RenderOptions {
   bool emit_initialize = false;
   bool emit_code_page = true;
   uint32_t max_rows_per_band = 1024;
+
+  // A caller's own whitespace before a mid-document cut, in the same relationship to
+  // the profile as JobOptions::bottom_feed_dots has to the engine's trailing cut: the
+  // renderer feeds max(profile.head_to_cutter_feed_dots, cut_clearance_dots). More is
+  // always granted, less is never — no setting can reintroduce a clipped ticket.
+  uint16_t cut_clearance_dots = 0;
 };
 
 // One laid-out operation. Text ops carry a finished visual line: columns arrive already
 // padded, plain text does not (the printer's own ESC a does the alignment).
 struct LayoutOp {
-  enum class Kind { Text, Feed, Qr, Image, DrawerKick, Raw, Cut };
+  enum class Kind { Text, Feed, Qr, Image, Barcode, DrawerKick, Raw, Cut };
 
   Kind kind = Kind::Text;
   std::string source;  // "blocks[3]"
@@ -94,11 +107,24 @@ struct LayoutOp {
   uint32_t target_width_dots = 0;
   Dither dither = Dither::FloydSteinberg;
 
+  // Barcode. `barcode_command` is the finished GS h / GS w / GS H / GS k block, so the
+  // symbology encoder runs once, during layout, and both the byte path and the preview
+  // read the same answer.
+  Symbology symbology = Symbology::Code128;
+  int barcode_height_dots = 64;
+  int barcode_module_width = 2;
+  Hri hri = Hri::None;
+  std::vector<uint8_t> barcode_command;
+  std::string barcode_text;  // what the symbol says, check digit included
+
   int drawer_pin = 0;
   int drawer_pulse = 25;
 
   std::vector<uint8_t> raw;
   CutKind cut = CutKind::Partial;
+  // max(profile.head_to_cutter_feed_dots, options.cut_clearance_dots), fed immediately
+  // before the cut command.
+  uint32_t cut_clearance_dots = 0;
 };
 
 // docs/receipt-dsl.md "Margins": resolved to dots at the profile's dpi. `topDots` wins

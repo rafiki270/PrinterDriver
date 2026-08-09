@@ -46,14 +46,21 @@ flags=(
   -I "${root}/core/tests"
   -I "${root}/capi/include"
   -I "${root}/queue/include"
+  -I "${root}/dsl/include"
+  -I "${root}/agent/include"
 )
 
 # Every translation unit that either is Windows-only or contains a Windows branch.
+# discovery.cpp and the agent's HTTP server are here because both open sockets directly
+# through printerdriver/net_platform.hpp rather than through TcpTransport.
 sources=(
   core/src/transport_win.cpp
   core/src/platform_file_win.cpp
   core/src/job_store.cpp
   core/src/capability_probe.cpp
+  core/src/discovery.cpp
+  agent/src/http.cpp
+  agent/src/agent.cpp
   core/tests/test_engine.cpp
   core/tests/test_store.cpp
 )

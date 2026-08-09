@@ -32,7 +32,8 @@ enum class ReportKind {
   UnknownStyle,         // style: "h1" with no such named style
   StyleCycle,           // extends chain that loops
   UnsupportedStyle,     // italic, rotate90, a raster font on the hardware path
-  UnsupportedBlock,     // barcode in this milestone, or an unbound control block
+  UnsupportedBlock,     // a symbology this build cannot draw, a block the profile has
+                        // no hardware for, or an unbound control block
   MissingImage,         // image ref with no asset supplied
   Truncated,            // content clipped to fit the media width
   EmptyIteration,       // each over a missing or non-array path
