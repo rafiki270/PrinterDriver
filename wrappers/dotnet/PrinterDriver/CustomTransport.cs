@@ -119,7 +119,7 @@ public sealed class CustomTransportPrinter
     public unsafe bool FeedBytes(ReadOnlySpan<byte> data)
     {
         TransportBinding.ThrowIfInsideCallback(nameof(FeedBytes));
-        _ = _driver.Handle;
+        EnsureDriverAlive();
         if (data.IsEmpty)
         {
             return false;
@@ -148,10 +148,15 @@ public sealed class CustomTransportPrinter
     public bool LinkDropped(string message = "link dropped")
     {
         TransportBinding.ThrowIfInsideCallback(nameof(LinkDropped));
-        _ = _driver.Handle;
+        EnsureDriverAlive();
         return NativeMethods.pd_transport_link_dropped(Printer.Handle, message ?? "link dropped")
             != 0;
     }
+
+    // The only disposal check available to these two calls: they take a printer handle, and
+    // it is pd_destroy that frees printer handles, so the driver is what has to still be
+    // there. Reading its handle throws when it is not.
+    private void EnsureDriverAlive() => _ = _driver.Handle;
 }
 
 /// <summary>

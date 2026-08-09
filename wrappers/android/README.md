@@ -97,7 +97,12 @@ In priority order -- this is the actual risk list, not a formality:
    `NativeBridge.kt`/`NativeCallbacks.kt` actually avoids Kotlin's internal-member name
    mangling** the way its code comments assert. This determines whether the
    `Java_com_printerdriver_internal_NativeBridge_*` symbol names match what Kotlin
-   actually emits; it was not checked against real `kotlinc` bytecode output.
+   actually emits; it was not checked against real `kotlinc` bytecode output. The same
+   question, one step harder, for `BluetoothSppTransport`: it is an *internal class*, and
+   Kotlin mangles members of internal classes. Its `connect`/`write`/`close` are
+   `override`s, which cannot be mangled without breaking the override -- the same reason
+   an internal Kotlin class can implement `java.lang.Runnable` and still produce a
+   callable `run()`. Sound, and unread in any `javap` output.
 6. **`kotlinx-coroutines-android`'s `Dispatchers.Main` resolves at runtime** (needed by
    `Printer.send`'s closure sugar and `PrinterDriver`'s internal scope).
 7. **Every enum's `Bitmap.Config.ARGB_8888` byte-order assumption** in
