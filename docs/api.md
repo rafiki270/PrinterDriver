@@ -429,3 +429,33 @@ degradations on the ticket itself (e.g. "BARCODE: not supported on this path"). 
 printer's own built-in self-test (`GS ( A`, `DC2 T`) remains separately reachable as
 `pdctl test-print` — vendor firmware's view vs. this, the SDK's view. Agent endpoints:
 `POST /printers/<id>/self-test`, `POST /autodetect`.
+
+## 16. Custom method registration (extensibility)
+
+Integrators can extend the SDK at runtime without forking it. Registration points, all
+per-driver-instance, all data-plus-callbacks (no subclassing across the ABI):
+
+- **Custom completion mechanism** — `driver.registerCompletionMethod(id, {fenceBytes:
+  fn(jobToken) -> bytes, matcher: fn(incoming bytes) -> Matched(token)|NotMine,
+  grade, authority, method-name})`: the engine sends the fence behind the payload and
+  attributes the matched response exactly like GS ( H. This is how a vendor-specific
+  idle/ack scheme (e.g. a confirmed Xprinter ESC x contract) becomes a first-class
+  grade-A path without a core release. Registered mechanisms appear in profiles as
+  `CompletionMechanism::VendorIdle` + the registered id.
+- **Custom probe step** — `registerProbeStep(id, {request bytes (MUST be
+  non-printing — declared, and enforced by a printable-byte lint), classify: fn(response)
+  -> finding})`: extends `probe`/`autoDetect` fingerprinting for house-specific quirks.
+- **Custom document block** — `registerBlockHandler(kind, fn(block json, profile) ->
+  encoder ops | degradation entry)`: new DSL block types (loyalty stamps, local fiscal
+  fields) render through the same pipeline and report degradations the same way.
+- **Custom formatter** — `registerFormatter(name, fn(value, args, locale) -> string)`
+  for `{{v|name:...}}` in templates.
+- **Custom drawer kick method** — `registerDrawerKick(id, {kickBytes: fn(channel,
+  pulseMs), statusRead?: ...})` filling `DrawerKickMethod::VENDOR`.
+- **Custom transports** — already available via the vtable ABI (§ M13b) — this section
+  completes the set.
+
+Rules: registrations are process-local (never persisted into shared journals beyond
+their ids), ids are namespaced strings (`"acme.x-idle"`), and anything a registration
+claims (grade, authority) is attributed to it by id in results and `pdctl verify`
+output, so a custom method's claims are auditable like the built-ins.
