@@ -11,7 +11,7 @@ namespace PrinterDriver;
 /// Nothing here is disposable: the driver owns every handle and frees them all in
 /// <see cref="PrinterDriver.Dispose"/>.
 /// </remarks>
-public sealed class Printer
+public sealed partial class Printer
 {
     private readonly PrinterDriver _driver;
     private readonly nint _handle;

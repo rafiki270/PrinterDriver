@@ -167,6 +167,27 @@ internal static class TestNative
     [DllImport(Library, CallingConvention = Cdecl)]
     internal static extern void pd_test_set_drawer_open(nint printer, int open);
 
+    // M15 -- docs/api.md §15. pd_discover and pd_auto_detect sweep addresses, so there is
+    // no printer handle to hang a scripted transport on: they need a real socket on the
+    // far side. Scripts: "ok" (answers DLE EOT, GS I, GS ( H and GS r 1) and "silent"
+    // (accepts the connection and answers nothing at all).
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern nint pd_test_listener_start(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string script);
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern ushort pd_test_listener_port(nint listener);
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern nuint pd_test_listener_print_data_bytes(nint listener);
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern void pd_test_listener_stop(nint listener);
+
+    [DllImport(Library, CallingConvention = Cdecl)]
+    internal static extern void pd_test_listener_destroy(nint listener);
+
     internal static string ReadUtf8(nint pointer) =>
         pointer == 0 ? string.Empty : Marshal.PtrToStringUTF8(pointer) ?? string.Empty;
 }
@@ -194,6 +215,50 @@ internal enum BridgedEnum
     DrawerPortStandard = 16,
     DrawerKickMethod = 17,
     DrawerStatusMethod = 18,
+    // M15 -- docs/api.md §15.
+    ProfileSelection = 19,
+    DetectionStatus = 20,
+}
+
+/// <summary>
+/// An in-process ESC/POS printer on an ephemeral loopback port, for the sweep paths.
+/// </summary>
+internal sealed class ScriptedListener : IDisposable
+{
+    private nint _handle;
+
+    internal ScriptedListener(string script)
+    {
+        NativeFixture.Bind();
+        _handle = TestNative.pd_test_listener_start(script);
+        Assert.NotEqual(0, _handle);
+        Port = TestNative.pd_test_listener_port(_handle);
+    }
+
+    internal ushort Port { get; }
+
+    internal string Endpoint => $"127.0.0.1:{Port}";
+
+    /// <summary>
+    /// How many printable bytes ever reached the device behind it — the number a
+    /// detection test has to watch stay at zero.
+    /// </summary>
+    internal nuint PrintDataBytes => TestNative.pd_test_listener_print_data_bytes(_handle);
+
+    /// <summary>
+    /// Closes the socket without destroying the handle, so a test can turn a listener
+    /// into a refused port at a known address.
+    /// </summary>
+    internal void Stop() => TestNative.pd_test_listener_stop(_handle);
+
+    public void Dispose()
+    {
+        if (_handle != 0)
+        {
+            TestNative.pd_test_listener_destroy(_handle);
+            _handle = 0;
+        }
+    }
 }
 
 /// <summary>

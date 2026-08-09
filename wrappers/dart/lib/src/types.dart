@@ -720,3 +720,266 @@ final class DrawerReading {
   /// The interpretation, where there is one.
   final DrawerState state;
 }
+
+// --- M15: self-test and auto-detection (docs/api.md §15) ------------------------------
+
+/// What a device said about itself, and what that is worth.
+///
+/// The whole class is evidence, never truth. [trusted] is false until a signal
+/// independent of `GS I` agrees with `GS I`, because at least one family ships answering
+/// as somebody else's model.
+final class DetectedIdentity {
+  const DetectedIdentity({
+    required this.vendor,
+    required this.model,
+    required this.firmware,
+    required this.serial,
+    required this.trusted,
+    required this.confidencePercent,
+    required this.impersonationSuspected,
+    required this.fresh,
+  });
+
+  final String vendor;
+  final String model;
+  final String firmware;
+  final String serial;
+  final bool trusted;
+  final int confidencePercent;
+  final bool impersonationSuspected;
+
+  /// Whether this identification came from the call that produced it rather than from
+  /// the findings cache.
+  final bool fresh;
+}
+
+/// The media facts the renderer consumes. Roll width and raster width are separate facts
+/// and neither is derived from the other.
+final class DetectedMedia {
+  const DetectedMedia({
+    required this.nominalPaperMm,
+    required this.printableWidthDots,
+    required this.charsPerLine,
+    required this.dpi,
+  });
+
+  final int nominalPaperMm;
+  final int printableWidthDots;
+  final int charsPerLine;
+  final int dpi;
+}
+
+/// The mechanism, the best grade a job on it can ever claim, who makes that claim, and
+/// what the claim rests on.
+final class DetectedCompletion {
+  const DetectedCompletion({
+    required this.mechanism,
+    required this.gradeCeiling,
+    required this.authority,
+    required this.method,
+    required this.provenance,
+  });
+
+  final CompletionMechanism mechanism;
+  final ConfidenceGrade gradeCeiling;
+  final CompletionAuthority authority;
+
+  /// The command a support engineer looks up six months later, e.g. `GS(H) fn48`.
+  final String method;
+  final Provenance provenance;
+}
+
+/// The drawer facet, classified rather than fired (docs/cash-drawer.md).
+final class DetectedDrawer {
+  const DetectedDrawer({
+    required this.present,
+    required this.kickable,
+    required this.portStandard,
+    required this.voltage,
+    required this.electricalProvenance,
+    required this.commandsProvenance,
+  });
+
+  final bool present;
+
+  /// Whether this engine may put a pulse on the wire: a drivable method AND an
+  /// established electrical standard.
+  final bool kickable;
+  final DrawerPortStandard portStandard;
+  final int voltage;
+  final Provenance electricalProvenance;
+  final Provenance commandsProvenance;
+}
+
+/// The detection report — `pd_detection_summary`.
+final class DetectionSummary {
+  const DetectionSummary({
+    required this.endpoint,
+    required this.identity,
+    required this.profileId,
+    required this.selection,
+    required this.media,
+    required this.completion,
+    required this.drawer,
+    required this.degradations,
+    required this.provenanceSummary,
+  });
+
+  factory DetectionSummary.fromNative(PdDetectionSummary native) {
+    final lines = <String>[];
+    if (native.degradations != nullptr) {
+      for (var index = 0; index < native.degradationCount; index++) {
+        lines.add(readNativeString(native.degradations[index]));
+      }
+    }
+    return DetectionSummary(
+      endpoint: readNativeString(native.endpoint),
+      identity: DetectedIdentity(
+        vendor: readNativeString(native.vendor),
+        model: readNativeString(native.model),
+        firmware: readNativeString(native.firmware),
+        serial: readNativeString(native.serial),
+        trusted: native.identityTrusted != 0,
+        confidencePercent: native.confidencePercent,
+        impersonationSuspected: native.impersonationSuspected != 0,
+        fresh: native.identityFresh != 0,
+      ),
+      profileId: readNativeString(native.profileId),
+      selection: ProfileSelection.fromNative(native.selection),
+      media: DetectedMedia(
+        nominalPaperMm: native.nominalPaperMm,
+        printableWidthDots: native.printableWidthDots,
+        charsPerLine: native.charsPerLine,
+        dpi: native.dpi,
+      ),
+      completion: DetectedCompletion(
+        mechanism: CompletionMechanism.fromNative(native.completion),
+        gradeCeiling: ConfidenceGrade.fromNative(native.gradeCeiling),
+        authority: CompletionAuthority.fromNative(native.authority),
+        method: readNativeString(native.method),
+        provenance: Provenance.fromNative(native.completionProvenance),
+      ),
+      drawer: DetectedDrawer(
+        present: native.drawerPresent != 0,
+        kickable: native.drawerKickable != 0,
+        portStandard: DrawerPortStandard.fromNative(native.drawerStandard),
+        voltage: native.drawerVoltage,
+        electricalProvenance:
+            Provenance.fromNative(native.drawerElectricalProvenance),
+        commandsProvenance:
+            Provenance.fromNative(native.drawerCommandsProvenance),
+      ),
+      degradations: List.unmodifiable(lines),
+      provenanceSummary: readNativeString(native.provenanceSummary),
+    );
+  }
+
+  final String endpoint;
+  final DetectedIdentity identity;
+  final String profileId;
+  final ProfileSelection selection;
+  final DetectedMedia media;
+  final DetectedCompletion completion;
+  final DetectedDrawer drawer;
+
+  /// Everything requested and not delivered, in the words it is printed in —
+  /// `BARCODE not supported on this path` and its relatives.
+  final List<String> degradations;
+
+  /// One line for a table row.
+  final String provenanceSummary;
+}
+
+/// One candidate, classified — `pd_detected_printer`.
+final class DetectedPrinter {
+  const DetectedPrinter({
+    required this.endpoint,
+    required this.host,
+    required this.port,
+    required this.status,
+    required this.portOpen,
+    required this.fromCache,
+    required this.dleEotHex,
+    required this.summary,
+  });
+
+  factory DetectedPrinter.fromNative(PdDetectedPrinter native) => DetectedPrinter(
+        endpoint: readNativeString(native.endpoint),
+        host: readNativeString(native.host),
+        port: native.port,
+        status: DetectionStatus.fromNative(native.status),
+        portOpen: native.portOpen != 0,
+        fromCache: native.fromCache != 0,
+        dleEotHex: readNativeString(native.dleEotHex),
+        summary: DetectionSummary.fromNative(native.summary),
+      );
+
+  final String endpoint;
+  final String host;
+  final int port;
+  final DetectionStatus status;
+  final bool portOpen;
+
+  /// True when the classification came from stored findings rather than from bytes
+  /// exchanged in this call.
+  final bool fromCache;
+
+  /// Whatever `DLE EOT 1` answered during the sweep, as uppercase hex.
+  final String dleEotHex;
+  final DetectionSummary summary;
+}
+
+/// One address the LAN sweep found listening — `pd_discovered_device`.
+final class DiscoveredDevice {
+  const DiscoveredDevice({
+    required this.ip,
+    required this.port,
+    required this.portOpen,
+    required this.dleEotHex,
+  });
+
+  factory DiscoveredDevice.fromNative(PdDiscoveredDevice native) => DiscoveredDevice(
+        ip: readNativeString(native.ip),
+        port: native.port,
+        portOpen: native.port9100Open != 0,
+        dleEotHex: readNativeString(native.dleEotHex),
+      );
+
+  final String ip;
+  final int port;
+  final bool portOpen;
+
+  /// `DLE EOT 1`'s answer as uppercase hex, verbatim and unclassified. Empty means the
+  /// port accepted the connection and said nothing — a LAN module that does not forward
+  /// status bytes, which is a finding and not a failure.
+  final String dleEotHex;
+
+  /// Whether anything came back on the backchannel at all.
+  bool get answered => dleEotHex.isNotEmpty;
+}
+
+/// What one diagnostic ticket established.
+///
+/// [result] is the proof: the ordinary tri-state outcome of the ordinary engine, so a
+/// [JobDone] at [ConfidenceGrade.aJobLevelConfirmation] is the statement that this stack
+/// works end to end on this unit.
+final class SelfTestResult {
+  const SelfTestResult({
+    required this.result,
+    required this.detection,
+    required this.key,
+    required this.verificationId,
+    required this.ticketLines,
+  });
+
+  final JobResult result;
+  final DetectionSummary detection;
+  final String key;
+
+  /// The four `GS ( H` characters printed as `V:` and inside the QR. Null on a profile
+  /// with no wire token to promote.
+  final String? verificationId;
+
+  /// The ticket exactly as it was laid out, one entry per line.
+  final List<String> ticketLines;
+}

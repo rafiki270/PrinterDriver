@@ -691,3 +691,196 @@ PD_TEST(the_drawer_endpoint_refuses_a_malformed_channel_or_pulse) {
   CHECK_EQ(fixture.post("/printers/kitchen/drawer", R"({"pulseMs":90000})").status, 400);
   CHECK_EQ(fixture.device->drawerKicks(), size_t{0});
 }
+
+// --- M15: self-test and auto-detection (docs/api.md §15) ------------------------------
+
+PD_TEST(the_self_test_endpoint_returns_the_ticket_the_report_and_the_proof) {
+  Fixture fixture;
+  CHECK(fixture.start(pd::CompletionMechanism::GsParenH));
+
+  const HttpClientResult response = fixture.post("/printers/kitchen/self-test", "{}");
+  CHECK(response.ok);
+  // 200 only for a settled Done. A self-test that came back Unknown is 202 and must
+  // never be reported as a success.
+  CHECK_EQ(response.status, 200);
+
+  const Json body = parse(response.body);
+  CHECK_EQ(field(body, "printerId"), std::string("kitchen"));
+  CHECK_EQ(field(body, "key").rfind("selftest-", 0), static_cast<size_t>(0));
+  CHECK_EQ(field(body, "token").size(), static_cast<size_t>(4));
+
+  const Json* result = body.find("result");
+  CHECK(result != nullptr);
+  if (result != nullptr) {
+    CHECK_EQ(field(*result, "outcome"), std::string("Done"));
+    CHECK_EQ(field(*result, "confidence"), std::string("CutFaultFree"));
+    CHECK_EQ(field(*result, "grade"), std::string("A"));
+    CHECK_EQ(field(*result, "authority"), std::string("PhysicalPrinter"));
+    CHECK_EQ(field(*result, "method"), std::string("GS(H) fn48"));
+  }
+
+  const Json* detection = body.find("detection");
+  CHECK(detection != nullptr);
+  if (detection != nullptr) {
+    // Nothing has interrogated this device in this run, so the profile in force is the
+    // configured one and the report says Documented rather than claiming a measurement.
+    CHECK_EQ(field(*detection, "selectedBy"), std::string("Documented"));
+    CHECK(!field(*detection, "provenanceSummary").empty());
+    const Json* identity = detection->find("identity");
+    CHECK(identity != nullptr);
+    if (identity != nullptr) {
+      // Never a bare vendor string: GS I is what the firmware chose to say.
+      CHECK(!flag(*identity, "trusted"));
+    }
+    const Json* completion = detection->find("completion");
+    CHECK(completion != nullptr);
+    if (completion != nullptr) {
+      CHECK_EQ(field(*completion, "mechanism"), std::string("GsParenH"));
+      CHECK_EQ(field(*completion, "gradeCeiling"), std::string("A"));
+    }
+    const Json* media = detection->find("media");
+    CHECK(media != nullptr);
+    if (media != nullptr) {
+      CHECK_EQ(media->find("printableWidthDots")->asInt(), 576LL);
+      CHECK_EQ(media->find("charsPerLine")->asInt(), 48LL);
+    }
+  }
+
+  // The ticket, as characters, and the ticket, as bytes the device actually received.
+  const Json* ticket = body.find("ticket");
+  CHECK(ticket != nullptr);
+  CHECK(ticket != nullptr && ticket->isArray() && ticket->size() > 5);
+  CHECK(fixture.device->receivedContains("PRINTERDRIVER SELF-TEST"));
+  CHECK(fixture.device->receivedContains("CHARSET"));
+  CHECK_EQ(fixture.device->cuts(), size_t{1});
+}
+
+PD_TEST(the_self_test_endpoint_declares_degradations_and_takes_a_key) {
+  Fixture fixture;
+  fixture.adjust_profile = [](pd::CapabilityProfile* profile) {
+    // A firmware with no GS k. The renderer refuses to half-draw a symbol and the
+    // refusal is printed on the ticket instead of being swallowed.
+    profile->render.barcode_gs_k = false;
+  };
+  CHECK(fixture.start());
+
+  const HttpClientResult response =
+      fixture.post("/printers/kitchen/self-test", R"({"key":"selftest-bench-1"})");
+  CHECK_EQ(response.status, 200);
+  const Json body = parse(response.body);
+  CHECK_EQ(field(body, "key"), std::string("selftest-bench-1"));
+
+  const Json* detection = body.find("detection");
+  CHECK(detection != nullptr);
+  bool declared = false;
+  if (detection != nullptr) {
+    const Json* degradations = detection->find("degradations");
+    if (degradations != nullptr) {
+      for (const Json& line : degradations->asArray()) {
+        declared = declared ||
+                   line.asString().find("BARCODE not supported on this path") !=
+                       std::string::npos;
+      }
+    }
+  }
+  CHECK(declared);
+  CHECK(fixture.device->receivedContains("BARCODE not supported on this path"));
+
+  // The same key twice prints once, exactly like every other job.
+  const size_t cuts = fixture.device->cuts();
+  CHECK_EQ(fixture.post("/printers/kitchen/self-test",
+                        R"({"key":"selftest-bench-1"})").status,
+           200);
+  CHECK_EQ(fixture.device->cuts(), cuts);
+}
+
+PD_TEST(the_self_test_endpoint_refuses_an_unknown_printer_and_bad_bodies) {
+  Fixture fixture;
+  CHECK(fixture.start());
+  CHECK_EQ(fixture.post("/printers/nosuch/self-test", "{}").status, 404);
+  CHECK_EQ(fixture.post("/printers/kitchen/self-test", "{").status, 400);
+  CHECK_EQ(fixture.post("/printers/kitchen/self-test", "[]").status, 400);
+  CHECK_EQ(fixture.post("/printers/kitchen/self-test", R"({"key":7})").status, 400);
+  CHECK_EQ(fixture.get("/printers/kitchen/self-test").status, 405);
+  CHECK_EQ(fixture.device->cuts(), size_t{0});
+}
+
+PD_TEST(the_autodetect_endpoint_classifies_listeners_without_printing) {
+  // Real loopback listeners: the endpoint sweeps addresses, so a scripted transport
+  // cannot stand in for one.
+  auto answering_device = std::make_shared<pdfake::FakePrinter>();
+  pdfake::Script talkative;
+  talkative.answer_identity = true;
+  answering_device->setScript(talkative);
+  pdfake::FakePrinterServer answering(answering_device);
+  CHECK(answering.start());
+
+  auto gone_device = std::make_shared<pdfake::FakePrinter>();
+  pdfake::FakePrinterServer gone(gone_device);
+  CHECK(gone.start());
+  const uint16_t refused_port = gone.port();
+  gone.stop();
+
+  Fixture fixture;
+  CHECK(fixture.start());
+
+  Json body = Json::object({});
+  Json endpoints = Json::array({});
+  endpoints.push(Json::string("127.0.0.1:" + std::to_string(answering.port())));
+  endpoints.push(Json::string("127.0.0.1:" + std::to_string(refused_port)));
+  body.set("endpoints", std::move(endpoints));
+  body.set("connectTimeoutMs", Json::number(500));
+
+  const HttpClientResult response =
+      fixture.post("/autodetect", pd::dsl::toJson(body));
+  CHECK_EQ(response.status, 200);
+
+  const Json answer = parse(response.body);
+  CHECK_EQ(answer.find("count")->asInt(), 2LL);
+  // Stated on every response rather than buried in documentation.
+  CHECK(!flag(answer, "printed"));
+  CHECK(!field(answer, "note").empty());
+
+  const Json* printers = answer.find("printers");
+  CHECK(printers != nullptr);
+  int answered = 0;
+  int unreachable = 0;
+  if (printers != nullptr) {
+    for (const Json& entry : printers->asArray()) {
+      const std::string status = field(entry, "status");
+      answered += status == "Answered" ? 1 : 0;
+      unreachable += status == "Unreachable" ? 1 : 0;
+      if (status == "Answered") {
+        const Json* summary = entry.find("summary");
+        CHECK(summary != nullptr);
+        if (summary != nullptr) {
+          const Json* identity = summary->find("identity");
+          CHECK(identity != nullptr && field(*identity, "model") == "TM-T88V");
+          CHECK(identity != nullptr && !flag(*identity, "trusted"));
+          const Json* completion = summary->find("completion");
+          // The printless probe promotes the flag and not its provenance.
+          CHECK(completion != nullptr &&
+                field(*completion, "provenance") == "Unverified");
+        }
+      }
+    }
+  }
+  CHECK_EQ(answered, 1);
+  CHECK_EQ(unreachable, 1);
+  // The whole point of the endpoint's existence.
+  CHECK_EQ(answering_device->printDataBytes(), size_t{0});
+  CHECK_EQ(answering_device->cuts(), size_t{0});
+
+  answering.stop();
+}
+
+PD_TEST(the_autodetect_endpoint_refuses_a_mistyped_subnet_and_a_get) {
+  Fixture fixture;
+  CHECK(fixture.start());
+  // /8 is 16 million connects: a mistyped CIDR rather than a venue.
+  CHECK_EQ(fixture.post("/autodetect", R"({"cidr":"10.0.0.0/8"})").status, 400);
+  CHECK_EQ(fixture.post("/autodetect", R"({"cidr":"not-a-subnet"})").status, 400);
+  CHECK_EQ(fixture.post("/autodetect", R"({"cidr":7})").status, 400);
+  CHECK_EQ(fixture.post("/autodetect", "[]").status, 400);
+  CHECK_EQ(fixture.get("/autodetect").status, 405);
+}

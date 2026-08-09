@@ -18,6 +18,7 @@
 #include "printerdriver/driver.hpp"
 #include "printerdriver/escpos_encoder.hpp"
 #include "printerdriver/job_store.hpp"
+#include "printerdriver/self_test.hpp"
 #include "printerdriver/types.hpp"
 
 // Test-only companions to pd.h; see pd_test_support.h for the contract. Compiled only
@@ -300,6 +301,59 @@ extern "C" int pd_test_link_received_contains(pd_test_link* link, const char* ne
   return link->device->receivedContains(needle) ? 1 : 0;
 }
 
+// --- M15: the loopback listener ------------------------------------------------------
+
+struct pd_test_listener {
+  std::shared_ptr<pdfake::FakePrinter> device = std::make_shared<pdfake::FakePrinter>();
+  std::unique_ptr<pdfake::FakePrinterServer> server;
+};
+
+extern "C" pd_test_listener* pd_test_listener_start(const char* script_id) {
+  if (script_id == nullptr) {
+    return nullptr;
+  }
+  const std::string id(script_id);
+  pdfake::Script script;
+  if (id == "ok") {
+    script.answer_identity = true;  // "EPOSN" / "TM-T88V" — the impersonation case
+  } else if (id == "silent") {
+    script.answer_realtime = false;
+    script.answer_identity = false;
+    script.answer_process_id = false;
+    script.answer_queued_status = false;
+    script.answer_asb = false;
+  } else {
+    return nullptr;
+  }
+
+  auto listener = new pd_test_listener();
+  listener->device->setScript(script);
+  listener->server.reset(new pdfake::FakePrinterServer(listener->device));
+  if (!listener->server->start()) {
+    delete listener;
+    return nullptr;
+  }
+  return listener;
+}
+
+extern "C" uint16_t pd_test_listener_port(pd_test_listener* listener) {
+  return listener != nullptr && listener->server ? listener->server->port() : 0;
+}
+
+extern "C" size_t pd_test_listener_print_data_bytes(pd_test_listener* listener) {
+  return listener != nullptr ? listener->device->printDataBytes() : 0;
+}
+
+extern "C" void pd_test_listener_stop(pd_test_listener* listener) {
+  if (listener != nullptr && listener->server) {
+    listener->server->stop();
+  }
+}
+
+extern "C" void pd_test_listener_destroy(pd_test_listener* listener) {
+  delete listener;
+}
+
 // --- Enum bridge ---------------------------------------------------------------------
 //
 // JobState, ConfidenceLevel, DeviceEvent, FailureReason, JobOutcome, ConfidenceGrade,
@@ -343,6 +397,11 @@ extern "C" int pd_test_cpp_enum_count(pd_test_enum which) {
       return static_cast<int>(pd::kAllDrawerKickMethods.size());
     case PD_TEST_ENUM_DRAWER_STATUS_METHOD:
       return static_cast<int>(pd::kAllDrawerStatusMethods.size());
+    // M15 — docs/api.md §15, same rule again.
+    case PD_TEST_ENUM_PROFILE_SELECTION:
+      return static_cast<int>(pd::kAllProfileSelections.size());
+    case PD_TEST_ENUM_DETECTION_STATUS:
+      return static_cast<int>(pd::kAllDetectionStatuses.size());
     case PD_TEST_ENUM_TOTAL: break;
   }
   return -1;
@@ -424,6 +483,10 @@ extern "C" int pd_test_cpp_enum_value(pd_test_enum which, int index) {
       return static_cast<int>(pd::kAllDrawerKickMethods[static_cast<size_t>(index)]);
     case PD_TEST_ENUM_DRAWER_STATUS_METHOD:
       return static_cast<int>(pd::kAllDrawerStatusMethods[static_cast<size_t>(index)]);
+    case PD_TEST_ENUM_PROFILE_SELECTION:
+      return static_cast<int>(pd::kAllProfileSelections[static_cast<size_t>(index)]);
+    case PD_TEST_ENUM_DETECTION_STATUS:
+      return static_cast<int>(pd::kAllDetectionStatuses[static_cast<size_t>(index)]);
     case PD_TEST_ENUM_TOTAL: break;
   }
   return -1;
@@ -463,6 +526,10 @@ extern "C" const char* pd_test_cpp_enum_name(pd_test_enum which, int index) {
       return pd::to_string(static_cast<pd::DrawerKickMethod>(value));
     case PD_TEST_ENUM_DRAWER_STATUS_METHOD:
       return pd::to_string(static_cast<pd::DrawerStatusMethod>(value));
+    case PD_TEST_ENUM_PROFILE_SELECTION:
+      return pd::to_string(static_cast<pd::ProfileSelection>(value));
+    case PD_TEST_ENUM_DETECTION_STATUS:
+      return pd::to_string(static_cast<pd::DetectionStatus>(value));
     case PD_TEST_ENUM_CUT:
     case PD_TEST_ENUM_PREFLIGHT:
     case PD_TEST_ENUM_ALIGNMENT:
@@ -495,6 +562,8 @@ extern "C" const char* pd_test_enum_label(pd_test_enum which) {
     case PD_TEST_ENUM_DRAWER_PORT_STANDARD: return "DrawerPortStandard";
     case PD_TEST_ENUM_DRAWER_KICK_METHOD: return "DrawerKickMethod";
     case PD_TEST_ENUM_DRAWER_STATUS_METHOD: return "DrawerStatusMethod";
+    case PD_TEST_ENUM_PROFILE_SELECTION: return "ProfileSelection";
+    case PD_TEST_ENUM_DETECTION_STATUS: return "DetectionStatus";
     case PD_TEST_ENUM_TOTAL: break;
   }
   return "UnknownEnum";

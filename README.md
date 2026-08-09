@@ -208,7 +208,8 @@ columns because either can say yes while the other says no.
 ## pdctl
 
 ```sh
-build/pdctl discover [cidr]                   # sweep a subnet (default: the local /24)
+build/pdctl discover   [cidr]                 # sweep a subnet (default: the local /24)
+build/pdctl autodetect [cidr]                 # sweep + identify + printless probe
 build/pdctl status   <host>                   # DLE EOT 1-4 decoded plus raw bytes
 build/pdctl probe    <host> [--mac <address>] # full printer discovery report
 build/pdctl identify <host> [--mac <address>] # fingerprint only, prints nothing
@@ -220,6 +221,13 @@ build/pdctl print list                        # the device database
 port together with whatever came back. Silence is a finding, not a failure: it is the LAN
 module that does not forward status bytes, and it is why the table separates "open" from
 "answers".
+
+`autodetect` composes `discover`, `identify` and the **printless** subset of the
+capability probe into one table — ip, vendor guess, model, trusted, profile, completion,
+grade ceiling, provenance — and still writes nothing printable. That restriction has a
+price it states on every run: an ordered fence only means anything when there is print
+data ahead of it, so a fence found here proves the command *exists* and not that its
+answer waits for paper. `pdctl probe`, which prints, or a real job is what promotes it.
 
 `print` runs through the whole engine — preflight, ordered fence, cut fence, cutter
 status, job store — and exits 0 on `done`, 1 on `failed`, 2 on `unknown`. The core owns a
@@ -234,6 +242,7 @@ separate operator commands that print a warning banner naming what they are abou
 build/pdctl recover    <host> --resume|--clear   # DLE ENQ 1 / DLE ENQ 2
 build/pdctl counters   <host>                    # GS g 2 maintenance counters
 build/pdctl test-print <host>                    # GS ( A, consumes paper
+build/pdctl self-test  <host> [--profile <name>] # one diagnostic ticket, consumes paper
 build/pdctl settings   <host>                    # GS ( E fn 4 / fn 6 readback
 build/pdctl drawer test <host> [--channel 1|2] [--pulse 200]  # opens the cash drawer
 ```
@@ -249,6 +258,16 @@ refuses outright on an unclassified port:
 ```sh
 build/pdctl drawer-probe <host> [--profile <name>]   # never fires an output
 ```
+
+`self-test` is the other half of `test-print`, and the two are deliberately different
+documents: `test-print` asks the firmware to print its own status sheet, and `self-test`
+prints the SDK's view of the unit through the ordinary fenced engine — identity, profile
+and how it was selected, media, completion mechanism with its grade ceiling and
+provenance, the drawer classification, a Czech/Hungarian/Polish charset line, a Code 128
+sample and the job's own `V:` token in the trailer QR. Anything the profile cannot draw is
+printed as a declared degradation instead of being dropped. The ticket is the report and
+the terminal result is the proof: a `Done` at grade A is the statement that the whole
+stack works end to end on that unit, over that interface path.
 
 It prints the documented port (standard, voltage, current, channels, sense pin) and the
 software provenance as two separate columns, then runs a non-destructive switch test —
@@ -357,8 +376,14 @@ MIT — see [LICENSE](LICENSE).
   opening sequence (`GS r 2` → `ESC p` → watch the switch) reporting `OPEN_VERIFIED` /
   `FAILED_TO_OPEN` / `KICK_SENT_UNVERIFIED`, persisted polarity calibration, and a
   refusal — zero bytes — on any port nobody has classified
+- ✅ Self-test and auto-detection: one fenced diagnostic ticket that IS the detection
+  report, and a non-printing sweep (discovery → identify → printless probe) that
+  classifies every candidate as answered / silent / unverified / unreachable and refuses
+  to promote a fence it could only ask out of an empty buffer
+- ✅ LAN discovery and auto-detection in every wrapper — Swift `AsyncStream`, Dart
+  `Stream`, .NET `IAsyncEnumerable`, Kotlin `Flow` — not only in the CLI
 - ✅ pdctl: status · probe · identify · print · verify · render · counters · settings ·
-  test-print · recover · drawer-probe · drawer test
+  test-print · self-test · autodetect · recover · drawer-probe · drawer test
 - 🔄 Provenance-in-code, A+ grade, Bluetooth custom-transport ABI, expanded catalogue
   (M12) · pd-agent daemon, LAN discovery, DSL barcodes (M13a)
 - 📋 ePOS A+ transport, Star raw (ETB / ESC GS ETX / CloudPRNT), serial, probe-path,

@@ -563,7 +563,24 @@ HttpResponse Agent::handle(const HttpRequest& request) {
       }
       return postPrinterDrawer(path[1], request);
     }
+    // M15 — docs/api.md §15. POST because it consumes paper; the answer is the whole
+    // detection report plus the ordinary tri-state job result.
+    if (path.size() == 3 && path[2] == "self-test") {
+      if (method != "POST") {
+        return fail(405, "method not allowed", method);
+      }
+      return postPrinterSelfTest(path[1], request);
+    }
     return fail(404, "not found", request.path);
+  }
+  // M15 — docs/api.md §15. Not under /printers, because it is what runs BEFORE there are
+  // any: it takes a subnet and returns candidates, and adding one is still a deliberate
+  // POST /printers.
+  if (path[0] == "autodetect" && path.size() == 1) {
+    if (method != "POST") {
+      return fail(405, "method not allowed", method);
+    }
+    return postAutoDetect(request);
   }
   // --- M13b: CloudPRNT (docs/wire-protocols.md §2) -------------------------------------
   //
@@ -871,6 +888,244 @@ HttpResponse Agent::postPrinterDrawer(const std::string& id, const HttpRequest& 
   // POST /jobs uses between a completed job and a fence still outstanding.
   const int status = result.state == DrawerState::KickSentUnverified ? 202 : 200;
   return ok(status, out);
+}
+
+// --- M15: self-test and auto-detection (docs/api.md §15) ---------------------------------
+
+namespace {
+
+Json detectionSummaryJson(const DetectionSummary& summary) {
+  Json identity = Json::object({});
+  identity.set("vendor", Json::string(summary.identity.vendor));
+  identity.set("model", Json::string(summary.identity.model));
+  identity.set("firmware", Json::string(summary.identity.firmware));
+  identity.set("serial", Json::string(summary.identity.serial));
+  // Never a bare vendor string: GS I is what the firmware chose to say, and at least
+  // one family ships answering as somebody else's model.
+  identity.set("trusted", Json::boolean(summary.identity.trusted));
+  identity.set("confidencePercent",
+               Json::number(static_cast<double>(summary.identity.confidence_percent)));
+  identity.set("impersonationSuspected",
+               Json::boolean(summary.identity.impersonation_suspected));
+  identity.set("fresh", Json::boolean(summary.identity_fresh));
+  Json signals = Json::array({});
+  for (const std::string& signal : summary.identity.signals) {
+    signals.push(Json::string(signal));
+  }
+  identity.set("signals", std::move(signals));
+
+  Json media = Json::object({});
+  media.set("nominalPaperMm", Json::number(summary.nominal_paper_mm));
+  media.set("printableWidthDots", Json::number(summary.printable_width_dots));
+  media.set("charsPerLine", Json::number(summary.chars_per_line));
+  media.set("dpi", Json::number(summary.dpi));
+
+  Json completion = Json::object({});
+  completion.set("mechanism", Json::string(to_string(summary.completion)));
+  completion.set("gradeCeiling", Json::string(gradeLetter(summary.grade_ceiling)));
+  completion.set("authority", Json::string(to_string(summary.authority)));
+  completion.set("method", Json::string(summary.method));
+  completion.set("provenance", Json::string(to_string(summary.completion_provenance)));
+
+  Json drawer = Json::object({});
+  drawer.set("present", Json::boolean(summary.drawer_present));
+  drawer.set("kickable", Json::boolean(summary.drawer_kickable));
+  drawer.set("standard", Json::string(to_string(summary.drawer_standard)));
+  drawer.set("voltage", Json::number(summary.drawer_voltage));
+  drawer.set("electricalProvenance",
+             Json::string(to_string(summary.drawer_electrical_provenance)));
+  drawer.set("commandsProvenance",
+             Json::string(to_string(summary.drawer_commands_provenance)));
+
+  Json degradations = Json::array({});
+  for (const std::string& line : summary.degradations) {
+    degradations.push(Json::string(line));
+  }
+
+  Json out = Json::object({});
+  out.set("endpoint", Json::string(summary.endpoint));
+  out.set("identity", std::move(identity));
+  out.set("profile", Json::string(summary.profile_id));
+  out.set("selectedBy", Json::string(to_string(summary.selection)));
+  out.set("media", std::move(media));
+  out.set("completion", std::move(completion));
+  out.set("drawer", std::move(drawer));
+  out.set("degradations", std::move(degradations));
+  out.set("provenanceSummary", Json::string(summary.provenanceSummary()));
+  return out;
+}
+
+}  // namespace
+
+HttpResponse Agent::postPrinterSelfTest(const std::string& id,
+                                        const HttpRequest& request) {
+  std::shared_ptr<Printer> printer = lookup(id);
+  if (!printer) {
+    return fail(404, "unknown printer", id);
+  }
+
+  SelfTestOptions options;
+  const std::string body = trimmed(request.body);
+  if (!body.empty()) {
+    Json json;
+    std::string parse_error;
+    if (!dsl::tryParseJson(body, &json, &parse_error)) {
+      return fail(400, "malformed JSON", parse_error);
+    }
+    if (!json.isObject()) {
+      return fail(400, "body must be a JSON object");
+    }
+    if (const Json* key = json.find("key"); key != nullptr) {
+      if (!key->isString()) {
+        return fail(400, "key must be a string");
+      }
+      options.key = key->asString();
+    }
+    if (const Json* refresh = json.find("refreshIdentity"); refresh != nullptr) {
+      if (!refresh->isBool()) {
+        return fail(400, "refreshIdentity must be a boolean");
+      }
+      options.refresh_identity = refresh->asBool();
+    }
+    if (const Json* barcode = json.find("barcode"); barcode != nullptr) {
+      if (!barcode->isBool()) {
+        return fail(400, "barcode must be a boolean");
+      }
+      options.barcode = barcode->asBool();
+    }
+  }
+
+  const SelfTestResult result = printer->selfTest(options);
+
+  Json out = Json::object({});
+  out.set("printerId", Json::string(printer->id()));
+  out.set("key", Json::string(result.key));
+  out.set("token", Json::string(result.print_token));
+  out.set("detection", detectionSummaryJson(result.detection));
+  // The ticket exactly as it was laid out — the same layout that produced the bytes.
+  Json lines = Json::array({});
+  for (const std::string& line : result.ticket_lines) {
+    lines.push(Json::string(line));
+  }
+  out.set("ticket", std::move(lines));
+
+  Json job = Json::object({});
+  job.set("outcome", Json::string(to_string(result.result.outcome)));
+  job.set("confidence", Json::string(to_string(result.result.confidence)));
+  job.set("grade", Json::string(gradeLetter(result.result.grade)));
+  job.set("authority", Json::string(to_string(result.result.authority)));
+  job.set("method", Json::string(result.result.method));
+  if (result.result.reason != FailureReason::None) {
+    job.set("reason", Json::string(to_string(result.result.reason)));
+  }
+  if (result.job) {
+    job.set("id", Json::string(result.job->id()));
+  }
+  out.set("result", std::move(job));
+
+  // The same three-way split every job answer uses: 200 for a settled Done, 409 for a
+  // settled Failed, 202 for an Unknown nothing could confirm. A self-test that came back
+  // Unknown is not a success and must not be reported as one.
+  switch (result.result.outcome) {
+    case JobOutcome::Done: return ok(200, out);
+    case JobOutcome::Failed: return ok(409, out);
+    case JobOutcome::Unknown: break;
+  }
+  return ok(202, out);
+}
+
+HttpResponse Agent::postAutoDetect(const HttpRequest& request) {
+  AutoDetectOptions options;
+  const std::string body = trimmed(request.body);
+  if (!body.empty()) {
+    Json json;
+    std::string parse_error;
+    if (!dsl::tryParseJson(body, &json, &parse_error)) {
+      return fail(400, "malformed JSON", parse_error);
+    }
+    if (!json.isObject()) {
+      return fail(400, "body must be a JSON object");
+    }
+    if (const Json* cidr = json.find("cidr"); cidr != nullptr) {
+      if (!cidr->isString()) {
+        return fail(400, "cidr must be a string");
+      }
+      options.subnet_cidr = cidr->asString();
+    }
+    if (const Json* endpoints = json.find("endpoints"); endpoints != nullptr) {
+      if (!endpoints->isArray()) {
+        return fail(400, "endpoints must be an array of strings");
+      }
+      for (const Json& entry : endpoints->asArray()) {
+        if (!entry.isString()) {
+          return fail(400, "endpoints must be an array of strings");
+        }
+        options.endpoints.push_back(entry.asString());
+      }
+    }
+    if (const Json* port = json.find("port"); port != nullptr) {
+      if (!port->isNumber() || port->asInt() < 1 || port->asInt() > 65535) {
+        return fail(400, "port must be 1..65535");
+      }
+      options.port = static_cast<uint16_t>(port->asInt());
+    }
+    if (const Json* concurrency = json.find("concurrency"); concurrency != nullptr) {
+      if (!concurrency->isNumber() || concurrency->asInt() < 1 ||
+          concurrency->asInt() > 256) {
+        return fail(400, "concurrency must be 1..256");
+      }
+      options.concurrency = static_cast<uint32_t>(concurrency->asInt());
+    }
+    if (const Json* connect = json.find("connectTimeoutMs"); connect != nullptr) {
+      if (!connect->isNumber() || connect->asInt() < 1) {
+        return fail(400, "connectTimeoutMs must be positive");
+      }
+      options.connect_timeout_ms = static_cast<uint32_t>(connect->asInt());
+    }
+    if (const Json* probe = json.find("probeUnknown"); probe != nullptr) {
+      if (!probe->isBool()) {
+        return fail(400, "probeUnknown must be a boolean");
+      }
+      options.probe_unknown = probe->asBool();
+    }
+  }
+
+  std::vector<DetectedPrinter> found;
+  try {
+    found = driver_->autoDetect(options);
+  } catch (const DiscoveryError& error) {
+    // A malformed CIDR, or one wider than /16 — a mistyped subnet rather than a venue.
+    return fail(400, "cannot sweep that subnet", error.what());
+  }
+
+  Json printers = Json::array({});
+  for (const DetectedPrinter& one : found) {
+    Json entry = Json::object({});
+    entry.set("endpoint", Json::string(one.endpoint));
+    entry.set("host", Json::string(one.host));
+    entry.set("port", Json::number(one.port));
+    entry.set("status", Json::string(to_string(one.status)));
+    entry.set("portOpen", Json::boolean(one.port_open));
+    entry.set("fromCache", Json::boolean(one.from_cache));
+    entry.set("dleEot", Json::string(DiscoveredDevice{one.host, one.port, one.port_open,
+                                                      one.dle_eot_response}
+                                          .responseHex()));
+    entry.set("summary", detectionSummaryJson(one.summary));
+    printers.push(std::move(entry));
+  }
+
+  Json out = Json::object({});
+  out.set("printers", std::move(printers));
+  out.set("count", Json::number(static_cast<double>(found.size())));
+  // Stated on every response, not buried in documentation: this endpoint may not print,
+  // so the fences it found were asked out of an empty buffer and their provenance was
+  // deliberately not promoted (docs/api.md §15).
+  out.set("printed", Json::boolean(false));
+  out.set("note",
+          Json::string("nothing printed and nothing fired: the printless probe subset "
+                       "proves a completion command exists, not that its answer waits "
+                       "for paper. Promotion needs the printing probe or a real job."));
+  return ok(200, out);
 }
 
 // --- Jobs --------------------------------------------------------------------------------

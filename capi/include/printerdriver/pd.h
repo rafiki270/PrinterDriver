@@ -1052,6 +1052,302 @@ const char* pd_drawer_status_method_name(pd_drawer_status_method value);
 
 /* ============================== end M14 ========================================== */
 
+/* =================================================================================
+ * M15: self-test, auto-detection and LAN discovery (docs/api.md §15)
+ * =================================================================================
+ *
+ * Three calls, in increasing order of what they are allowed to do to a device:
+ *
+ *   pd_discover    sweeps a subnet. The only bytes it ever writes are DLE EOT 1
+ *                  (10 04 01), the real-time status query. A port-9100 device prints
+ *                  what it receives, so a scanner that wrote anything printable would
+ *                  cost a venue a roll of paper per run.
+ *   pd_auto_detect discovery + identification + the PRINTLESS subset of the capability
+ *                  probe, with the stored-findings cache respected. Still nothing
+ *                  prints and nothing fires.
+ *   pd_self_test   prints exactly one diagnostic ticket, through the ordinary fenced
+ *                  engine, under an ordinary idempotency key.
+ *
+ * -- What auto-detection may not claim ---------------------------------------------
+ *
+ * An ordered completion fence only means anything when there is print data ahead of it
+ * for the device to finish first. pd_auto_detect has no print data, so the fences go out
+ * behind an empty buffer: a device that echoes them has proved that its firmware
+ * IMPLEMENTS the command, not that the echo waits for paper to move. The flag is
+ * therefore promoted and its provenance is not — `completion_provenance` stays
+ * PD_PROVENANCE_UNVERIFIED on a printless answer, and the reason is spelled out in the
+ * summary's degradation list. Full promotion still needs the printing probe
+ * (`pdctl probe`) or a real job.
+ *
+ * -- String lifetime ----------------------------------------------------------------
+ *
+ * Callback structs and every string inside them are valid ONLY for the duration of the
+ * callback: copy what you need. pd_self_test_result's strings are owned by the driver
+ * and valid until the next pd_self_test call on that same driver.
+ */
+
+/* pd::ProfileSelection — how the capability profile in force was arrived at. Not a
+ * provenance: that says where a claim about one capability comes from, and this says
+ * where the profile came from. */
+typedef enum pd_profile_selection {
+  /* A device-database entry matched what the device reported about itself. */
+  PD_PROFILE_SELECTED_DOCUMENTED = 0,
+  /* A probe's first-hand findings promoted whatever was selected. */
+  PD_PROFILE_SELECTED_PROBED = 1,
+  /* Neither: the shipped default is the whole truth, which means UNKNOWN DEVICE
+   * rather than ordinary device. */
+  PD_PROFILE_SELECTED_DEFAULT = 2,
+  PD_PROFILE_SELECTION_COUNT = 3
+} pd_profile_selection;
+
+/* pd::DetectionStatus — what auto-detection established about one address. */
+typedef enum pd_detection_status {
+  /* The backchannel answered: identification, fences, or both. */
+  PD_DETECTION_ANSWERED = 0,
+  /* The port accepted the connection and said nothing at all. A real finding — the
+   * interface that does not forward status bytes — and never rendered as a failure. */
+  PD_DETECTION_SILENT = 1,
+  /* Reachable and deliberately not interrogated: leave_unknown_unprobed was set and
+   * nothing is cached. Never rendered as "no capabilities": nobody asked. */
+  PD_DETECTION_UNVERIFIED = 2,
+  PD_DETECTION_UNREACHABLE = 3,
+  PD_DETECTION_STATUS_COUNT = 4
+} pd_detection_status;
+
+/*
+ * The detection report, flattened. Shared by the self-test and by auto-detection so the
+ * paper, the CLI, the agent and every wrapper describe the same device the same way.
+ */
+typedef struct pd_detection_summary {
+  const char* endpoint;
+
+  const char* vendor;
+  const char* model;
+  const char* firmware;
+  const char* serial;
+  /* 1 only when a signal independent of GS I agrees with GS I. Rongta's own manual
+   * documents its printers answering "EPOSN" / "TM-T88V", so this is 0 by default and
+   * `confidence_percent` is what it is worth. */
+  int32_t identity_trusted;
+  uint8_t confidence_percent;
+  int32_t impersonation_suspected;
+  /* 1 when the identification above came from this call rather than from the cache. */
+  int32_t identity_fresh;
+
+  const char* profile_id;
+  pd_profile_selection selection;
+
+  /* Roll width and raster width are separate facts, and neither is derived from the
+   * other: a 112 mm-media printer prints 104 mm. */
+  uint16_t nominal_paper_mm;
+  uint32_t printable_width_dots;
+  uint32_t chars_per_line;
+  uint16_t dpi;
+
+  pd_completion_mechanism completion;
+  /* The best grade a job on this printer can ever claim. */
+  pd_confidence_grade grade_ceiling;
+  pd_completion_authority authority;
+  const char* method;
+  pd_provenance completion_provenance;
+
+  int32_t drawer_present;
+  int32_t drawer_kickable;
+  pd_drawer_port_standard drawer_standard;
+  uint16_t drawer_voltage;
+  pd_provenance drawer_electrical_provenance;
+  pd_provenance drawer_commands_provenance;
+
+  /* One line, for a table row:
+   * "GS(H) fn48 Probed - profile Probed - identity untrusted (35%)". */
+  const char* provenance_summary;
+
+  /* Everything that was requested and not delivered, in the words it is printed in —
+   * "BARCODE not supported on this path" and its relatives. `degradation_count`
+   * entries; NULL when there are none. */
+  const char* const* degradations;
+  size_t degradation_count;
+} pd_detection_summary;
+
+/* --- pd_self_test ----------------------------------------------------------------- */
+
+/* All-zeroes is the useful call. Every field that inverts a default is spelled as the
+ * negative so that memset(0) means "the documented behaviour". */
+typedef struct pd_self_test_options {
+  /* NULL or "" -> "selftest-<unix ms>". A real idempotency key on a real job: running
+   * the same key twice does not print twice. */
+  const char* key;
+  /* Interrogate the device now instead of using what is already known. Runs the same
+   * probe pd_add_printer_tcp schedules, on the printer's own worker thread. */
+  int32_t refresh_identity;
+  /* Keep that refresh printless, at the cost of asking the ordered fences out of an
+   * empty buffer. Only meaningful with refresh_identity. */
+  int32_t probe_without_printing;
+  /* Omit the Code 128 sample. Note that a profile with no barcode path omits it anyway,
+   * with a declared degradation printed on the ticket. */
+  int32_t no_barcode;
+  const char* barcode_data; /* NULL -> "PD-SELFTEST" */
+  /* Suppress the trailer `V:` line and its QR. On a GS ( H printer that QR carries the
+   * job's own verification token, which is what makes the paper evidence. */
+  int32_t no_verification_id;
+  uint32_t timeout_ms; /* 0 -> the profile's completion budget */
+} pd_self_test_options;
+
+/*
+ * The self-test's answer: the ordinary tri-state job result, plus what the ticket said.
+ * `ticket_text` is the ticket exactly as it was laid out, lines separated by '\n' — the
+ * same layout that produced the bytes, never a second one. `job` is the ordinary job
+ * handle, so the ticket can be resolved by key or by token afterwards.
+ *
+ * Every string here is owned by the driver and valid until the next pd_self_test call
+ * on it.
+ */
+typedef struct pd_self_test_result {
+  pd_job_result result;
+  pd_detection_summary detection;
+  const char* key;
+  /* The four GS ( H characters printed as `V:` and inside the QR. "" on a profile with
+   * no wire token to promote. */
+  const char* print_token;
+  const char* ticket_text;
+  pd_job* job;
+} pd_self_test_result;
+
+/*
+ * Prints ONE diagnostic ticket and blocks until the job is terminal. `options` may be
+ * NULL. Returns 1 and fills `out`; 0 on a bad handle or a null `out`, see pd_last_error.
+ *
+ * A Done at PD_GRADE_A_JOB_LEVEL_CONFIRMATION here is the statement that the whole
+ * stack works end to end on this unit, over this interface path — because the ticket
+ * went through the ordinary engine, with the ordinary preflight, fence and grading, and
+ * the result is what that engine reported.
+ */
+int32_t pd_self_test(pd_driver* driver, pd_printer* printer,
+                     const pd_self_test_options* options, pd_self_test_result* out);
+
+/* --- pd_auto_detect ---------------------------------------------------------------- */
+
+typedef struct pd_auto_detect_options {
+  /* NULL or "" -> the local /24. Ignored when `endpoints` is set. */
+  const char* subnet_cidr;
+  /* A NULL-terminated array of "host" or "host:port" strings. When present the sweep is
+   * skipped and exactly these addresses are examined — the path for a caller with a
+   * known inventory, and the only one that reports an unreachable address, because it
+   * is the only one where somebody named it. */
+  const char* const* endpoints;
+  uint16_t port;                 /* 0 -> 9100 */
+  uint32_t concurrency;          /* 0 -> 16 */
+  uint32_t connect_timeout_ms;   /* 0 -> 300 */
+  uint32_t response_timeout_ms;  /* 0 -> 400 */
+  /* Leave devices nobody has interrogated alone: cached findings still apply, and
+   * anything untouched comes back PD_DETECTION_UNVERIFIED instead of being asked. */
+  int32_t leave_unknown_unprobed;
+  uint32_t status_timeout_ms;      /* 0 -> 700 */
+  uint32_t identity_timeout_ms;    /* 0 -> 700 */
+  uint32_t completion_timeout_ms;  /* 0 -> 1200 */
+} pd_auto_detect_options;
+
+typedef struct pd_detected_printer {
+  const char* endpoint; /* "192.168.1.101:9100" */
+  const char* host;
+  uint16_t port;
+  pd_detection_status status;
+  int32_t port_open;
+  /* 1 when the classification came from stored findings rather than from bytes
+   * exchanged in this call. */
+  int32_t from_cache;
+  /* Whatever DLE EOT 1 answered during the sweep, as uppercase hex. "" when the port
+   * accepted the connection and said nothing. */
+  const char* dle_eot_hex;
+  pd_detection_summary summary;
+} pd_detected_printer;
+
+/* Fired as each candidate is finished, from a worker thread, one at a time. The struct
+ * and its strings are valid only for the duration of the call. */
+typedef void (*pd_detected_cb)(const pd_detected_printer* printer, uint64_t completed,
+                              uint64_t total, void* ctx);
+
+/*
+ * Sweeps, identifies and classifies. NOTHING PRINTS AND NOTHING FIRES. Blocks until
+ * every candidate is finished and returns how many were reported, or -1 on error (see
+ * pd_last_error — a malformed CIDR, or one wider than /16, is the usual cause).
+ * `options` and `cb` may both be NULL.
+ */
+int32_t pd_auto_detect(pd_driver* driver, const pd_auto_detect_options* options,
+                       pd_detected_cb cb, void* ctx);
+
+/* --- pd_discover ------------------------------------------------------------------- */
+
+/*
+ * The raw sweep underneath pd_auto_detect: is something ESC/POS-shaped listening, and
+ * does its backchannel reach me? No identification, no capability probe, no profile —
+ * deciding what a device *is* costs time and belongs to pd_auto_detect.
+ *
+ * The whole write side is DLE EOT 1. Every byte of it is below 0x20, so none of it can
+ * print, on any device, ever.
+ */
+typedef struct pd_discover_options {
+  const char* subnet_cidr;       /* NULL or "" -> the local /24 */
+  uint16_t port;                 /* 0 -> 9100 */
+  uint32_t concurrency;          /* 0 -> 32 */
+  uint32_t connect_timeout_ms;   /* 0 -> 300 */
+  uint32_t response_timeout_ms;  /* 0 -> 400 */
+  /* Turns the sweep into a pure port scan: the port state is still reported and not one
+   * byte is written. */
+  int32_t no_backchannel_probe;
+} pd_discover_options;
+
+typedef struct pd_discovered_device {
+  const char* ip;
+  uint16_t port;
+  int32_t port9100_open;
+  /* DLE EOT 1's answer as uppercase hex, verbatim and unclassified. "" means the port
+   * accepted the connection and said nothing — a LAN module that does not forward
+   * status bytes, which is a finding and not a failure. */
+  const char* dle_eot_hex;
+} pd_discovered_device;
+
+/* Fired for every OPEN port as it is found, from a worker thread, one at a time. Valid
+ * only for the duration of the call. */
+typedef void (*pd_discovered_cb)(const pd_discovered_device* device, uint64_t completed,
+                                uint64_t total, void* ctx);
+
+/*
+ * Sweeps and reports the open ports. Blocks. Returns how many were found, or -1 on
+ * error (a malformed CIDR, one wider than /16, or no local subnet to guess). `options`
+ * and `cb` may both be NULL.
+ *
+ * `completed` and `total` count every address the sweep finishes, open or not, so a UI
+ * can show progress across a whole /24 while only the open ones arrive as devices.
+ */
+int32_t pd_discover(pd_driver* driver, const pd_discover_options* options,
+                    pd_discovered_cb cb, void* ctx);
+
+/*
+ * The last sweep's results, by index, for a wrapper that cannot service a callback while
+ * it is blocked inside the call that fires it — which is every FFI binding whose runtime
+ * owns the calling thread, Dart above all. `pd_auto_detect` and `pd_discover` keep their
+ * results on the driver; these read them back.
+ *
+ * Returns 1 and fills `out`, or 0 when the index is out of range. Every string in `out`
+ * is owned by the driver and valid until the next call to the same reader, or to
+ * pd_auto_detect / pd_discover, on that driver: copy before asking for the next index.
+ */
+int32_t pd_detected_at(pd_driver* driver, int32_t index, pd_detected_printer* out);
+int32_t pd_discovered_at(pd_driver* driver, int32_t index, pd_discovered_device* out);
+
+/* The /24 around this host's primary address, as "192.168.1.0/24", or "" when it cannot
+ * be determined. Found by asking the routing table which local address would be used to
+ * reach a remote one; no packet is transmitted. Owned by the driver, valid until the
+ * next call on it. */
+const char* pd_local_subnet(pd_driver* driver);
+
+/* Static storage, never NULL, matching the core's own spelling one-for-one. */
+const char* pd_profile_selection_name(pd_profile_selection value);
+const char* pd_detection_status_name(pd_detection_status value);
+
+/* ============================== end M15 ========================================== */
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

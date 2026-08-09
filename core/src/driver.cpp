@@ -524,6 +524,10 @@ class PrinterRuntime {
   void openCashDrawer();
   void drain();
 
+  // M15. The probe addPrinter schedules, on demand: same function, same worker thread,
+  // same persistence (docs/api.md §15).
+  std::optional<CapabilityFindings> probeNow(bool print_test_lines);
+
   // --- M14: cash drawer -------------------------------------------------------------
   DrawerOpenResult openDrawer(const DrawerRequest& request);
   DrawerReading readDrawerSensor(std::chrono::milliseconds timeout);
@@ -552,7 +556,9 @@ class PrinterRuntime {
 
   void applyStoredFindings();
   void scheduleProbe();
-  void runProbe();
+  // `print_test_lines` overrides ProbeOptions when set; nullopt keeps the configured
+  // value, which is what the scheduled probe uses.
+  void runProbe(std::optional<bool> print_test_lines = std::nullopt);
 
   // --- M14 ---
   void applyStoredDrawerPolarity();
@@ -842,7 +848,7 @@ void PrinterRuntime::scheduleProbe() {
   push(std::move(task));
 }
 
-void PrinterRuntime::runProbe() {
+void PrinterRuntime::runProbe(std::optional<bool> print_test_lines) {
   std::string error;
   if (!ensureConnected(&error)) {
     return;
@@ -850,6 +856,9 @@ void PrinterRuntime::runProbe() {
   ProbeOptions options = config_.probe_options;
   options.endpoint = config_.id;
   options.hints = config_.identity_hints;
+  if (print_test_lines.has_value()) {
+    options.print_test_lines = *print_test_lines;
+  }
   auto probe = std::make_shared<CapabilityProbe>(options);
   {
     std::lock_guard<std::mutex> lock(probe_mutex_);
@@ -2064,6 +2073,26 @@ DeviceStatus PrinterRuntime::refreshStatus(std::chrono::milliseconds timeout) {
   return status();
 }
 
+// M15. Same shape as refreshStatus above: one task on the printer's own worker, behind
+// whatever is queued, waited out by the caller. Nothing else may talk to the device
+// while the probe owns the backchannel, and the worker is what guarantees that.
+std::optional<CapabilityFindings> PrinterRuntime::probeNow(bool print_test_lines) {
+  if (stopping_.load()) {
+    return std::nullopt;
+  }
+  auto done = std::make_shared<std::promise<void>>();
+  auto future = done->get_future();
+  Task task;
+  task.run = [this, print_test_lines, done] {
+    runProbe(print_test_lines);
+    done->set_value();
+  };
+  task.cancel = [done] { done->set_value(); };
+  push(std::move(task));
+  future.wait();
+  return findings();
+}
+
 void PrinterRuntime::openCashDrawer() {
   if (stopping_.load()) {
     return;
@@ -2402,6 +2431,16 @@ DrawerCapabilities Printer::drawerCapabilities() const { return rt_->profile().d
 DrawerPolarity Printer::drawerPolarity() const { return rt_->drawerPolarity(); }
 
 // --- end M14 -------------------------------------------------------------------------
+
+// --- M15 (docs/api.md §15) -----------------------------------------------------------
+// Printer::selfTest is defined one layer up, in dsl/src/self_test.cpp: the ticket is a
+// DSL document and the DSL depends on the core, not the other way round. See the note at
+// the top of printerdriver/self_test.hpp.
+
+std::optional<CapabilityFindings> Printer::probeNow(bool print_test_lines) {
+  return rt_->probeNow(print_test_lines);
+}
+// --- end M15 -------------------------------------------------------------------------
 
 void Printer::drain() { rt_->drain(); }
 

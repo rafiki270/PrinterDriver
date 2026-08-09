@@ -298,6 +298,42 @@ internal static class NativeMethods
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int pd_code_page_at(int index);
 
+    // --- M15: self-test, auto-detection and LAN discovery (docs/api.md §15) ----------
+
+    /// <summary>
+    /// One classified candidate, fired from a sweep worker thread. The struct and every
+    /// string in it are valid only for the duration of the call.
+    /// </summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void DetectedCallback(nint printer, ulong completed, ulong total,
+        nint context);
+
+    /// <summary>One open port, fired from a sweep worker thread. Same lifetime rule.</summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void DiscoveredCallback(nint device, ulong completed, ulong total,
+        nint context);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_self_test(nint driver, nint printer,
+        in PdSelfTestOptions options, out PdSelfTestResult result);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_auto_detect(nint driver, in PdAutoDetectOptions options,
+        DetectedCallback? callback, nint context);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_discover(nint driver, in PdDiscoverOptions options,
+        DiscoveredCallback? callback, nint context);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_local_subnet(nint driver);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_profile_selection_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_detection_status_name(int value);
+
     // --- Helpers ---------------------------------------------------------------------
 
     /// <summary>
@@ -530,4 +566,116 @@ internal struct PdPayload
 {
     public int Kind;
     public PdPayloadUnion As;
+}
+
+// --- M15 structs (docs/api.md §15) ----------------------------------------------------
+
+/// <summary>
+/// <c>pd_detection_summary</c> — the report the self-test prints on paper and
+/// auto-detection returns per candidate. Every <c>nint</c> here is a
+/// <c>const char*</c> the driver owns; see pd.h for how long.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDetectionSummary
+{
+    public nint Endpoint;
+    public nint Vendor;
+    public nint Model;
+    public nint Firmware;
+    public nint Serial;
+    public int IdentityTrusted;
+    public byte ConfidencePercent;
+    public int ImpersonationSuspected;
+    public int IdentityFresh;
+    public nint ProfileId;
+    public int Selection;
+    public ushort NominalPaperMm;
+    public uint PrintableWidthDots;
+    public uint CharsPerLine;
+    public ushort Dpi;
+    public int Completion;
+    public int GradeCeiling;
+    public int Authority;
+    public nint Method;
+    public int CompletionProvenance;
+    public int DrawerPresent;
+    public int DrawerKickable;
+    public int DrawerStandard;
+    public ushort DrawerVoltage;
+    public int DrawerElectricalProvenance;
+    public int DrawerCommandsProvenance;
+    public nint ProvenanceSummary;
+    public nint Degradations;
+    public nuint DegradationCount;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdSelfTestOptions
+{
+    public nint Key;
+    public int RefreshIdentity;
+    public int ProbeWithoutPrinting;
+    public int NoBarcode;
+    public nint BarcodeData;
+    public int NoVerificationId;
+    public uint TimeoutMs;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdSelfTestResult
+{
+    public PdJobResult Result;
+    public PdDetectionSummary Detection;
+    public nint Key;
+    public nint PrintToken;
+    public nint TicketText;
+    public nint Job;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdAutoDetectOptions
+{
+    public nint SubnetCidr;
+    public nint Endpoints;
+    public ushort Port;
+    public uint Concurrency;
+    public uint ConnectTimeoutMs;
+    public uint ResponseTimeoutMs;
+    public int LeaveUnknownUnprobed;
+    public uint StatusTimeoutMs;
+    public uint IdentityTimeoutMs;
+    public uint CompletionTimeoutMs;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDetectedPrinter
+{
+    public nint Endpoint;
+    public nint Host;
+    public ushort Port;
+    public int Status;
+    public int PortOpen;
+    public int FromCache;
+    public nint DleEotHex;
+    public PdDetectionSummary Summary;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDiscoverOptions
+{
+    public nint SubnetCidr;
+    public ushort Port;
+    public uint Concurrency;
+    public uint ConnectTimeoutMs;
+    public uint ResponseTimeoutMs;
+    public int NoBackchannelProbe;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDiscoveredDevice
+{
+    public nint Ip;
+    public ushort Port;
+    public int Port9100Open;
+    public nint DleEotHex;
 }

@@ -30,12 +30,18 @@ let package = Package(
         // need not link a policy engine; SwiftPM has one target for the whole ABI, so the
         // addon's single translation unit joins it here.
         "queue/src",
+        // M15: pd_self_test binds Printer::selfTest, and that member is defined in the
+        // receipt-DSL library because the diagnostic ticket is a DSL document
+        // (docs/api.md §15). CMake keeps the DSL a separate library and links it into the
+        // ABI; SwiftPM has one target for the whole ABI, so its sources join it here.
+        "dsl/src",
       ],
       publicHeadersPath: "capi/include",
       cxxSettings: [
         .headerSearchPath("core/include"),
         .headerSearchPath("capi/src"),
         .headerSearchPath("queue/include"),
+        .headerSearchPath("dsl/include"),
       ]
     ),
 
@@ -63,6 +69,7 @@ let package = Package(
         .headerSearchPath("core/tests"),
         .headerSearchPath("capi/src"),
         .headerSearchPath("queue/include"),
+        .headerSearchPath("dsl/include"),  // M15
       ]
     ),
 

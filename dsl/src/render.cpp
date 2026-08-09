@@ -665,6 +665,19 @@ RenderProfile RenderProfile::from(const CapabilityProfile& capability,
   profile.code_page = capability.code_page;
   profile.cutter = capability.media.cutter;
   profile.head_to_cutter_feed_dots = capability.media.head_to_cutter_feed_dots;
+  // M15. Two independent questions, both of which have to be YES: does the firmware
+  // implement the drawing command (CapabilityProfile::render), and is this path one
+  // where an ESC/POS drawing command means anything at all? Star line mode has neither
+  // GS k nor GS ( k, so a barcode block on a Star profile is a declared degradation
+  // rather than a stream of literal bytes across half a receipt.
+  const bool escpos_path = capability.language == CommandLanguage::EscPos;
+  profile.barcodes = capability.render.barcode_gs_k && escpos_path;
+  profile.qr = capability.render.qr_gs_paren_k && escpos_path;
+  profile.images = capability.render.raster_gs_v;
+  // `drawer_kick` is deliberately left alone: a `drawerKick` block is a document asking
+  // for a pulse, and whether that pulse is *allowed* is docs/cash-drawer.md's question,
+  // answered by Printer::openDrawer with the whole electrical classification behind it.
+  // Mirroring it here would put half of that rule in a renderer.
   return profile;
 }
 

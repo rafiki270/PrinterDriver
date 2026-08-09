@@ -55,6 +55,10 @@ void main() {
     setUpAll(() {
       bindings = testingBindings;
 
+      final selections = ProfileSelection.values
+          .where((v) => v != ProfileSelection.unrecognized);
+      final detections =
+          DetectionStatus.values.where((v) => v != DetectionStatus.unrecognized);
       final states = JobState.values.where((v) => v != JobState.unrecognized);
       final confidences = ConfidenceLevel.values
           .where((v) => v != ConfidenceLevel.unrecognized);
@@ -170,6 +174,14 @@ void main() {
               'VendorSdk',
               'None',
             ]),
+        // M15 — docs/api.md §15. `byDefault` is spelled around Dart's reserved word,
+        // which is why this pair names the core's spellings outright.
+        _Mirror(PdTestEnum.profileSelection, ProfileSelection.nativeCount,
+            selections.map((v) => v.nativeValue).toList(),
+            expectedNames: const <String>['Documented', 'Probed', 'Default']),
+        _Mirror(PdTestEnum.detectionStatus, DetectionStatus.nativeCount,
+            detections.map((v) => v.nativeValue).toList(),
+            expectedNames: _coreSpelling(detections.map((v) => v.name))),
       ];
 
       namers = <PdTestEnum, Pointer<Char> Function(int)>{
@@ -187,6 +199,8 @@ void main() {
         PdTestEnum.drawerPortStandard: bindings.drawerPortStandardName,
         PdTestEnum.drawerKickMethod: bindings.drawerKickMethodName,
         PdTestEnum.drawerStatusMethod: bindings.drawerStatusMethodName,
+        PdTestEnum.profileSelection: bindings.profileSelectionName,
+        PdTestEnum.detectionStatus: bindings.detectionStatusName,
       };
     });
 

@@ -17,6 +17,8 @@
 #include "printerdriver/escpos_encoder.hpp"
 #include "printerdriver/identity.hpp"
 #include "printerdriver/job_store.hpp"
+// M15 — the option and result types for selfTest()/autoDetect() (docs/api.md §15).
+#include "printerdriver/self_test.hpp"
 #include "printerdriver/transport.hpp"
 #include "printerdriver/types.hpp"
 
@@ -324,6 +326,35 @@ class Printer {
   DrawerPolarity drawerPolarity() const;
   // --- end M14 ---------------------------------------------------------------------
 
+  // --- M15: self-test (docs/api.md §15) ---------------------------------------------
+  //
+  // Prints ONE diagnostic ticket through the full fenced engine and returns the ordinary
+  // tri-state result plus what the ticket says. The paper is the detection report:
+  // identity, profile and how it was selected, media, completion mechanism with its
+  // grade ceiling and provenance, the drawer classification, a Czech/Hungarian/Polish
+  // charset line, a Code 128 sample, and the job's own GS ( H verification token in the
+  // trailer QR. Anything the profile cannot do is printed as a declared degradation
+  // rather than silently dropped.
+  //
+  // Composition only: identify + probe + the DSL renderer + print(), with an
+  // idempotency key of `selftest-<unix ms>` and printVerificationId on. There is no
+  // second engine and no bypass, which is the point — a Done at grade A here is the
+  // statement that the ordinary path works end to end on this unit.
+  //
+  // Blocks until the job is terminal. DEFINED IN THE DSL LIBRARY: see the note at the
+  // top of printerdriver/self_test.hpp.
+  SelfTestResult selfTest(const SelfTestOptions& options = {});
+
+  // Runs the capability probe against this device on this printer's own worker thread,
+  // behind whatever is queued, and returns what it established — the same probe
+  // addPrinter schedules under ProbePolicy::IfUnknown and Always, never a second one.
+  // Exposed because a self-test, and an operator, want to be able to ask *now*.
+  // `print_test_lines` false keeps it printless at the cost of asking the ordered fences
+  // out of an empty buffer (see AutoDetectOptions for why that is a weaker answer).
+  // nullopt when the device could not be reached or answered nothing at all.
+  std::optional<CapabilityFindings> probeNow(bool print_test_lines = true);
+  // --- end M15 -----------------------------------------------------------------------
+
   // Blocks until the queue is empty and the active job is terminal.
   void drain();
 
@@ -408,6 +439,25 @@ class PrinterDriver {
   // the tokens on yesterday's paper still name this instance; regenerated per process
   // for an in-memory driver, which has nowhere to keep it.
   const std::string& instanceNonce() const noexcept;
+
+  // --- M15: auto-detection (docs/api.md §15) -----------------------------------------
+  //
+  // The one call from "I know nothing" to a list of configured-and-classified printers:
+  // LAN discovery (the non-printing DLE EOT 1 sweep of discovery.hpp) → multi-signal
+  // identification per candidate → the non-destructive capability probe, respecting the
+  // stored-findings cache → one DetectedPrinter per address, classified honestly.
+  //
+  // NOTHING PRINTS AND NOTHING FIRES. Only the printless probe paths are used: DLE EOT,
+  // GS I, and the two fences asked out of an empty buffer. The full probe's GS ( H test
+  // line DOES print, so it is not used here, and a completion established this way is
+  // reported without promoting its provenance — read the comment on
+  // AutoDetectOptions::allow_printing_probe before trusting a fence this call found.
+  //
+  // Blocks until every candidate is finished. `on_candidate` fires as each one is,
+  // from a worker thread.
+  std::vector<DetectedPrinter> autoDetect(const AutoDetectOptions& options = {},
+                                          const AutoDetectProgressCallback& on_candidate = {});
+  // --- end M15 -----------------------------------------------------------------------
 
   void shutdown();
 

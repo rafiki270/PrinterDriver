@@ -277,6 +277,188 @@ final class PrinterDriver {
     return readNativeString(_bindings.instanceNonce(_handle));
   }
 
+  // --- M15: auto-detection and LAN discovery (docs/api.md §15) ----------------------
+
+  /// Sweeps, identifies and classifies. **Nothing prints and nothing fires.**
+  ///
+  /// Discovery (the non-printing `DLE EOT 1` sweep) then multi-signal identification per
+  /// candidate, then the PRINTLESS subset of the capability probe, respecting the stored
+  /// findings cache.
+  ///
+  /// An ordered fence only means anything when there is print data ahead of it. This
+  /// call has none, so the fences go out behind an empty buffer: a device that echoes
+  /// them has proved that its firmware *implements* the command, not that the echo waits
+  /// for paper to move. The flag is promoted and its provenance is not —
+  /// [DetectedCompletion.provenance] stays [Provenance.unverified] on a printless
+  /// answer, and the reason appears in [DetectionSummary.degradations]. Full promotion
+  /// needs the printing probe or a real job.
+  ///
+  /// [endpoints] is an explicit `host` / `host:port` list that skips the sweep entirely —
+  /// the path for a caller with a known inventory, and the only one that reports an
+  /// unreachable address, because it is the only one where somebody named it.
+  ///
+  /// Blocks this isolate until every candidate is finished.
+  List<DetectedPrinter> autoDetect({
+    String? subnetCidr,
+    List<String> endpoints = const <String>[],
+    int port = 0,
+    int concurrency = 0,
+    Duration? connectTimeout,
+    Duration? responseTimeout,
+    bool probeUnknown = true,
+  }) {
+    _checkAlive();
+    final count = Arena.using((arena) {
+      final options =
+          arena.allocate<PdAutoDetectOptions>(sizeOf<PdAutoDetectOptions>());
+      options.ref
+        ..subnetCidr = arena.string(subnetCidr)
+        ..endpoints = _stringArray(arena, endpoints)
+        ..port = port
+        ..concurrency = concurrency
+        ..connectTimeoutMs = connectTimeout?.inMilliseconds ?? 0
+        ..responseTimeoutMs = responseTimeout?.inMilliseconds ?? 0
+        ..leaveUnknownUnprobed = probeUnknown ? 0 : 1;
+      // No callback: a Dart isolate blocked inside an FFI call cannot service a native
+      // one until the call returns, so the results are read back by index instead
+      // (pd.h, pd_detected_at).
+      return _bindings.autoDetect(_handle, options, nullptr, nullptr);
+    });
+    if (count < 0) {
+      throw PrinterDriverException(lastError);
+    }
+    return Arena.using((arena) {
+      final slot =
+          arena.allocate<PdDetectedPrinter>(sizeOf<PdDetectedPrinter>());
+      final found = <DetectedPrinter>[];
+      for (var index = 0; index < count; index++) {
+        if (_bindings.detectedAt(_handle, index, slot) != 1) break;
+        found.add(DetectedPrinter.fromNative(slot.ref));
+      }
+      return List<DetectedPrinter>.unmodifiable(found);
+    });
+  }
+
+  /// [autoDetect] as a stream, for a UI that wants to fill a table as it goes.
+  ///
+  /// The sweep itself blocks a thread, and Dart cannot deliver a native callback to an
+  /// isolate that is blocked inside the call firing it — so this runs the sweep off the
+  /// event loop and emits the candidates it found. The stream is honest about that: it
+  /// is a stream of results, not a live feed.
+  Stream<DetectedPrinter> autoDetectStream({
+    String? subnetCidr,
+    List<String> endpoints = const <String>[],
+    int port = 0,
+    int concurrency = 0,
+    Duration? connectTimeout,
+    Duration? responseTimeout,
+    bool probeUnknown = true,
+  }) async* {
+    final found = await Future(() => autoDetect(
+          subnetCidr: subnetCidr,
+          endpoints: endpoints,
+          port: port,
+          concurrency: concurrency,
+          connectTimeout: connectTimeout,
+          responseTimeout: responseTimeout,
+          probeUnknown: probeUnknown,
+        ));
+    for (final one in found) {
+      yield one;
+    }
+  }
+
+  /// The raw sweep underneath [autoDetect]: is something ESC/POS-shaped listening, and
+  /// does its backchannel reach me?
+  ///
+  /// No identification, no capability probe, no profile — deciding what a device *is*
+  /// costs time and belongs to [autoDetect]. The whole write side is `DLE EOT 1`
+  /// (`10 04 01`), every byte of which is below 0x20 and therefore cannot print on any
+  /// device, ever.
+  ///
+  /// [subnetCidr] of null sweeps [localSubnet]. Blocks this isolate.
+  List<DiscoveredDevice> discover({
+    String? subnetCidr,
+    int port = 0,
+    int concurrency = 0,
+    Duration? connectTimeout,
+    Duration? responseTimeout,
+    bool probeBackchannel = true,
+  }) {
+    _checkAlive();
+    final count = Arena.using((arena) {
+      final options =
+          arena.allocate<PdDiscoverOptions>(sizeOf<PdDiscoverOptions>());
+      options.ref
+        ..subnetCidr = arena.string(subnetCidr)
+        ..port = port
+        ..concurrency = concurrency
+        ..connectTimeoutMs = connectTimeout?.inMilliseconds ?? 0
+        ..responseTimeoutMs = responseTimeout?.inMilliseconds ?? 0
+        ..noBackchannelProbe = probeBackchannel ? 0 : 1;
+      return _bindings.discover(_handle, options, nullptr, nullptr);
+    });
+    if (count < 0) {
+      throw PrinterDriverException(lastError);
+    }
+    return Arena.using((arena) {
+      final slot =
+          arena.allocate<PdDiscoveredDevice>(sizeOf<PdDiscoveredDevice>());
+      final found = <DiscoveredDevice>[];
+      for (var index = 0; index < count; index++) {
+        if (_bindings.discoveredAt(_handle, index, slot) != 1) break;
+        found.add(DiscoveredDevice.fromNative(slot.ref));
+      }
+      return List<DiscoveredDevice>.unmodifiable(found);
+    });
+  }
+
+  /// [discover] as a stream. Same caveat as [autoDetectStream].
+  Stream<DiscoveredDevice> discoverStream({
+    String? subnetCidr,
+    int port = 0,
+    int concurrency = 0,
+    Duration? connectTimeout,
+    Duration? responseTimeout,
+    bool probeBackchannel = true,
+  }) async* {
+    final found = await Future(() => discover(
+          subnetCidr: subnetCidr,
+          port: port,
+          concurrency: concurrency,
+          connectTimeout: connectTimeout,
+          responseTimeout: responseTimeout,
+          probeBackchannel: probeBackchannel,
+        ));
+    for (final one in found) {
+      yield one;
+    }
+  }
+
+  /// The /24 around this host's primary address, as `192.168.1.0/24`, or null when it
+  /// cannot be determined.
+  ///
+  /// Found by asking the routing table which local address would be used to reach a
+  /// remote one; no packet is transmitted.
+  String? get localSubnet {
+    _checkAlive();
+    final value = readNativeString(_bindings.localSubnet(_handle));
+    return value.isEmpty ? null : value;
+  }
+
+  /// A NULL-terminated `char*` array inside [arena], or `nullptr` when empty.
+  static Pointer<Pointer<Char>> _stringArray(Arena arena, List<String> values) {
+    if (values.isEmpty) return nullptr;
+    final array = arena.allocate<Pointer<Char>>(
+      (values.length + 1) * sizeOf<Pointer<Char>>(),
+    );
+    for (var index = 0; index < values.length; index++) {
+      array[index] = arena.string(values[index]);
+    }
+    array[values.length] = nullptr;
+    return array;
+  }
+
   /// Test support: attaches a printer whose transport is an in-process scripted device.
   ///
   /// Only works against a library built from the `printerdriver_capi_testing` target;
@@ -609,6 +791,62 @@ final class Printer {
   bool get drawerHighMeansOpen {
     _driver._checkAlive();
     return _bindings.drawerHighMeansOpen(_driver._handle, _handle) == 1;
+  }
+
+  // --- M15: the self-test (docs/api.md §15) ---------------------------------------
+
+  /// Prints ONE diagnostic ticket through the full fenced engine and reports what it
+  /// established. **This uses paper: the paper is the report.**
+  ///
+  /// Identity, profile and how it was selected, media, completion mechanism with its
+  /// grade ceiling and provenance, the drawer classification, a Czech/Hungarian/Polish
+  /// charset line, a Code 128 sample and the job's own verification token in the trailer
+  /// QR. Anything the profile cannot draw is printed as a declared degradation rather
+  /// than dropped, and repeated in [DetectionSummary.degradations].
+  ///
+  /// The printer's OWN built-in self-test (`GS ( A`) is a different document and stays
+  /// separately reachable through `pdctl test-print`: vendor firmware's view of the
+  /// device against this, the SDK's.
+  ///
+  /// Blocks this isolate until the job is terminal.
+  SelfTestResult selfTest({
+    String? key,
+    bool refreshIdentity = false,
+    bool probeWithoutPrinting = false,
+    bool barcode = true,
+    String? barcodeData,
+    bool printVerificationId = true,
+    Duration? timeout,
+  }) {
+    _driver._checkAlive();
+    return Arena.using((arena) {
+      final options =
+          arena.allocate<PdSelfTestOptions>(sizeOf<PdSelfTestOptions>());
+      options.ref
+        ..key = arena.string(key)
+        ..refreshIdentity = refreshIdentity ? 1 : 0
+        ..probeWithoutPrinting = probeWithoutPrinting ? 1 : 0
+        ..noBarcode = barcode ? 0 : 1
+        ..barcodeData = arena.string(barcodeData)
+        ..noVerificationId = printVerificationId ? 0 : 1
+        ..timeoutMs = timeout?.inMilliseconds ?? 0;
+
+      final out = arena.allocate<PdSelfTestResult>(sizeOf<PdSelfTestResult>());
+      if (_bindings.selfTest(_driver._handle, _handle, options, out) != 1) {
+        throw PrinterDriverException(_driver.lastError);
+      }
+      final token = readNativeString(out.ref.printToken);
+      final ticket = readNativeString(out.ref.ticketText);
+      return SelfTestResult(
+        result: jobResultFromNative(out.ref.result),
+        detection: DetectionSummary.fromNative(out.ref.detection),
+        key: readNativeString(out.ref.key),
+        verificationId: token.isEmpty ? null : token,
+        ticketLines: ticket.isEmpty
+            ? const <String>[]
+            : List.unmodifiable(ticket.split('\n')),
+      );
+    });
   }
 
   /// Blocks until this printer's queue is empty and its active job is terminal.

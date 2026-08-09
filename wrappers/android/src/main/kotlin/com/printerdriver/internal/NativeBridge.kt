@@ -173,6 +173,83 @@ internal object NativeBridge {
     @JvmStatic external fun drawerHighMeansOpen(driverHandle: Long, printerHandle: Long): Int
 
     /** Blocks until the printer's queue is empty and its active job is terminal. */
+    // --- M15: self-test, auto-detection and LAN discovery (docs/api.md §15) ---------
+    //
+    // Numbers and strings cross separately, which is the JNI idiom this file already uses
+    // for pd_device_status and the drawer facet: an IntArray the caller supplies is filled
+    // by the glue, and the strings come back as the return value. Packing both into one
+    // Array<String> would mean parsing integers out of text on the Kotlin side, which is
+    // exactly the kind of quiet lossiness this SDK exists to avoid.
+
+    /** Prints ONE diagnostic ticket through the full fenced engine (docs/api.md §15).
+     *  USES PAPER. `values` must have room for 24 ints and receives, in order:
+     *  [outcome, confidence, reason, grade, authority,
+     *   identityTrusted, confidencePercent, impersonationSuspected, identityFresh,
+     *   selection, nominalPaperMm, printableWidthDots, charsPerLine, dpi,
+     *   completion, gradeCeiling, completionAuthority, completionProvenance,
+     *   drawerPresent, drawerKickable, drawerStandard, drawerVoltage,
+     *   degradationCount, ticketLineCount].
+     *  Returns the strings: [resultMethod, key, printToken, endpoint, vendor, model,
+     *  firmware, serial, profileId, completionMethod, provenanceSummary] followed by
+     *  `degradationCount` degradation lines and then `ticketLineCount` ticket lines.
+     *  Empty array when the call was refused; see driverLastError. Blocks. */
+    @JvmStatic external fun selfTest(
+        driverHandle: Long,
+        printerHandle: Long,
+        key: String?,
+        refreshIdentity: Boolean,
+        probeWithoutPrinting: Boolean,
+        barcode: Boolean,
+        barcodeData: String?,
+        printVerificationId: Boolean,
+        timeoutMs: Int,
+        values: IntArray
+    ): Array<String>
+
+    /** Sweeps, identifies and classifies. NOTHING PRINTS AND NOTHING FIRES. Returns how
+     *  many candidates were examined, or -1 on error (see driverLastError); read them
+     *  back with [detectedAt]. Blocks. */
+    @JvmStatic external fun autoDetect(
+        driverHandle: Long,
+        subnetCidr: String?,
+        endpoints: Array<String>,
+        port: Int,
+        concurrency: Int,
+        connectTimeoutMs: Int,
+        responseTimeoutMs: Int,
+        probeUnknown: Boolean
+    ): Int
+
+    /** One candidate of the last [autoDetect]. `values` must have room for 22 ints:
+     *  [port, status, portOpen, fromCache, identityTrusted, confidencePercent,
+     *   impersonationSuspected, identityFresh, selection, nominalPaperMm,
+     *   printableWidthDots, charsPerLine, dpi, completion, gradeCeiling, authority,
+     *   completionProvenance, drawerPresent, drawerKickable, drawerStandard,
+     *   drawerVoltage, degradationCount].
+     *  Returns [endpoint, host, dleEotHex, vendor, model, firmware, serial, profileId,
+     *  completionMethod, provenanceSummary] plus `degradationCount` degradation lines.
+     *  Empty array when the index is out of range. */
+    @JvmStatic external fun detectedAt(driverHandle: Long, index: Int, values: IntArray): Array<String>
+
+    /** The raw non-printing sweep beneath [autoDetect]: DLE EOT 1 and nothing else.
+     *  Returns how many open ports were found, or -1 on error. Blocks. */
+    @JvmStatic external fun discover(
+        driverHandle: Long,
+        subnetCidr: String?,
+        port: Int,
+        concurrency: Int,
+        connectTimeoutMs: Int,
+        responseTimeoutMs: Int,
+        probeBackchannel: Boolean
+    ): Int
+
+    /** One device of the last [discover]. `values` must have room for 2 ints:
+     *  [port, portOpen]. Returns [ip, dleEotHex], or an empty array when out of range. */
+    @JvmStatic external fun discoveredAt(driverHandle: Long, index: Int, values: IntArray): Array<String>
+
+    /** The local /24 as a CIDR string, or "" when it cannot be determined. */
+    @JvmStatic external fun localSubnet(driverHandle: Long): String
+
     @JvmStatic external fun printerDrain(driverHandle: Long, printerHandle: Long)
 
     /** Registers [callback] for the life of the driver -- there is no
