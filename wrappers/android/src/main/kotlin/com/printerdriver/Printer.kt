@@ -27,7 +27,9 @@ private object PdOpKind {
  * and owned by its driver).
  */
 class Printer internal constructor(
-    private val driver: PrinterDriver,
+    // internal, not private: the M15 self-test is an extension function in this module
+    // (Detection.kt) and needs the driver handle the same way every member here does.
+    internal val driver: PrinterDriver,
     internal val handle: Long
 ) {
     val id: String get() { driver.checkOpen(); return NativeBridge.printerId(handle) }

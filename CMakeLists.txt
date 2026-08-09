@@ -64,6 +64,10 @@ add_library(printerdriver_core STATIC
   core/src/job_store.cpp
   core/src/discovery.cpp
   core/src/driver.cpp
+  # M15 — auto-detection (docs/api.md §15): discovery + identify + the printless probe
+  # subset, composed, plus the report structure the self-test shares with it. Nothing
+  # here prints and nothing here fires.
+  core/src/auto_detect.cpp
   # Platform-independent, unlike the pair selected above: the embedder-owned transport
   # contains no socket call at all, because the socket belongs to the embedder
   # (docs/compatibility-brief.md §25). This is how Bluetooth reaches the core on Apple
@@ -130,7 +134,11 @@ add_library(printerdriver_dsl STATIC
   dsl/src/format.cpp
   dsl/src/bind.cpp
   dsl/src/barcode.cpp
-  dsl/src/render.cpp)
+  dsl/src/render.cpp
+  # M15 — Printer::selfTest (docs/api.md §15). Declared in core/driver.hpp, defined here
+  # because the diagnostic ticket is a DSL document and the DSL depends on the core, not
+  # the other way round. See the linkage note at the top of printerdriver/self_test.hpp.
+  dsl/src/self_test.cpp)
 
 target_include_directories(printerdriver_dsl PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/dsl/include>)
@@ -152,7 +160,11 @@ target_include_directories(printerdriver_capi PRIVATE
 # reimplement the three §12 rules without eventually getting one of them wrong.
 # printerdriver_queue PUBLIC-links the core, so naming both here would put the same
 # archive on the link line twice.
-target_link_libraries(printerdriver_capi PUBLIC printerdriver_queue)
+#
+# M15: the DSL joins it, because pd_self_test binds Printer::selfTest and that member is
+# defined in the DSL library (docs/api.md §15 — the ticket is a document). The ABI is
+# what every wrapper binds, so the self-test has to be reachable through it.
+target_link_libraries(printerdriver_capi PUBLIC printerdriver_queue printerdriver_dsl)
 
 printerdriver_warnings(printerdriver_capi)
 
@@ -169,6 +181,8 @@ if(PD_BUILD_SHARED_CAPI)
   # M13b: the queue addon is linked into the same shared object now that pd_queue_*
   # exists, so it needs the same treatment.
   set_property(TARGET printerdriver_queue PROPERTY POSITION_INDEPENDENT_CODE ON)
+  # M15: and so does the DSL, now that pd_self_test binds a member defined there.
+  set_property(TARGET printerdriver_dsl PROPERTY POSITION_INDEPENDENT_CODE ON)
 
   add_library(printerdriver_capi_shared SHARED capi/src/pd_capi.cpp)
   set_target_properties(printerdriver_capi_shared PROPERTIES
@@ -177,7 +191,8 @@ if(PD_BUILD_SHARED_CAPI)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/capi/include>)
   target_include_directories(printerdriver_capi_shared PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/capi/src)
-  target_link_libraries(printerdriver_capi_shared PRIVATE printerdriver_queue)  # M13b
+  target_link_libraries(printerdriver_capi_shared
+    PRIVATE printerdriver_queue printerdriver_dsl)  # M13b, M15
   printerdriver_warnings(printerdriver_capi_shared)
 
   # Same ABI plus the scripted device and the enum bridge, so a wrapper's test suite can
@@ -192,7 +207,8 @@ if(PD_BUILD_SHARED_CAPI)
     ${CMAKE_CURRENT_SOURCE_DIR}/capi/src
     ${CMAKE_CURRENT_SOURCE_DIR}/capi/tests
     ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
-  target_link_libraries(printerdriver_capi_testing PRIVATE printerdriver_queue)  # M13b
+  target_link_libraries(printerdriver_capi_testing
+    PRIVATE printerdriver_queue printerdriver_dsl)  # M13b, M15
   printerdriver_warnings(printerdriver_capi_testing)
 endif()
 
@@ -242,7 +258,11 @@ set(printerdriver_tests
   test_probe_path  # docs/compatibility-brief.md §19-§23: PRINT_SERVER_ONLY
   # M14 — docs/cash-drawer.md: the fleet's drawer facets, the state machine and the
   # verified opening sequence against the scripted device.
-  test_drawer)
+  test_drawer
+  # M15 — docs/api.md §15. Auto-detection against three real loopback listeners: one
+  # ESC/POS-answering, one silent, one refusing. Core-only on purpose — autoDetect
+  # composes discovery, identify and the printless probe and needs no renderer.
+  test_autodetect)
 
 foreach(test_name IN LISTS printerdriver_tests)
   add_executable(${test_name}
@@ -262,7 +282,11 @@ set(printerdriver_dsl_tests
   test_dsl_format
   test_dsl_bind
   test_dsl_barcode
-  test_dsl_render)
+  test_dsl_render
+  # M15 — docs/api.md §15. Printer::selfTest is defined in this library, so its suite
+  # lives here; it drives the core's scripted device, hence the core/tests include path
+  # the loop below already adds.
+  test_selftest)
 
 foreach(test_name IN LISTS printerdriver_dsl_tests)
   add_executable(${test_name}

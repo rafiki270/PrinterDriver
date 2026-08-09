@@ -1332,4 +1332,283 @@ JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_jobMethod
   return StdToJString(env, result.method);
 }
 
+// --- M15: self-test, auto-detection and LAN discovery (docs/api.md §15) ---------------
+//
+// Numbers and strings cross separately, the same split pd_device_status and the drawer
+// facet already use: the caller supplies a jintArray the glue fills, and the strings come
+// back as the return value. Nothing here decides anything -- which provenance column
+// governs a mechanism, what a printless probe may claim and how a ticket is laid out are
+// all core questions, answered behind pd_self_test / pd_auto_detect / pd_discover.
+
+namespace {
+
+// A growable String[] builder. JNI has no such thing, and every M15 entry point returns a
+// variable-length list of strings.
+class JStringList {
+ public:
+  explicit JStringList(JNIEnv* env) : env_(env) {}
+
+  void add(const char* value) { values_.push_back(value != nullptr ? value : ""); }
+  void add(const std::string& value) { values_.push_back(value); }
+
+  jobjectArray release() {
+    jclass string_class = env_->FindClass("java/lang/String");
+    jobjectArray array = env_->NewObjectArray(
+        static_cast<jsize>(values_.size()), string_class, nullptr);
+    if (array != nullptr) {
+      for (size_t i = 0; i < values_.size(); ++i) {
+        jstring value = StdToJString(env_, values_[i].c_str());
+        env_->SetObjectArrayElement(array, static_cast<jsize>(i), value);
+        env_->DeleteLocalRef(value);
+      }
+    }
+    env_->DeleteLocalRef(string_class);
+    return array;
+  }
+
+ private:
+  JNIEnv* env_;
+  std::vector<std::string> values_;
+};
+
+jobjectArray EmptyStringArray(JNIEnv* env) {
+  JStringList list(env);
+  return list.release();
+}
+
+// Writes `count` ints into a caller-supplied jintArray, refusing quietly when it is too
+// small: a wrapper that under-sized the buffer gets zeros rather than a heap overwrite.
+void WriteInts(JNIEnv* env, jintArray out, const std::vector<jint>& values) {
+  if (out == nullptr) {
+    return;
+  }
+  const jsize capacity = env->GetArrayLength(out);
+  if (capacity < static_cast<jsize>(values.size())) {
+    return;
+  }
+  env->SetIntArrayRegion(out, 0, static_cast<jsize>(values.size()), values.data());
+}
+
+// The detection report's numeric half, in the order NativeBridge documents.
+void AppendSummaryInts(const pd_detection_summary& summary, std::vector<jint>* out) {
+  out->push_back(static_cast<jint>(summary.identity_trusted));
+  out->push_back(static_cast<jint>(summary.confidence_percent));
+  out->push_back(static_cast<jint>(summary.impersonation_suspected));
+  out->push_back(static_cast<jint>(summary.identity_fresh));
+  out->push_back(static_cast<jint>(summary.selection));
+  out->push_back(static_cast<jint>(summary.nominal_paper_mm));
+  out->push_back(static_cast<jint>(summary.printable_width_dots));
+  out->push_back(static_cast<jint>(summary.chars_per_line));
+  out->push_back(static_cast<jint>(summary.dpi));
+  out->push_back(static_cast<jint>(summary.completion));
+  out->push_back(static_cast<jint>(summary.grade_ceiling));
+  out->push_back(static_cast<jint>(summary.authority));
+  out->push_back(static_cast<jint>(summary.completion_provenance));
+  out->push_back(static_cast<jint>(summary.drawer_present));
+  out->push_back(static_cast<jint>(summary.drawer_kickable));
+  out->push_back(static_cast<jint>(summary.drawer_standard));
+  out->push_back(static_cast<jint>(summary.drawer_voltage));
+}
+
+// And its string half, minus the degradations, which the caller appends last so their
+// count can be the final int.
+void AppendSummaryStrings(const pd_detection_summary& summary, JStringList* out) {
+  out->add(summary.endpoint);
+  out->add(summary.vendor);
+  out->add(summary.model);
+  out->add(summary.firmware);
+  out->add(summary.serial);
+  out->add(summary.profile_id);
+  out->add(summary.method);
+  out->add(summary.provenance_summary);
+}
+
+void AppendDegradations(const pd_detection_summary& summary, JStringList* out) {
+  for (size_t i = 0; i < summary.degradation_count; ++i) {
+    out->add(summary.degradations[i]);
+  }
+}
+
+}  // namespace
+
+JNIEXPORT jobjectArray JNICALL Java_com_printerdriver_internal_NativeBridge_selfTest(
+    JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jstring key,
+    jboolean refreshIdentity, jboolean probeWithoutPrinting, jboolean barcode,
+    jstring barcodeData, jboolean printVerificationId, jint timeoutMs, jintArray values) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr) {
+    return EmptyStringArray(env);
+  }
+
+  const std::string key_text = JStringToStd(env, key);
+  const std::string barcode_text = JStringToStd(env, barcodeData);
+  pd_self_test_options options{};
+  options.key = key != nullptr ? key_text.c_str() : nullptr;
+  options.refresh_identity = refreshIdentity ? 1 : 0;
+  options.probe_without_printing = probeWithoutPrinting ? 1 : 0;
+  options.no_barcode = barcode ? 0 : 1;
+  options.barcode_data = barcodeData != nullptr ? barcode_text.c_str() : nullptr;
+  options.no_verification_id = printVerificationId ? 0 : 1;
+  options.timeout_ms = static_cast<uint32_t>(timeoutMs);
+
+  pd_self_test_result result{};
+  if (pd_self_test(handle->driver, printer, &options, &result) == 0) {
+    return EmptyStringArray(env);
+  }
+
+  // The ticket arrives as one '\n'-separated block; JNI carries it as lines, so the
+  // Kotlin side never has to know how it was joined.
+  std::vector<std::string> ticket_lines;
+  {
+    const std::string ticket = result.ticket_text != nullptr ? result.ticket_text : "";
+    std::string line;
+    for (const char c : ticket) {
+      if (c == '\n') {
+        ticket_lines.push_back(line);
+        line.clear();
+      } else {
+        line.push_back(c);
+      }
+    }
+    if (!line.empty()) {
+      ticket_lines.push_back(line);
+    }
+  }
+
+  std::vector<jint> ints;
+  ints.push_back(static_cast<jint>(result.result.outcome));
+  ints.push_back(static_cast<jint>(result.result.confidence));
+  ints.push_back(static_cast<jint>(result.result.reason));
+  ints.push_back(static_cast<jint>(result.result.grade));
+  ints.push_back(static_cast<jint>(result.result.authority));
+  AppendSummaryInts(result.detection, &ints);
+  ints.push_back(static_cast<jint>(result.detection.degradation_count));
+  ints.push_back(static_cast<jint>(ticket_lines.size()));
+  WriteInts(env, values, ints);
+
+  JStringList strings(env);
+  strings.add(result.result.method);
+  strings.add(result.key);
+  strings.add(result.print_token);
+  AppendSummaryStrings(result.detection, &strings);
+  AppendDegradations(result.detection, &strings);
+  for (const std::string& line : ticket_lines) {
+    strings.add(line);
+  }
+  return strings.release();
+}
+
+JNIEXPORT jint JNICALL Java_com_printerdriver_internal_NativeBridge_autoDetect(
+    JNIEnv* env, jclass, jlong driverHandle, jstring subnetCidr, jobjectArray endpoints,
+    jint port, jint concurrency, jint connectTimeoutMs, jint responseTimeoutMs,
+    jboolean probeUnknown) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr) {
+    return -1;
+  }
+
+  const std::string cidr = JStringToStd(env, subnetCidr);
+  // Owned here for the duration of the call: pd.h copies every string it is given before
+  // returning, so these outlive it by construction.
+  std::vector<std::string> endpoint_texts;
+  std::vector<const char*> endpoint_pointers;
+  if (endpoints != nullptr) {
+    const jsize count = env->GetArrayLength(endpoints);
+    endpoint_texts.reserve(static_cast<size_t>(count));
+    for (jsize i = 0; i < count; ++i) {
+      jobject element = env->GetObjectArrayElement(endpoints, i);
+      endpoint_texts.push_back(JStringToStd(env, static_cast<jstring>(element)));
+      env->DeleteLocalRef(element);
+    }
+    for (const std::string& text : endpoint_texts) {
+      endpoint_pointers.push_back(text.c_str());
+    }
+    endpoint_pointers.push_back(nullptr);
+  }
+
+  pd_auto_detect_options options{};
+  options.subnet_cidr = subnetCidr != nullptr ? cidr.c_str() : nullptr;
+  options.endpoints = endpoint_pointers.empty() ? nullptr : endpoint_pointers.data();
+  options.port = static_cast<uint16_t>(port);
+  options.concurrency = static_cast<uint32_t>(concurrency);
+  options.connect_timeout_ms = static_cast<uint32_t>(connectTimeoutMs);
+  options.response_timeout_ms = static_cast<uint32_t>(responseTimeoutMs);
+  options.leave_unknown_unprobed = probeUnknown ? 0 : 1;
+  // No callback: the results are read back by index, so a JNI thread attach per candidate
+  // never happens (pd.h, pd_detected_at).
+  return static_cast<jint>(pd_auto_detect(handle->driver, &options, nullptr, nullptr));
+}
+
+JNIEXPORT jobjectArray JNICALL Java_com_printerdriver_internal_NativeBridge_detectedAt(
+    JNIEnv* env, jclass, jlong driverHandle, jint index, jintArray values) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_detected_printer one{};
+  if (handle == nullptr || pd_detected_at(handle->driver, index, &one) == 0) {
+    return EmptyStringArray(env);
+  }
+
+  std::vector<jint> ints;
+  ints.push_back(static_cast<jint>(one.port));
+  ints.push_back(static_cast<jint>(one.status));
+  ints.push_back(static_cast<jint>(one.port_open));
+  ints.push_back(static_cast<jint>(one.from_cache));
+  AppendSummaryInts(one.summary, &ints);
+  ints.push_back(static_cast<jint>(one.summary.degradation_count));
+  WriteInts(env, values, ints);
+
+  JStringList strings(env);
+  strings.add(one.endpoint);
+  strings.add(one.host);
+  strings.add(one.dle_eot_hex);
+  AppendSummaryStrings(one.summary, &strings);
+  AppendDegradations(one.summary, &strings);
+  return strings.release();
+}
+
+JNIEXPORT jint JNICALL Java_com_printerdriver_internal_NativeBridge_discover(
+    JNIEnv* env, jclass, jlong driverHandle, jstring subnetCidr, jint port,
+    jint concurrency, jint connectTimeoutMs, jint responseTimeoutMs,
+    jboolean probeBackchannel) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr) {
+    return -1;
+  }
+  const std::string cidr = JStringToStd(env, subnetCidr);
+  pd_discover_options options{};
+  options.subnet_cidr = subnetCidr != nullptr ? cidr.c_str() : nullptr;
+  options.port = static_cast<uint16_t>(port);
+  options.concurrency = static_cast<uint32_t>(concurrency);
+  options.connect_timeout_ms = static_cast<uint32_t>(connectTimeoutMs);
+  options.response_timeout_ms = static_cast<uint32_t>(responseTimeoutMs);
+  options.no_backchannel_probe = probeBackchannel ? 0 : 1;
+  return static_cast<jint>(pd_discover(handle->driver, &options, nullptr, nullptr));
+}
+
+JNIEXPORT jobjectArray JNICALL Java_com_printerdriver_internal_NativeBridge_discoveredAt(
+    JNIEnv* env, jclass, jlong driverHandle, jint index, jintArray values) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_discovered_device one{};
+  if (handle == nullptr || pd_discovered_at(handle->driver, index, &one) == 0) {
+    return EmptyStringArray(env);
+  }
+  const std::vector<jint> ints = {static_cast<jint>(one.port),
+                                  static_cast<jint>(one.port9100_open)};
+  WriteInts(env, values, ints);
+
+  JStringList strings(env);
+  strings.add(one.ip);
+  strings.add(one.dle_eot_hex);
+  return strings.release();
+}
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_localSubnet(
+    JNIEnv* env, jclass, jlong driverHandle) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr) {
+    return StdToJString(env, "");
+  }
+  return StdToJString(env, pd_local_subnet(handle->driver));
+}
+
 } // extern "C"

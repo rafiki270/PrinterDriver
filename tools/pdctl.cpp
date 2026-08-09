@@ -282,6 +282,22 @@ int usage() {
       "      prints the render report (every degradation, declared) and a character\n"
       "      approximation of the paper. Reads files only; opens no socket.\n"
       "\n"
+      "  pdctl autodetect [cidr] [--port <n>] [--concurrency <n>]\n"
+      "                   [--connect-timeout <ms>] [--response-timeout <ms>]\n"
+      "                   [--endpoint <host[:port]>]... [--no-probe-unknown]\n"
+      "                   [--store <dir>] [--quiet]\n"
+      "      docs/api.md §15. Discovery -> identify -> the PRINTLESS subset of the\n"
+      "      capability probe, with the stored-findings cache respected. Prints one\n"
+      "      row per candidate: ip, vendor guess, model, trusted, profile,\n"
+      "      completion, grade ceiling, provenance. NOTHING PRINTS AND NOTHING\n"
+      "      FIRES. Because the fences are asked out of an empty buffer, a\n"
+      "      completion found here proves the command exists and not that its\n"
+      "      answer waits for paper: `pdctl probe`, which prints, or a real job is\n"
+      "      what promotes it. --no-probe-unknown leaves untouched devices alone\n"
+      "      and reports them Unverified; --endpoint may be repeated and skips the\n"
+      "      sweep entirely, which is also the only way an unreachable address is\n"
+      "      reported (somebody named it).\n"
+      "\n"
       "  pdctl print <host[:port]> --text \"...\" [options]\n"
       "  pdctl print <host[:port]> --template <file.json> [--model <file.json>]\n"
       "      Print a small receipt through the full engine and stream job events.\n"
@@ -311,6 +327,19 @@ int usage() {
       "      state before the kick, the pulse, whether the switch changed and\n"
       "      how long it took, and a verdict that distinguishes OPEN_VERIFIED\n"
       "      from KICK_SENT_UNVERIFIED.\n"
+      "  pdctl self-test <host[:port]> [--profile <name>] [--width <dots>]\n"
+      "                     [--store <dir>] [--refresh-identity] [--no-barcode]\n"
+      "      docs/api.md §15. Prints ONE diagnostic ticket through the full fenced\n"
+      "      engine: identity, profile and how it was selected, media, completion\n"
+      "      mechanism with its grade ceiling and provenance, the drawer\n"
+      "      classification, a Czech/Hungarian/Polish charset line, a Code 128\n"
+      "      sample, and the job's own verification token in the trailer QR.\n"
+      "      Anything the profile cannot draw is printed as a declared degradation.\n"
+      "      The ticket is the report and the terminal result is the proof: a Done\n"
+      "      at grade A is the statement that the stack works end to end on this\n"
+      "      unit. --refresh-identity interrogates the device first (that probe\n"
+      "      prints two short test lines). The printer's OWN built-in self-test is\n"
+      "      a different document: `pdctl test-print`.\n"
       "  pdctl counters <host[:port]>    GS g 2 maintenance counters\n"
       "  pdctl test-print <host[:port]>  GS ( A built-in test print (uses paper)\n"
       "  pdctl settings <host[:port]>    GS ( E fn 4 / fn 6 settings readback\n"
@@ -1809,6 +1838,191 @@ int runDiscover(const DiscoverArgs& args) {
   return devices.empty() ? kExitFailed : kExitDone;
 }
 
+// ====================================================================================
+// M15 — SELF-TEST AND AUTO-DETECTION (docs/api.md §15)
+// ====================================================================================
+
+struct SelfTestArgs {
+  std::string profile = "xp-s260m";
+  std::string store;
+  uint32_t width = pd::escpos::kWidth80mm;
+  bool refresh_identity = false;
+  bool barcode = true;
+};
+
+int runSelfTest(const Endpoint& endpoint, const SelfTestArgs& args) {
+  const pd::CapabilityProfile profile = profileByName(args.profile);
+
+  pd::PrinterDriver driver(pd::StorageConfig::at(args.store));
+  pd::PrinterConfig config;
+  config.id = endpoint.host + ":" + std::to_string(endpoint.port);
+  config.transport = pd::tcp(endpoint.host, endpoint.port, 3000);
+  config.width_dots = args.width;
+  config.profile = profile;
+  auto printer = driver.addPrinter(config);
+
+  std::cout << "self-test " << config.id << "  profile=" << profile.name << "\n"
+            << "one diagnostic ticket, through the ordinary fenced engine, under an\n"
+               "ordinary idempotency key. THIS USES PAPER: the paper is the report.\n";
+
+  pd::SelfTestOptions options;
+  options.refresh_identity = args.refresh_identity;
+  options.barcode = args.barcode;
+  const pd::SelfTestResult result = printer->selfTest(options);
+
+  section("Ticket (as laid out)");
+  for (const std::string& line : result.ticket_lines) {
+    std::cout << "  |" << line << "|\n";
+  }
+
+  const pd::DetectionSummary& detection = result.detection;
+  section("Detection");
+  row("endpoint", detection.endpoint);
+  row("vendor", detection.identity.vendor);
+  row("model", detection.identity.model.empty() ? "not reported"
+                                                : detection.identity.model);
+  row("identity trusted", yesNo(detection.identity.trusted));
+  row("confidence",
+      std::to_string(static_cast<int>(detection.identity.confidence_percent)) + "%");
+  row("identity from this run", yesNo(detection.identity_fresh));
+  row("profile", detection.profile_id);
+  row("selected by", pd::to_string(detection.selection));
+  row("media", std::to_string(detection.printable_width_dots) + " dots, " +
+                   std::to_string(detection.chars_per_line) + " cols, " +
+                   std::to_string(detection.dpi) + " dpi");
+  row("completion", std::string(pd::to_string(detection.completion)) + " (" +
+                        detection.method + ")");
+  row("grade ceiling", std::string(pd::gradeLetter(detection.grade_ceiling)) + " (" +
+                           pd::to_string(detection.grade_ceiling) + ")");
+  row("completion provenance", pd::to_string(detection.completion_provenance));
+  row("drawer", detection.drawer_present
+                    ? (std::string(pd::to_string(detection.drawer_standard)) +
+                       (detection.drawer_kickable ? ", kickable" : ", NOT kickable"))
+                    : std::string("no drawer port on this profile"));
+  row("provenance", detection.provenanceSummary());
+
+  if (!detection.degradations.empty()) {
+    section("Declared degradations (printed on the ticket)");
+    for (const std::string& line : detection.degradations) {
+      bullet(line);
+    }
+  }
+
+  section("Result");
+  row("key", result.key);
+  row("verification id", result.print_token.empty()
+                             ? "none - this profile has no GS ( H wire token"
+                             : result.print_token);
+  row("outcome", pd::to_string(result.result.outcome));
+  row("evidence", pd::to_string(result.result.confidence));
+  row("grade", std::string(pd::gradeLetter(result.result.grade)) + " (" +
+                   pd::to_string(result.result.grade) + ")");
+  row("authority", pd::to_string(result.result.authority));
+  row("method", result.result.method);
+  if (result.result.reason != pd::FailureReason::None) {
+    row("reason", pd::to_string(result.result.reason));
+  }
+
+  std::cout << "\n";
+  switch (result.result.outcome) {
+    case pd::JobOutcome::Done:
+      paragraph("Done. The ticket in your hand is the output of the ordinary path on "
+                "this unit, and the grade above is what the hardware proved, not what "
+                "the profile hoped.");
+      return kExitDone;
+    case pd::JobOutcome::Failed:
+      return kExitFailed;
+    case pd::JobOutcome::Unknown:
+      paragraph("UNKNOWN, not failed: bytes were sent and the ticket may have printed. "
+                "Look at the paper.");
+      return kExitUnknown;
+  }
+  return kExitUnknown;
+}
+
+struct AutoDetectArgs {
+  pd::AutoDetectOptions options;
+  std::string store;
+  bool quiet = false;
+};
+
+int runAutoDetect(const AutoDetectArgs& args) {
+  pd::PrinterDriver driver(args.store.empty() ? pd::StorageConfig::inMemory()
+                                              : pd::StorageConfig::at(args.store));
+
+  std::cout << "auto-detect "
+            << (args.options.subnet_cidr.empty() ? std::string("(local /24)")
+                                                 : args.options.subnet_cidr)
+            << " port " << args.options.port << "\n"
+               "discovery (DLE EOT 1) -> identify -> the PRINTLESS probe subset.\n"
+               "Nothing prints and nothing fires: the full probe's test lines are\n"
+               "skipped, so a fence found here proves the command exists and NOT that\n"
+               "its answer waits for paper. Run `pdctl probe <address>`, which costs\n"
+               "paper, or a real job to promote it.\n\n";
+
+  std::mutex output;
+  std::vector<pd::DetectedPrinter> found;
+  try {
+    found = driver.autoDetect(
+        args.options, [&](const pd::DetectedPrinter& one, uint64_t done, uint64_t total) {
+          if (args.quiet) {
+            return;
+          }
+          std::lock_guard<std::mutex> lock(output);
+          std::cout << "  " << std::left << std::setw(24) << one.endpoint
+                    << pd::to_string(one.status) << "  (" << done << "/" << total
+                    << ")\n";
+        });
+  } catch (const pd::DiscoveryError& error) {
+    std::cout << error.what() << "\n";
+    return kExitUsage;
+  }
+
+  std::cout << "\n"
+            << std::left << std::setw(22) << "IP" << std::setw(12) << "VENDOR"
+            << std::setw(14) << "MODEL" << std::setw(9) << "TRUSTED" << std::setw(20)
+            << "PROFILE" << std::setw(16) << "COMPLETION" << std::setw(8) << "CEILING"
+            << "PROVENANCE\n"
+            << "-------------------------------------------------------------------"
+               "-----------------------------------------------\n";
+  size_t reachable = 0;
+  for (const pd::DetectedPrinter& one : found) {
+    const pd::DetectionSummary& summary = one.summary;
+    const bool live = one.status != pd::DetectionStatus::Unreachable;
+    reachable += live ? 1 : 0;
+    std::cout << std::left << std::setw(22) << one.endpoint << std::setw(12)
+              << (live ? summary.identity.vendor : std::string("-")) << std::setw(14)
+              << (summary.identity.model.empty() ? std::string("-")
+                                                 : summary.identity.model)
+              << std::setw(9)
+              << (live ? yesNo(summary.identity.trusted) : std::string("-"))
+              << std::setw(20)
+              << (summary.profile_id.empty() ? std::string("-") : summary.profile_id)
+              << std::setw(16)
+              << (live ? pd::to_string(summary.completion) : "-") << std::setw(8)
+              << (live ? pd::gradeLetter(summary.grade_ceiling) : "-")
+              << (live ? summary.provenanceSummary() : pd::to_string(one.status)) << "\n";
+  }
+  if (found.empty()) {
+    std::cout << "  (nothing listening)\n";
+  }
+
+  for (const pd::DetectedPrinter& one : found) {
+    if (one.summary.degradations.empty()) {
+      continue;
+    }
+    std::cout << "\n" << one.endpoint << ":\n";
+    for (const std::string& line : one.summary.degradations) {
+      bullet(line);
+    }
+  }
+
+  std::cout << "\n" << found.size() << " candidate(s), " << reachable << " reachable\n";
+  return reachable == 0 ? kExitFailed : kExitDone;
+}
+
+// ============================== end M15 =============================================
+
 int listProfiles() {
   std::cout << "device database (docs/device-database.md):\n\n";
   for (const std::string& name : pd::devices::names()) {
@@ -1936,6 +2150,56 @@ int main(int argc, char** argv) {
     }
     try {
       return runDiscover(args);
+    } catch (const std::exception& error) {
+      std::cout << "error: " << error.what() << "\n";
+      return kExitFailed;
+    }
+  }
+
+  // M15 — docs/api.md §15. Like `discover`, it takes a subnet rather than a printer, so
+  // it is dispatched before argv[2] is read as a hostname.
+  if (argc >= 2 && std::string(argv[1]) == "autodetect") {
+    AutoDetectArgs args;
+    for (int i = 2; i < argc; ++i) {
+      const std::string flag = argv[i];
+      const bool has_value = i + 1 < argc;
+      if (flag == "--port" && has_value) {
+        const long value = std::strtol(argv[++i], nullptr, 10);
+        if (value <= 0 || value > 65535) {
+          std::cout << "invalid port\n\n";
+          return kExitUsage;
+        }
+        args.options.port = static_cast<uint16_t>(value);
+      } else if (flag == "--concurrency" && has_value) {
+        args.options.concurrency =
+            static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        if (args.options.concurrency == 0) {
+          std::cout << "invalid concurrency\n\n";
+          return kExitUsage;
+        }
+      } else if (flag == "--connect-timeout" && has_value) {
+        args.options.connect_timeout_ms =
+            static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      } else if (flag == "--response-timeout" && has_value) {
+        args.options.response_timeout_ms =
+            static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      } else if (flag == "--endpoint" && has_value) {
+        args.options.endpoints.emplace_back(argv[++i]);
+      } else if (flag == "--no-probe-unknown") {
+        args.options.probe_unknown = false;
+      } else if (flag == "--store" && has_value) {
+        args.store = argv[++i];
+      } else if (flag == "--quiet") {
+        args.quiet = true;
+      } else if (!flag.empty() && flag[0] != '-' && args.options.subnet_cidr.empty()) {
+        args.options.subnet_cidr = flag;
+      } else {
+        std::cout << "unknown option: " << flag << "\n\n";
+        return usage();
+      }
+    }
+    try {
+      return runAutoDetect(args);
     } catch (const std::exception& error) {
       std::cout << "error: " << error.what() << "\n";
       return kExitFailed;
@@ -2107,6 +2371,43 @@ int main(int argc, char** argv) {
     }
     if (command == "settings") {
       return runSettings(endpoint);
+    }
+    // M15 — docs/api.md §15. Consumes paper, so it sits with the operator commands
+    // even though everything it does goes through the ordinary job path.
+    if (command == "self-test") {
+      SelfTestArgs args;
+      args.store = defaultStore();
+      for (int i = 3; i < argc; ++i) {
+        const std::string flag = argv[i];
+        const bool has_value = i + 1 < argc;
+        if (flag == "--profile" && has_value) {
+          args.profile = argv[++i];
+          if (args.profile == "list") {
+            return listProfiles();
+          }
+          if (!profileExists(args.profile)) {
+            std::cout << "unknown profile: " << args.profile
+                      << " (try --profile list)\n\n";
+            return usage();
+          }
+        } else if (flag == "--store" && has_value) {
+          args.store = argv[++i];
+        } else if (flag == "--width" && has_value) {
+          args.width = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+          if (args.width == 0) {
+            std::cout << "invalid width\n\n";
+            return usage();
+          }
+        } else if (flag == "--refresh-identity") {
+          args.refresh_identity = true;
+        } else if (flag == "--no-barcode") {
+          args.barcode = false;
+        } else {
+          std::cout << "unknown option: " << flag << "\n\n";
+          return usage();
+        }
+      }
+      return runSelfTest(endpoint, args);
     }
     if (command == "print") {
       PrintArgs args;

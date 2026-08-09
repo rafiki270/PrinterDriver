@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstring>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1430,3 +1432,366 @@ extern "C" const char* pd_drawer_status_method_name(pd_drawer_status_method valu
 }
 
 // ================================ end M14 ==========================================
+
+// ===================================================================================
+// M15: self-test, auto-detection and LAN discovery (docs/api.md §15)
+// ===================================================================================
+//
+// Composition all the way down: every function below turns a C struct into the core's
+// own option type, calls one core entry point, and turns what comes back into C. There
+// is no policy here, which is the point — a wrapper that reimplemented "which provenance
+// column governs the mechanism in force" would eventually get it wrong on one platform.
+
+static_assert(PD_PROFILE_SELECTED_DOCUMENTED == value_of(pd::ProfileSelection::Documented));
+static_assert(PD_PROFILE_SELECTED_PROBED == value_of(pd::ProfileSelection::Probed));
+static_assert(PD_PROFILE_SELECTED_DEFAULT == value_of(pd::ProfileSelection::Default));
+static_assert(PD_PROFILE_SELECTION_COUNT ==
+              static_cast<int>(pd::kAllProfileSelections.size()));
+
+static_assert(PD_DETECTION_ANSWERED == value_of(pd::DetectionStatus::Answered));
+static_assert(PD_DETECTION_SILENT == value_of(pd::DetectionStatus::Silent));
+static_assert(PD_DETECTION_UNVERIFIED == value_of(pd::DetectionStatus::Unverified));
+static_assert(PD_DETECTION_UNREACHABLE == value_of(pd::DetectionStatus::Unreachable));
+static_assert(PD_DETECTION_STATUS_COUNT ==
+              static_cast<int>(pd::kAllDetectionStatuses.size()));
+
+namespace {
+
+const char* const kProfileSelectionNames[PD_PROFILE_SELECTION_COUNT] = {
+    "Documented", "Probed", "Default"};
+
+const char* const kDetectionStatusNames[PD_DETECTION_STATUS_COUNT] = {
+    "Answered", "Silent", "Unverified", "Unreachable"};
+
+// Copies every string out of the core's summary into `storage` and points the C struct
+// at it. Nothing in the returned struct outlives `storage`, which is exactly the
+// contract pd.h states for both of its callers.
+pd_detection_summary fillSummary(const pd::DetectionSummary& summary,
+                                 pd_summary_storage* storage) {
+  storage->endpoint = summary.endpoint;
+  storage->vendor = summary.identity.vendor;
+  storage->model = summary.identity.model;
+  storage->firmware = summary.identity.firmware;
+  storage->serial = summary.identity.serial;
+  storage->profile_id = summary.profile_id;
+  storage->method = summary.method;
+  storage->provenance_summary = summary.provenanceSummary();
+  storage->degradations = summary.degradations;
+  storage->degradation_ptrs.clear();
+  storage->degradation_ptrs.reserve(storage->degradations.size());
+  for (const std::string& line : storage->degradations) {
+    storage->degradation_ptrs.push_back(line.c_str());
+  }
+
+  pd_detection_summary out{};
+  out.endpoint = storage->endpoint.c_str();
+  out.vendor = storage->vendor.c_str();
+  out.model = storage->model.c_str();
+  out.firmware = storage->firmware.c_str();
+  out.serial = storage->serial.c_str();
+  out.identity_trusted = summary.identity.trusted ? 1 : 0;
+  out.confidence_percent = summary.identity.confidence_percent;
+  out.impersonation_suspected = summary.identity.impersonation_suspected ? 1 : 0;
+  out.identity_fresh = summary.identity_fresh ? 1 : 0;
+  out.profile_id = storage->profile_id.c_str();
+  out.selection = static_cast<pd_profile_selection>(summary.selection);
+  out.nominal_paper_mm = summary.nominal_paper_mm;
+  out.printable_width_dots = summary.printable_width_dots;
+  out.chars_per_line = summary.chars_per_line;
+  out.dpi = summary.dpi;
+  out.completion = static_cast<pd_completion_mechanism>(summary.completion);
+  out.grade_ceiling = static_cast<pd_confidence_grade>(summary.grade_ceiling);
+  out.authority = static_cast<pd_completion_authority>(summary.authority);
+  out.method = storage->method.c_str();
+  out.completion_provenance = static_cast<pd_provenance>(summary.completion_provenance);
+  out.drawer_present = summary.drawer_present ? 1 : 0;
+  out.drawer_kickable = summary.drawer_kickable ? 1 : 0;
+  out.drawer_standard = static_cast<pd_drawer_port_standard>(summary.drawer_standard);
+  out.drawer_voltage = summary.drawer_voltage;
+  out.drawer_electrical_provenance =
+      static_cast<pd_provenance>(summary.drawer_electrical_provenance);
+  out.drawer_commands_provenance =
+      static_cast<pd_provenance>(summary.drawer_commands_provenance);
+  out.provenance_summary = storage->provenance_summary.c_str();
+  out.degradations =
+      storage->degradation_ptrs.empty() ? nullptr : storage->degradation_ptrs.data();
+  out.degradation_count = storage->degradation_ptrs.size();
+  return out;
+}
+
+std::string hexOf(const std::vector<uint8_t>& bytes) {
+  static const char kDigits[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (const uint8_t byte : bytes) {
+    out += kDigits[byte >> 4];
+    out += kDigits[byte & 0x0F];
+  }
+  return out;
+}
+
+}  // namespace
+
+extern "C" int32_t pd_self_test(pd_driver* driver, pd_printer* printer,
+                                const pd_self_test_options* options,
+                                pd_self_test_result* out) {
+  if (!checkHandles(driver, printer)) {
+    return 0;
+  }
+  if (out == nullptr) {
+    setError(driver, "pd_self_test needs somewhere to put the result");
+    return 0;
+  }
+
+  pd::SelfTestOptions wanted;
+  if (options != nullptr) {
+    if (options->key != nullptr) {
+      wanted.key = options->key;
+    }
+    wanted.refresh_identity = options->refresh_identity != 0;
+    wanted.probe_prints_test_lines = options->probe_without_printing == 0;
+    wanted.barcode = options->no_barcode == 0;
+    if (options->barcode_data != nullptr && options->barcode_data[0] != '\0') {
+      wanted.barcode_data = options->barcode_data;
+    }
+    wanted.print_verification_id = options->no_verification_id == 0;
+    wanted.timeout_ms = options->timeout_ms;
+  }
+
+  const pd::SelfTestResult result = printer->printer->selfTest(wanted);
+
+  pd_self_test_result answer{};
+  answer.result.outcome = static_cast<pd_job_outcome>(result.result.outcome);
+  answer.result.confidence = static_cast<pd_confidence_level>(result.result.confidence);
+  answer.result.reason = static_cast<pd_failure_reason>(result.result.reason);
+  answer.result.grade = static_cast<pd_confidence_grade>(result.result.grade);
+  answer.result.authority = static_cast<pd_completion_authority>(result.result.authority);
+  {
+    std::lock_guard<std::mutex> lock(driver->mutex);
+    driver->self_test.result_method = result.result.method;
+    answer.result.method = driver->self_test.result_method.c_str();
+    driver->self_test.key = result.key;
+    driver->self_test.print_token = result.print_token;
+    driver->self_test.ticket_text = result.ticketText();
+    answer.detection = fillSummary(result.detection, &driver->self_test.summary);
+    answer.key = driver->self_test.key.c_str();
+    answer.print_token = driver->self_test.print_token.c_str();
+    answer.ticket_text = driver->self_test.ticket_text.c_str();
+  }
+  // Interned outside the lock: internJob takes it itself.
+  answer.job = result.job ? pd::capi::internJob(driver, result.job) : nullptr;
+  *out = answer;
+  return 1;
+}
+
+extern "C" int32_t pd_auto_detect(pd_driver* driver, const pd_auto_detect_options* options,
+                                  pd_detected_cb cb, void* ctx) {
+  if (driver == nullptr || !driver->driver) {
+    setError(driver, "driver handle is null");
+    return -1;
+  }
+  clearError(driver);
+
+  pd::AutoDetectOptions wanted;
+  std::vector<std::string> endpoints;
+  if (options != nullptr) {
+    if (options->subnet_cidr != nullptr) {
+      wanted.subnet_cidr = options->subnet_cidr;
+    }
+    if (options->endpoints != nullptr) {
+      for (const char* const* it = options->endpoints; *it != nullptr; ++it) {
+        endpoints.emplace_back(*it);
+      }
+    }
+    if (options->port != 0) {
+      wanted.port = options->port;
+    }
+    if (options->concurrency != 0) {
+      wanted.concurrency = options->concurrency;
+    }
+    if (options->connect_timeout_ms != 0) {
+      wanted.connect_timeout_ms = options->connect_timeout_ms;
+    }
+    if (options->response_timeout_ms != 0) {
+      wanted.response_timeout_ms = options->response_timeout_ms;
+    }
+    wanted.probe_unknown = options->leave_unknown_unprobed == 0;
+    if (options->status_timeout_ms != 0) {
+      wanted.status_timeout_ms = options->status_timeout_ms;
+    }
+    if (options->identity_timeout_ms != 0) {
+      wanted.identity_timeout_ms = options->identity_timeout_ms;
+    }
+    if (options->completion_timeout_ms != 0) {
+      wanted.completion_timeout_ms = options->completion_timeout_ms;
+    }
+  }
+  wanted.endpoints = std::move(endpoints);
+
+  try {
+    const std::vector<pd::DetectedPrinter> found = driver->driver->autoDetect(
+        wanted, [cb, ctx](const pd::DetectedPrinter& one, uint64_t completed,
+                          uint64_t total) {
+          if (cb == nullptr) {
+            return;
+          }
+          // Stack-local storage: pd.h promises these strings for the duration of the
+          // callback and no longer, so this is where they live and die.
+          pd_summary_storage storage;
+          const std::string hex = hexOf(one.dle_eot_response);
+          pd_detected_printer wire{};
+          wire.endpoint = one.endpoint.c_str();
+          wire.host = one.host.c_str();
+          wire.port = one.port;
+          wire.status = static_cast<pd_detection_status>(one.status);
+          wire.port_open = one.port_open ? 1 : 0;
+          wire.from_cache = one.from_cache ? 1 : 0;
+          wire.dle_eot_hex = hex.c_str();
+          wire.summary = fillSummary(one.summary, &storage);
+          cb(&wire, completed, total, ctx);
+        });
+    {
+      std::lock_guard<std::mutex> lock(driver->mutex);
+      driver->detected = found;
+    }
+    return static_cast<int32_t>(found.size());
+  } catch (const pd::DiscoveryError& error) {
+    setError(driver, error.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t pd_discover(pd_driver* driver, const pd_discover_options* options,
+                               pd_discovered_cb cb, void* ctx) {
+  if (driver == nullptr || !driver->driver) {
+    setError(driver, "driver handle is null");
+    return -1;
+  }
+  clearError(driver);
+
+  pd::DiscoveryOptions wanted;
+  std::string cidr;
+  if (options != nullptr) {
+    if (options->subnet_cidr != nullptr) {
+      cidr = options->subnet_cidr;
+    }
+    if (options->port != 0) {
+      wanted.port = options->port;
+    }
+    if (options->concurrency != 0) {
+      wanted.concurrency = options->concurrency;
+    }
+    if (options->connect_timeout_ms != 0) {
+      wanted.connect_timeout_ms = options->connect_timeout_ms;
+    }
+    if (options->response_timeout_ms != 0) {
+      wanted.response_timeout_ms = options->response_timeout_ms;
+    }
+    wanted.probe_backchannel = options->no_backchannel_probe == 0;
+  }
+
+  // Every address the sweep finishes drives `completed`/`total`; only the open ones are
+  // handed to the caller as devices. A UI needs both numbers, and a caller that only
+  // wanted printers must not have to filter 254 closed addresses out of its own model.
+  pd::DiscoveryCallbacks callbacks;
+  if (cb != nullptr) {
+    auto shared_progress = std::make_shared<std::mutex>();
+    callbacks.on_progress = [cb, ctx, shared_progress](const pd::DiscoveryProgress& step) {
+      if (!step.device.port9100_open) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(*shared_progress);
+      const std::string hex = hexOf(step.device.dle_eot_response);
+      pd_discovered_device wire{};
+      wire.ip = step.device.ip.c_str();
+      wire.port = step.device.port;
+      wire.port9100_open = step.device.port9100_open ? 1 : 0;
+      wire.dle_eot_hex = hex.c_str();
+      cb(&wire, step.completed, step.total, ctx);
+    };
+  }
+
+  try {
+    const std::vector<pd::DiscoveredDevice> found =
+        cidr.empty() ? pd::discover(wanted, callbacks)
+                     : pd::discover(cidr, wanted, callbacks);
+    {
+      std::lock_guard<std::mutex> lock(driver->mutex);
+      driver->discovered = found;
+    }
+    return static_cast<int32_t>(found.size());
+  } catch (const pd::DiscoveryError& error) {
+    setError(driver, error.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t pd_detected_at(pd_driver* driver, int32_t index,
+                                  pd_detected_printer* out) {
+  if (driver == nullptr || out == nullptr || index < 0) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(driver->mutex);
+  if (static_cast<size_t>(index) >= driver->detected.size()) {
+    return 0;
+  }
+  const pd::DetectedPrinter& one = driver->detected[static_cast<size_t>(index)];
+  driver->detected_endpoint = one.endpoint;
+  driver->detected_host = one.host;
+  driver->detected_hex = hexOf(one.dle_eot_response);
+
+  pd_detected_printer wire{};
+  wire.endpoint = driver->detected_endpoint.c_str();
+  wire.host = driver->detected_host.c_str();
+  wire.port = one.port;
+  wire.status = static_cast<pd_detection_status>(one.status);
+  wire.port_open = one.port_open ? 1 : 0;
+  wire.from_cache = one.from_cache ? 1 : 0;
+  wire.dle_eot_hex = driver->detected_hex.c_str();
+  wire.summary = fillSummary(one.summary, &driver->detected_view);
+  *out = wire;
+  return 1;
+}
+
+extern "C" int32_t pd_discovered_at(pd_driver* driver, int32_t index,
+                                    pd_discovered_device* out) {
+  if (driver == nullptr || out == nullptr || index < 0) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(driver->mutex);
+  if (static_cast<size_t>(index) >= driver->discovered.size()) {
+    return 0;
+  }
+  const pd::DiscoveredDevice& one = driver->discovered[static_cast<size_t>(index)];
+  driver->discovered_ip = one.ip;
+  driver->discovered_hex = hexOf(one.dle_eot_response);
+
+  pd_discovered_device wire{};
+  wire.ip = driver->discovered_ip.c_str();
+  wire.port = one.port;
+  wire.port9100_open = one.port9100_open ? 1 : 0;
+  wire.dle_eot_hex = driver->discovered_hex.c_str();
+  *out = wire;
+  return 1;
+}
+
+extern "C" const char* pd_local_subnet(pd_driver* driver) {
+  if (driver == nullptr) {
+    return "";
+  }
+  clearError(driver);
+  const std::optional<pd::Subnet> subnet = pd::localSubnet();
+  std::lock_guard<std::mutex> lock(driver->mutex);
+  driver->local_subnet = subnet.has_value() ? subnet->toString() : std::string();
+  return driver->local_subnet.c_str();
+}
+
+extern "C" const char* pd_profile_selection_name(pd_profile_selection value) {
+  return nameAt(kProfileSelectionNames, value);
+}
+
+extern "C" const char* pd_detection_status_name(pd_detection_status value) {
+  return nameAt(kDetectionStatusNames, value);
+}
+
+// ================================ end M15 ==========================================

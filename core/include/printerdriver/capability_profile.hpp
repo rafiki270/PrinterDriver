@@ -303,6 +303,24 @@ struct EposCapabilities {
   Provenance spooler_provenance = Provenance::Unverified;
 };
 
+// --- M15 (docs/api.md §15, docs/receipt-dsl.md "Degradation rules") -----------------
+//
+// Which of the *drawing* commands the document renderer emits this firmware actually
+// implements. A separate facet from completion and status for the usual reason: whether
+// a device can draw a Code 128 symbol is unrelated to whether it can fence a print, and
+// the two are established from different evidence.
+//
+// All three default true because every ESC/POS family in this database documents them.
+// They exist so that a profile can decline one and get a **declared degradation on the
+// paper** — "BARCODE not supported on this path" — instead of a GS k command the
+// firmware prints as literal text across half a receipt. Star line mode is the clearest
+// real case: it has no GS k and no GS ( k at all.
+struct RenderCapabilities {
+  bool barcode_gs_k = true;    // GS k function B (docs/receipt-dsl.md `barcode`)
+  bool qr_gs_paren_k = true;   // GS ( k fn 165/167/169/180/181
+  bool raster_gs_v = true;     // GS v 0
+};
+
 // docs/device-database.md "Media is a capability, not a model assumption". Roll width
 // and raster width are separate facts: a CT-S4500 takes 112 mm media and prints 104 mm,
 // and deriving one from the other is how receipts end up clipped.
@@ -354,6 +372,8 @@ struct CapabilityProfile {
   RecoveryCapabilities recovery;
   Quirks quirks;
   MediaProfile media;
+  // M15 — what the document renderer may draw on this path.
+  RenderCapabilities render;
 
   // --- M13b (docs/wire-protocols.md §1-§2) -----------------------------------------
   StarCapabilities star;

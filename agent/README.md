@@ -98,6 +98,9 @@ Flags:
 | `GET /printers` | every printer this agent owns |
 | `POST /printers` | add one at runtime |
 | `GET /printers/<id>/status` | device status; `?refresh=1` queries the device |
+| `POST /printers/<id>/drawer` | the verified opening sequence; answers a drawer state, never a boolean |
+| `POST /printers/<id>/self-test` | one diagnostic ticket, the whole detection report and the ordinary tri-state result — **uses paper** |
+| `POST /autodetect` | discovery + identify + the printless probe subset; nothing prints and nothing fires |
 | `GET /healthz` | liveness, journal depth, instance nonce |
 | `POST\|GET\|DELETE /cloudprnt/<id>` | the CloudPRNT printer's own poll, job download and confirmation |
 | `POST /cloudprnt/<id>/jobs` | hand bytes to a CloudPRNT printer |

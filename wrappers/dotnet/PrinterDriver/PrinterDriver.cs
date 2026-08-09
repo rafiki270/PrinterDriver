@@ -19,7 +19,7 @@ namespace PrinterDriver;
 /// <c>PrintJobTests</c> asserts.
 /// </para>
 /// </remarks>
-public sealed class PrinterDriver : IDisposable
+public sealed partial class PrinterDriver : IDisposable
 {
     private readonly object _gate = new();
     private readonly CallbackRoots _roots = new();

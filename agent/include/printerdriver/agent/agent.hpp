@@ -164,6 +164,14 @@ class Agent {
   HttpResponse getPrinterStatus(const std::string& id, const HttpRequest& request);
   // M14 — POST /printers/<id>/drawer {channel?, pulseMs?} (docs/cash-drawer.md).
   HttpResponse postPrinterDrawer(const std::string& id, const HttpRequest& request);
+  // --- M15 (docs/api.md §15) ------------------------------------------------------
+  // POST /printers/<id>/self-test  — one diagnostic ticket, the whole detection report
+  //                                  and the ordinary tri-state result. Uses paper.
+  // POST /autodetect {cidr?}       — discovery + identify + the printless probe subset.
+  //                                  Nothing prints and nothing fires.
+  HttpResponse postPrinterSelfTest(const std::string& id, const HttpRequest& request);
+  HttpResponse postAutoDetect(const HttpRequest& request);
+  // --- end M15 ---------------------------------------------------------------------
   HttpResponse getHealth() const;
 
   // --- M13b: CloudPRNT ------------------------------------------------------------------

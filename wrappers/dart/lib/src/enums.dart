@@ -782,3 +782,71 @@ enum DrawerStatusMethod {
     return unrecognized;
   }
 }
+
+// --- M15: self-test and auto-detection (docs/api.md §15) -----------------------------
+
+/// How the capability profile in force was arrived at — `pd_profile_selection`.
+///
+/// Not a [Provenance]: that says where a claim about one *capability* comes from, and
+/// this says where the *profile* came from.
+enum ProfileSelection {
+  /// A device-database entry matched what the device reported about itself.
+  documented(0),
+
+  /// A probe's first-hand findings promoted whatever was selected.
+  probed(1),
+
+  /// Neither: the shipped default is the whole truth, which means UNKNOWN DEVICE rather
+  /// than ordinary device.
+  byDefault(2),
+
+  /// A `pd_profile_selection` this build does not know.
+  unrecognized(-1);
+
+  const ProfileSelection(this.nativeValue);
+
+  final int nativeValue;
+
+  /// Mirrors `PD_PROFILE_SELECTION_COUNT`.
+  static const int nativeCount = 3;
+
+  static ProfileSelection fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
+}
+
+/// What auto-detection established about one address — `pd_detection_status`.
+enum DetectionStatus {
+  /// The backchannel answered: identification, fences, or both.
+  answered(0),
+
+  /// The port accepted the connection and said nothing at all. A real finding — the
+  /// interface that does not forward status bytes — and never a failure.
+  silent(1),
+
+  /// Reachable and deliberately not interrogated. Never render this as "no
+  /// capabilities": nobody asked.
+  unverified(2),
+
+  unreachable(3),
+
+  /// A `pd_detection_status` this build does not know.
+  unrecognized(-1);
+
+  const DetectionStatus(this.nativeValue);
+
+  final int nativeValue;
+
+  /// Mirrors `PD_DETECTION_STATUS_COUNT`.
+  static const int nativeCount = 4;
+
+  static DetectionStatus fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
+}

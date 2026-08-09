@@ -2,6 +2,7 @@ import 'dart:ffi';
 import 'dart:io';
 
 import 'package:printerdriver/printerdriver.dart';
+import 'package:printerdriver/src/allocation.dart';
 import 'package:printerdriver/src/bindings.dart';
 
 /// Locating the native library the suite binds.
@@ -111,3 +112,63 @@ PrinterDriverBindings get testingBindings =>
 /// nothing should leave files behind.
 PrinterDriver openTestDriver() =>
     PrinterDriver.open(fsyncDisabled: true, library: testingLibrary);
+
+// --- M15: loopback listeners (docs/api.md §15) ---------------------------------------
+//
+// `pd_discover` and `pd_auto_detect` sweep addresses, so there is no printer handle to
+// hang a scripted transport on: they need a real socket on the far side. The fixture is
+// in capi/tests/pd_test_support.cpp, next to the scripted device it pumps, and is
+// reached here directly from the testing library rather than through the wrapper — the
+// wrapper an application ships must not carry a test double.
+
+typedef _StartNative = Pointer<Void> Function(Pointer<Char>);
+typedef _PortNative = Uint16 Function(Pointer<Void>);
+typedef _BytesNative = Size Function(Pointer<Void>);
+typedef _VoidNative = Void Function(Pointer<Void>);
+
+/// An in-process ESC/POS printer on an ephemeral loopback port.
+final class ScriptedListener {
+  ScriptedListener._(this._handle, this.port);
+
+  /// [script] is `ok` (answers DLE EOT, GS I, GS ( H and GS r 1) or `silent` (accepts
+  /// the connection and answers nothing at all).
+  factory ScriptedListener.start(String script) {
+    final start = testingLibrary.lookupFunction<_StartNative,
+        Pointer<Void> Function(Pointer<Char>)>('pd_test_listener_start');
+    return Arena.using((arena) {
+      final handle = start(arena.string(script));
+      if (handle == nullptr) {
+        throw StateError('the scripted listener $script was refused');
+      }
+      final port = testingLibrary.lookupFunction<_PortNative,
+          int Function(Pointer<Void>)>('pd_test_listener_port')(handle);
+      return ScriptedListener._(handle, port);
+    });
+  }
+
+  final Pointer<Void> _handle;
+
+  /// The loopback port it bound.
+  final int port;
+
+  String get endpoint => '127.0.0.1:$port';
+
+  /// How many printable bytes ever reached the device behind it — the number a
+  /// detection test has to watch stay at zero.
+  int get printDataBytes => testingLibrary
+      .lookupFunction<_BytesNative, int Function(Pointer<Void>)>(
+    'pd_test_listener_print_data_bytes',
+  )(_handle);
+
+  /// Closes the socket without destroying the handle, so a test can turn a listener into
+  /// a refused port at a known address.
+  void stop() => testingLibrary
+      .lookupFunction<_VoidNative, void Function(Pointer<Void>)>(
+    'pd_test_listener_stop',
+  )(_handle);
+
+  void destroy() => testingLibrary
+      .lookupFunction<_VoidNative, void Function(Pointer<Void>)>(
+    'pd_test_listener_destroy',
+  )(_handle);
+}

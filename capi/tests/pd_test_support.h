@@ -100,6 +100,33 @@ size_t pd_test_link_bytes_written(pd_test_link* link);
 size_t pd_test_link_cuts(pd_test_link* link);
 int pd_test_link_received_contains(pd_test_link* link, const char* needle);
 
+/* --- M15: a loopback ESC/POS listener, for the discovery and auto-detection paths ---
+ *
+ * pd_discover and pd_auto_detect are the only calls in this ABI that need a real socket
+ * on the far side rather than a transport factory: they sweep addresses, so there is no
+ * printer handle to attach a scripted device to. A wrapper test cannot portably open a
+ * TCP listener from Swift, Dart and C# alike and script an ESC/POS device behind it, so
+ * the fixture lives here, next to the scripted device it is already pumping.
+ *
+ * script_id:
+ *   "ok"     — answers DLE EOT, GS I ("EPOSN"/"TM-T88V"), GS ( H and GS r 1.
+ *   "silent" — accepts the connection and answers nothing at all, which is the LAN
+ *              module that does not forward status bytes and a real finding.
+ * NULL for an unknown id.
+ */
+typedef struct pd_test_listener pd_test_listener;
+
+pd_test_listener* pd_test_listener_start(const char* script_id);
+/* The ephemeral loopback port it bound, or 0. */
+uint16_t pd_test_listener_port(pd_test_listener* listener);
+/* How many printable bytes ever reached the device behind it. The number a detection
+ * test has to watch stay at zero. */
+size_t pd_test_listener_print_data_bytes(pd_test_listener* listener);
+/* Closes the socket without destroying the handle, so a test can turn a listener into a
+ * refused port at a known address. */
+void pd_test_listener_stop(pd_test_listener* listener);
+void pd_test_listener_destroy(pd_test_listener* listener);
+
 /* --- Enum bridge ------------------------------------------------------------------ */
 
 typedef enum pd_test_enum {
@@ -123,7 +150,10 @@ typedef enum pd_test_enum {
   PD_TEST_ENUM_DRAWER_PORT_STANDARD = 16,
   PD_TEST_ENUM_DRAWER_KICK_METHOD = 17,
   PD_TEST_ENUM_DRAWER_STATUS_METHOD = 18,
-  PD_TEST_ENUM_TOTAL = 19
+  /* M15 — docs/api.md §15. */
+  PD_TEST_ENUM_PROFILE_SELECTION = 19,
+  PD_TEST_ENUM_DETECTION_STATUS = 20,
+  PD_TEST_ENUM_TOTAL = 21
 } pd_test_enum;
 
 /* Number of members the C++ enum has, straight from the core's kAll* arrays or from a

@@ -603,6 +603,206 @@ final class PdDrawerReading extends Struct {
   external int state;
 }
 
+// --- M15: self-test, auto-detection and LAN discovery (docs/api.md §15) -------------
+
+/// `pd_detection_summary` — the detection report, shared by the self-test and by
+/// auto-detection so the paper, the CLI, the agent and this wrapper describe a device the
+/// same way.
+final class PdDetectionSummary extends Struct {
+  external Pointer<Char> endpoint;
+
+  external Pointer<Char> vendor;
+  external Pointer<Char> model;
+  external Pointer<Char> firmware;
+  external Pointer<Char> serial;
+
+  /// 1 only when a signal independent of `GS I` agrees with `GS I`.
+  @Int32()
+  external int identityTrusted;
+
+  @Uint8()
+  external int confidencePercent;
+
+  @Int32()
+  external int impersonationSuspected;
+
+  @Int32()
+  external int identityFresh;
+
+  external Pointer<Char> profileId;
+
+  @Int32()
+  external int selection;
+
+  @Uint16()
+  external int nominalPaperMm;
+
+  @Uint32()
+  external int printableWidthDots;
+
+  @Uint32()
+  external int charsPerLine;
+
+  @Uint16()
+  external int dpi;
+
+  @Int32()
+  external int completion;
+
+  @Int32()
+  external int gradeCeiling;
+
+  @Int32()
+  external int authority;
+
+  external Pointer<Char> method;
+
+  @Int32()
+  external int completionProvenance;
+
+  @Int32()
+  external int drawerPresent;
+
+  @Int32()
+  external int drawerKickable;
+
+  @Int32()
+  external int drawerStandard;
+
+  @Uint16()
+  external int drawerVoltage;
+
+  @Int32()
+  external int drawerElectricalProvenance;
+
+  @Int32()
+  external int drawerCommandsProvenance;
+
+  external Pointer<Char> provenanceSummary;
+
+  /// Declared degradations, `degradationCount` entries; `nullptr` when there are none.
+  external Pointer<Pointer<Char>> degradations;
+
+  @Size()
+  external int degradationCount;
+}
+
+/// `pd_self_test_options` — all-zeroes is the useful call.
+final class PdSelfTestOptions extends Struct {
+  external Pointer<Char> key;
+
+  @Int32()
+  external int refreshIdentity;
+
+  @Int32()
+  external int probeWithoutPrinting;
+
+  @Int32()
+  external int noBarcode;
+
+  external Pointer<Char> barcodeData;
+
+  @Int32()
+  external int noVerificationId;
+
+  @Uint32()
+  external int timeoutMs;
+}
+
+/// `pd_self_test_result` — the ordinary tri-state job result plus what the ticket said.
+final class PdSelfTestResult extends Struct {
+  external PdJobResult result;
+  external PdDetectionSummary detection;
+  external Pointer<Char> key;
+  external Pointer<Char> printToken;
+  external Pointer<Char> ticketText;
+  external Pointer<PdJob> job;
+}
+
+/// `pd_auto_detect_options`.
+final class PdAutoDetectOptions extends Struct {
+  external Pointer<Char> subnetCidr;
+  external Pointer<Pointer<Char>> endpoints;
+
+  @Uint16()
+  external int port;
+
+  @Uint32()
+  external int concurrency;
+
+  @Uint32()
+  external int connectTimeoutMs;
+
+  @Uint32()
+  external int responseTimeoutMs;
+
+  @Int32()
+  external int leaveUnknownUnprobed;
+
+  @Uint32()
+  external int statusTimeoutMs;
+
+  @Uint32()
+  external int identityTimeoutMs;
+
+  @Uint32()
+  external int completionTimeoutMs;
+}
+
+/// `pd_detected_printer` — one candidate, classified.
+final class PdDetectedPrinter extends Struct {
+  external Pointer<Char> endpoint;
+  external Pointer<Char> host;
+
+  @Uint16()
+  external int port;
+
+  @Int32()
+  external int status;
+
+  @Int32()
+  external int portOpen;
+
+  @Int32()
+  external int fromCache;
+
+  external Pointer<Char> dleEotHex;
+  external PdDetectionSummary summary;
+}
+
+/// `pd_discover_options`.
+final class PdDiscoverOptions extends Struct {
+  external Pointer<Char> subnetCidr;
+
+  @Uint16()
+  external int port;
+
+  @Uint32()
+  external int concurrency;
+
+  @Uint32()
+  external int connectTimeoutMs;
+
+  @Uint32()
+  external int responseTimeoutMs;
+
+  @Int32()
+  external int noBackchannelProbe;
+}
+
+/// `pd_discovered_device` — one address the sweep found listening.
+final class PdDiscoveredDevice extends Struct {
+  external Pointer<Char> ip;
+
+  @Uint16()
+  external int port;
+
+  @Int32()
+  external int port9100Open;
+
+  external Pointer<Char> dleEotHex;
+}
+
 /// `pd_test_enum` — the enum-bridge ids of `pd_test_support.h`.
 enum PdTestEnum {
   jobState(0),
@@ -624,14 +824,17 @@ enum PdTestEnum {
   drawerState(15),
   drawerPortStandard(16),
   drawerKickMethod(17),
-  drawerStatusMethod(18);
+  drawerStatusMethod(18),
+  // M15 — docs/api.md §15.
+  profileSelection(19),
+  detectionStatus(20);
 
   const PdTestEnum(this.nativeValue);
 
   final int nativeValue;
 
   /// `PD_TEST_ENUM_TOTAL`: the sentinel, not a member.
-  static const int total = 19;
+  static const int total = 21;
 }
 
 /// Every `pd_*` entry point of pd.h, resolved from one [DynamicLibrary].
@@ -995,6 +1198,74 @@ final class PrinterDriverBindings {
   late final Pointer<Char> Function(int) drawerStatusMethodName =
       _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
     'pd_drawer_status_method_name',
+  );
+
+  // --- M15: self-test, auto-detection and LAN discovery (docs/api.md §15) ------------
+  //
+  // Lazy, like the two blocks above, so adding them reorders no existing lookup.
+  //
+  // Note what is NOT bound here: the per-candidate callbacks pd_auto_detect and
+  // pd_discover accept. A Dart isolate blocked inside an FFI call cannot service a
+  // native callback until that call returns, so this wrapper passes NULL and reads the
+  // results back with pd_detected_at / pd_discovered_at, which pd.h provides for exactly
+  // this reason.
+
+  /// `pd_self_test` — prints one diagnostic ticket. Uses paper.
+  late final int Function(Pointer<PdDriver>, Pointer<PdPrinter>,
+      Pointer<PdSelfTestOptions>, Pointer<PdSelfTestResult>) selfTest =
+      _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdPrinter>,
+              Pointer<PdSelfTestOptions>, Pointer<PdSelfTestResult>),
+          int Function(Pointer<PdDriver>, Pointer<PdPrinter>,
+              Pointer<PdSelfTestOptions>, Pointer<PdSelfTestResult>)>('pd_self_test');
+
+  /// `pd_auto_detect` — nothing prints and nothing fires.
+  late final int Function(
+          Pointer<PdDriver>, Pointer<PdAutoDetectOptions>, Pointer<Void>, Pointer<Void>)
+      autoDetect = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdAutoDetectOptions>, Pointer<Void>,
+              Pointer<Void>),
+          int Function(Pointer<PdDriver>, Pointer<PdAutoDetectOptions>, Pointer<Void>,
+              Pointer<Void>)>('pd_auto_detect');
+
+  /// `pd_discover` — the raw sweep, DLE EOT 1 and nothing else.
+  late final int Function(
+          Pointer<PdDriver>, Pointer<PdDiscoverOptions>, Pointer<Void>, Pointer<Void>)
+      discover = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdDiscoverOptions>, Pointer<Void>,
+              Pointer<Void>),
+          int Function(Pointer<PdDriver>, Pointer<PdDiscoverOptions>, Pointer<Void>,
+              Pointer<Void>)>('pd_discover');
+
+  /// `pd_detected_at`
+  late final int Function(Pointer<PdDriver>, int, Pointer<PdDetectedPrinter>)
+      detectedAt = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Int32, Pointer<PdDetectedPrinter>),
+          int Function(Pointer<PdDriver>, int,
+              Pointer<PdDetectedPrinter>)>('pd_detected_at');
+
+  /// `pd_discovered_at`
+  late final int Function(Pointer<PdDriver>, int, Pointer<PdDiscoveredDevice>)
+      discoveredAt = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Int32, Pointer<PdDiscoveredDevice>),
+          int Function(Pointer<PdDriver>, int,
+              Pointer<PdDiscoveredDevice>)>('pd_discovered_at');
+
+  /// `pd_local_subnet`
+  late final Pointer<Char> Function(Pointer<PdDriver>) localSubnet =
+      _library.lookupFunction<Pointer<Char> Function(Pointer<PdDriver>),
+          Pointer<Char> Function(Pointer<PdDriver>)>('pd_local_subnet');
+
+  /// `pd_profile_selection_name`
+  late final Pointer<Char> Function(int) profileSelectionName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_profile_selection_name',
+  );
+
+  /// `pd_detection_status_name`
+  late final Pointer<Char> Function(int) detectionStatusName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_detection_status_name',
   );
 
   /// `pd_test_drawer_kicks` — pulses that reached the scripted device. Test-only.
