@@ -44,8 +44,8 @@ test('the naming rule is the one the generator and the module both use', () => {
 
 test('pd.h yields the function list the rest of this file walks', () => {
   assert.ok(
-    generatedFunctions.length >= 80,
-    `expected at least 80 pd_* functions, saw ${generatedFunctions.length}`
+    generatedFunctions.length >= 92,
+    `expected at least 92 pd_* functions, saw ${generatedFunctions.length}`
   );
 });
 

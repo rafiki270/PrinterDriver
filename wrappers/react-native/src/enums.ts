@@ -474,6 +474,64 @@ export const MatchKind = {
 export type MatchKind = keyof typeof MatchKind;
 export const matchKindFromNative = decoder('pd_match_kind', MatchKind);
 
+// --- pd_report_kind -------------------------------------------------------------------
+
+/**
+ * What kind of departure from the document a render declared (docs/receipt-dsl.md).
+ *
+ * A declared degradation is not a failure: a missing model path, an unknown formatter and
+ * a barcode the profile cannot draw all still print. They are simply never silent — each
+ * one becomes a `ReportEntry` on the rendered document and on the job that printed it.
+ */
+export const ReportKind = {
+  /** `{{order.note}}` with no such path in the model. */
+  missingPath: 0,
+  /** `{{v|frobnicate}}`. */
+  unknownFormatter: 1,
+  /** `{{v|number:2}}` where `v` is an object. */
+  unformattableValue: 2,
+  /**
+   * An unterminated `{{`, an empty path — and the three hard failures that stop bytes
+   * being produced at all: JSON that is not JSON, a structure that is not a document, and
+   * a template submitted with no model.
+   */
+  malformedTemplate: 3,
+  unknownStyle: 4,
+  /** An `extends` chain that loops. */
+  styleCycle: 5,
+  /** Italic, `rotate90`, a raster font on the hardware path. */
+  unsupportedStyle: 6,
+  /** A symbology this build cannot draw, or a block this profile has no hardware for. */
+  unsupportedBlock: 7,
+  missingImage: 8,
+  /** Content clipped to fit the media width. */
+  truncated: 9,
+  /** `each` over a missing or non-array path. */
+  emptyIteration: 10,
+  /** An IANA zone name: this library ships no timezone database. */
+  unsupportedTimezone: 11,
+  /** A `raw` block carrying a cut or a status command — the core owns job termination. */
+  rawFramingRisk: 12,
+  /** Everything else worth telling the operator. */
+  note: 13,
+} as const;
+export type ReportKind = keyof typeof ReportKind;
+export const reportKindFromNative = decoder('pd_report_kind', ReportKind);
+
+// --- pd_render_path -------------------------------------------------------------------
+
+/** How an entry's content reached the paper, if it did. */
+export const RenderPath = {
+  /** Produced by ESC/POS commands. */
+  hardware: 0,
+  /** Produced as an image. */
+  raster: 1,
+  /** Requested, and deliberately absent from the output. */
+  notRendered: 2,
+} as const;
+export type RenderPath = keyof typeof RenderPath;
+export const renderPathFromNative = decoder('pd_render_path', RenderPath);
+
 // --- the table the enum-bridge test walks ----------------------------------------------
 
 /**
@@ -508,4 +566,6 @@ export const enumMirrors: Readonly<Record<string, Readonly<Record<string, number
   pd_profile_selection: ProfileSelection,
   pd_detection_status: DetectionStatus,
   pd_match_kind: MatchKind,
+  pd_report_kind: ReportKind,
+  pd_render_path: RenderPath,
 };

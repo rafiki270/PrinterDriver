@@ -99,6 +99,12 @@ export const nativeMethodNames: readonly string[] = [
   'registerBlockHandler',
   'registerFormatter',
   'registerDrawerKick',
+  'renderDocument',
+  'printDocumentJson',
+  'renderReportAt',
+  'renderReportCount',
+  'reportKindName',
+  'renderPathName',
 ];
 
 /**

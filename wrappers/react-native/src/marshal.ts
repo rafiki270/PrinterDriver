@@ -37,6 +37,10 @@ import {
   jobStateFromNative,
   profileSelectionFromNative,
   provenanceFromNative,
+  codePageFromNative,
+  cutSettingFromNative,
+  renderPathFromNative,
+  reportKindFromNative,
   tristateFromNative,
 } from './enums.ts';
 import type {
@@ -55,9 +59,13 @@ import type {
   JobEvent,
   JobOptions,
   JobResult,
+  JsonDocument,
   Payload,
   QueueOptions,
   QueuePolicy,
+  RenderOptions,
+  RenderedDocument,
+  ReportEntry,
   ReprintOptions,
   SelfTestOptions,
   TcpPrinterConfig,
@@ -266,6 +274,54 @@ export function marshalDiscoverOptions(
     responseTimeoutMs: int(options?.responseTimeoutMs),
     noBackchannelProbe: bool(options?.noBackchannelProbe),
   };
+}
+
+// --- outbound: the receipt DSL ------------------------------------------------------------------
+
+export interface NativeRenderOptions {
+  widthDots: number;
+  cutClearanceDots: number;
+  maxRowsPerBand: number;
+  locale: string;
+  currency: string;
+  timeZone: string;
+}
+
+export function marshalRenderOptions(options: RenderOptions | undefined): NativeRenderOptions {
+  return {
+    widthDots: int(options?.widthDots),
+    cutClearanceDots: int(options?.cutClearanceDots),
+    maxRowsPerBand: int(options?.maxRowsPerBand),
+    // "" is the ABI's own "defer to the document's meta", which is why an omitted
+    // override is not turned into an empty locale that overrides it with nothing.
+    locale: str(options?.locale),
+    currency: str(options?.currency),
+    timeZone: str(options?.timeZone),
+  };
+}
+
+/**
+ * A JSON string stays exactly as it is; anything else goes through `JSON.stringify`, so an
+ * object built in JavaScript and a stored `.json` template reach the identical parser in
+ * the core. `undefined` and `null` become "", which the native side turns back into the
+ * NULL that means "this document carries its own content".
+ */
+export function marshalJsonDocument(
+  value: JsonDocument | null | undefined,
+  what: string
+): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value;
+  let text: string;
+  try {
+    text = JSON.stringify(value);
+  } catch (error) {
+    throw new PayloadError(`the ${what} is not representable as JSON: ${String(error)}`);
+  }
+  if (text === undefined) {
+    throw new PayloadError(`the ${what} is not representable as JSON`);
+  }
+  return text;
 }
 
 // --- outbound: payloads -----------------------------------------------------------------------
@@ -636,4 +692,75 @@ export function unmarshalDiscoveredDevice(raw: NativeDiscoveredDevice): Discover
     port9100Open: raw.port9100Open === 1,
     dleEotHex: raw.dleEotHex,
   };
+}
+
+// --- inbound: the receipt DSL ---------------------------------------------------------------------
+
+export interface NativeReportEntry {
+  kind: number;
+  block: string;
+  requested: string;
+  delivered: string;
+  path: number;
+  note: string;
+}
+
+export function unmarshalReportEntry(raw: NativeReportEntry): ReportEntry {
+  return {
+    kind: reportKindFromNative(raw.kind),
+    block: raw.block,
+    requested: raw.requested,
+    delivered: raw.delivered,
+    path: renderPathFromNative(raw.path),
+    note: raw.note,
+  };
+}
+
+export function unmarshalReport(raw: readonly NativeReportEntry[] | undefined): ReportEntry[] {
+  return raw === undefined ? [] : raw.map(unmarshalReportEntry);
+}
+
+/** One line, for a log, an error message or a test failure. */
+export function describeReportEntry(entry: ReportEntry): string {
+  const because = entry.note.length === 0 ? '' : ` - ${entry.note}`;
+  return (
+    `${entry.block}  ${entry.kind}: requested "${entry.requested}", ` +
+    `delivered "${entry.delivered}" [${entry.path}]${because}`
+  );
+}
+
+export interface NativeRenderResult {
+  /** 1 when bytes were produced. 0 means the report says why, and nothing printed. */
+  ok: number;
+  bytes: ArrayBuffer;
+  codePage: number;
+  hasCut: number;
+  cut: number;
+  topFeedDots: number;
+  bottomFeedDots: number;
+  report: NativeReportEntry[];
+  /** pd_last_error, read on the thread that made the call. "" on the success path. */
+  error: string;
+}
+
+export function unmarshalRenderedDocument(raw: NativeRenderResult): RenderedDocument {
+  return {
+    bytes: raw.bytes,
+    codePage: codePageFromNative(raw.codePage),
+    meta: {
+      // has_cut = 0 is "the document asked for no particular cut", which is not the same
+      // as asking for `profile`; null keeps the two distinguishable.
+      cut: raw.hasCut === 0 ? null : cutSettingFromNative(raw.cut),
+      topFeedDots: raw.topFeedDots,
+      bottomFeedDots: raw.bottomFeedDots,
+    },
+    report: unmarshalReport(raw.report),
+  };
+}
+
+export interface NativePrintDocumentResult {
+  /** 0 when nothing was submitted. */
+  job: number;
+  report: NativeReportEntry[];
+  error: string;
 }

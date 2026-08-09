@@ -3,7 +3,7 @@
 A cross-platform SDK for receipt printers (ESC/POS and friends) with real
 print-completion feedback. One portable C++17 core does all the work — encoding,
 transports, status parsing, job tracking — with thin native wrappers for Swift, Kotlin,
-Dart and .NET. Zero third-party dependencies.
+Dart, .NET and React Native. Zero third-party dependencies.
 
 Instead of "the bytes were sent", a print job returns `done`, `failed`, or `unknown`,
 together with the evidence behind the answer (e.g. the printer's own completion
@@ -23,6 +23,9 @@ control, printer auto-detection and a print-server daemon are built in.
 **.NET 8** — [wrappers/dotnet](wrappers/dotnet) (`dotnet pack` produces the NuGet).
 
 **Android** — [wrappers/android](wrappers/android) (Gradle AAR module, `com.printerdriver:printerdriver`).
+
+**React Native / Expo** — [wrappers/react-native](wrappers/react-native) (npm package
+`printerdriver-react-native`; C++ TurboModule, New Architecture, Expo dev build).
 
 **C / C++** — build with CMake; link `printerdriver_core` or the C ABI
 (`capi/include/printerdriver/pd.h`):
@@ -51,8 +54,8 @@ case .unknown:                 print("sent, unconfirmed — ask the operator")
 }
 ```
 
-Same API shape in Dart, C#, Kotlin and C — see each wrapper's README. Receipts can
-also be built from JSON templates with bound data models
+Same API shape in Dart, C#, Kotlin, TypeScript and C — see each wrapper's README.
+Receipts can also be built from JSON templates with bound data models
 ([docs/receipt-dsl.md](docs/receipt-dsl.md)), sent as rendered raster images, or as raw
 ESC/POS bytes. Resubmitting the same `key` never prints twice; deliberate reprints are
 marked on the paper.
@@ -168,9 +171,9 @@ scanner + receipt designer.
 ## Development
 
 C++17, CMake 3.16+, no dependencies. `ctest` runs the C++ suites; `swift test`,
-`dart test` and `dotnet test` cover the wrappers (see each wrapper's README for the
-one-line setup). The Android module and the Windows build are CI-ready but need their
-respective toolchains.
+`dart test`, `dotnet test` and `npm run verify` (React Native) cover the wrappers (see
+each wrapper's README for the one-line setup). The Android module and the Windows build
+are CI-ready but need their respective toolchains.
 
 Two source-level checks need no toolchain and run on every push:
 
@@ -181,11 +184,11 @@ scripts/check_kotlin_syntax.sh       # the JNI glue's types, and every external 
 ```
 
 **No wrapper is a subset** (docs/api.md §17). `check_parity.sh` enumerates the public
-`pd_*` functions in `capi/include/printerdriver/pd.h` and asserts that Swift, Dart, .NET
-and Kotlin each reference every one; a function a wrapper satisfies through a property or
-a higher-level member is listed in `scripts/parity_allowlist.txt` with the member that
-covers it, so the mapping stays visible rather than silently absent. Adding a `pd_`
-function without binding it everywhere fails the build.
+`pd_*` functions in `capi/include/printerdriver/pd.h` and asserts that Swift, Dart, .NET,
+Kotlin and React Native each reference every one; a function a wrapper satisfies through a
+property or a higher-level member is listed in `scripts/parity_allowlist.txt` with the
+member that covers it, so the mapping stays visible rather than silently absent. Adding a
+`pd_` function without binding it everywhere fails the build.
 
 ## License
 

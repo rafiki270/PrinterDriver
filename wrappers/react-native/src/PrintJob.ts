@@ -10,7 +10,7 @@ import { confidenceLevelFromNative, jobStateFromNative } from './enums.ts';
 import { unmarshalJobEvent, unmarshalJobResult } from './marshal.ts';
 import type { NativeJobResult } from './marshal.ts';
 import { addJobListener, nativeModule } from './native.ts';
-import type { JobEvent, JobResult } from './types.ts';
+import type { JobEvent, JobResult, ReportEntry } from './types.ts';
 
 export class PrintJob {
   /** @internal */ readonly driverHandle: number;
@@ -19,6 +19,7 @@ export class PrintJob {
   private readonly stream = new EventStream<JobEvent>();
   private subscription: (() => void) | null = null;
   private pendingResult: Promise<JobResult> | null = null;
+  private report: readonly ReportEntry[] = [];
 
   /** @internal */
   constructor(driverHandle: number, handle: number) {
@@ -103,6 +104,23 @@ export class PrintJob {
       });
     }
     return this.pendingResult;
+  }
+
+  /**
+   * What the renderer declared on the way to this job, for a job submitted with
+   * `printer.printDocument(...)`. Empty for every other job, and for a template job where
+   * every block rendered exactly as written.
+   *
+   * Worth reading on the success path: a receipt that printed with a dropped barcode is a
+   * receipt that printed, and this is the only place that says so.
+   */
+  get renderReport(): readonly ReportEntry[] {
+    return this.report;
+  }
+
+  /** @internal Set by `printer.printDocument`, which is the only caller that has one. */
+  setRenderReport(entries: readonly ReportEntry[]): void {
+    this.report = entries;
   }
 
   /** Stops delivering events for this job. The job itself is unaffected. */

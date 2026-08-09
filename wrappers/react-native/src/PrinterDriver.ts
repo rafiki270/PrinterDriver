@@ -3,7 +3,7 @@
  */
 
 import { EventStream } from './events.ts';
-import { MatchKind } from './enums.ts';
+import { MatchKind, RenderPath, ReportKind } from './enums.ts';
 import { ConfidenceGrade, CompletionAuthority } from './enums.ts';
 import {
   marshalAutoDetectOptions,
@@ -12,8 +12,13 @@ import {
   marshalTcpConfig,
   unmarshalDetectedPrinter,
   unmarshalDiscoveredDevice,
+  unmarshalReportEntry,
 } from './marshal.ts';
-import type { NativeDetectedPrinter, NativeDiscoveredDevice } from './marshal.ts';
+import type {
+  NativeDetectedPrinter,
+  NativeDiscoveredDevice,
+  NativeReportEntry,
+} from './marshal.ts';
 import {
   addLogListener,
   nativeModule,
@@ -42,6 +47,7 @@ import type {
   DiscoveredDevice,
   DriverConfig,
   QueuePolicy,
+  ReportEntry,
   TcpPrinterConfig,
 } from './types.ts';
 
@@ -280,6 +286,37 @@ export class PrinterDriver {
     return raw === null || raw === undefined
       ? null
       : unmarshalDiscoveredDevice(raw as unknown as NativeDiscoveredDevice);
+  }
+
+  // --- the receipt DSL ---------------------------------------------------------------------
+
+  /**
+   * The last render's report on this driver, pulled through the ABI's indexed reader.
+   *
+   * Rarely needed: `printer.renderDocument` and `printer.printDocument` both hand back the
+   * report that belongs to their own call, captured on the thread that produced it. This is
+   * the pull form, for a caller that kept neither — and it answers for the last render on
+   * the driver, whichever printer that was.
+   */
+  renderReport(): ReportEntry[] {
+    const module = nativeModule();
+    const count = module.renderReportCount(this.handle);
+    const entries: ReportEntry[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const raw = module.renderReportAt(this.handle, index);
+      if (raw === null || raw === undefined) continue;
+      entries.push(unmarshalReportEntry(raw as unknown as NativeReportEntry));
+    }
+    return entries;
+  }
+
+  /** The core's own spellings, for a log line or a support ticket. */
+  reportKindName(kind: ReportKind): string {
+    return nativeModule().reportKindName(ReportKind[kind]);
+  }
+
+  renderPathName(path: RenderPath): string {
+    return nativeModule().renderPathName(RenderPath[path]);
   }
 
   // --- custom method registration --------------------------------------------------------------

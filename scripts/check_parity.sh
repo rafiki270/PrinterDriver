@@ -5,13 +5,16 @@
 # THE RULE
 #   Every capability of the C++ core is available in every wrapper, through an idiomatic
 #   interface. No wrapper is a subset. The chain is C++ core -> C ABI (pd.h) -> Swift,
-#   Dart, .NET, Kotlin, and a `pd_` function added to the ABI without a binding in all
-#   four wrappers is an incomplete change, not a follow-up.
+#   Dart, .NET, Kotlin, React Native, and a `pd_` function added to the ABI without a
+#   binding in all five wrappers is an incomplete change, not a follow-up.
 #
 # WHAT THIS PROVES
 #   1. Every public function declared in capi/include/printerdriver/pd.h is referenced
 #      from every wrapper's SOURCE tree -- not its tests, which can bind the ABI directly
-#      and would hide a missing public surface.
+#      and would hide a missing public surface. A wrapper whose source tree is split
+#      across languages names every part of it: the React Native package binds the ABI
+#      from a C++ TurboModule (cpp/) and presents it from TypeScript (src/), so both
+#      directories are its source tree and neither alone is.
 #   2. Every exemption is written down. A wrapper may satisfy a C function through a
 #      property or a higher-level member (a C getter that becomes a Swift property, an
 #      index reader a callback-capable runtime does not need); those cases live in
@@ -35,13 +38,16 @@
 #   in prose does not count as a declaration.
 #
 # THE NEGATIVE CONTROL
-#   A green check nobody has seen go red is worth nothing. `--self-test` runs three
+#   A green check nobody has seen go red is worth nothing. `--self-test` runs four
 #   controls and requires the expected colour from each:
 #     A. the plain run is green;
 #     B. a function nobody has ever bound is injected into the required list, and the
-#        check must go red naming all four wrappers;
+#        check must go red naming all five wrappers;
 #     C. one real binding is hidden from one wrapper, and the check must go red naming
-#        that wrapper and only that one.
+#        that wrapper and only that one;
+#     D. the same, aimed at the multi-directory wrapper. C alone would still pass if the
+#        React Native lane silently matched everything or nothing, because it never
+#        touches it; D is what proves that lane extracts a real per-wrapper set.
 #
 # Usage:
 #   scripts/check_parity.sh              the check; non-zero when a wrapper is short
@@ -60,12 +66,20 @@ cd "$root" || exit 1
 header="capi/include/printerdriver/pd.h"
 allowlist="scripts/parity_allowlist.txt"
 
-# name:source-directory. The source tree only: a wrapper's tests bind the ABI directly
-# and would satisfy every line of this check while the public surface stayed empty.
+# name:source-directory[,more-directories]. The source tree only: a wrapper's tests bind
+# the ABI directly and would satisfy every line of this check while the public surface
+# stayed empty.
+#
+# reactnative carries two directories because its source tree really is two: cpp/ is the
+# TurboModule that calls pd.h, src/ is the TypeScript API an app imports. Listing only cpp/
+# would grade a wrapper by its glue; listing only src/ would look for C function names in a
+# language that never spells them. Neither directory is a test directory -- the package's
+# own tests live in wrappers/react-native/test/, which is not listed here.
 wrappers="swift:wrappers/swift/Sources
 dart:wrappers/dart/lib
 dotnet:wrappers/dotnet/PrinterDriver
-kotlin:wrappers/android/src/main"
+kotlin:wrappers/android/src/main
+reactnative:wrappers/react-native/cpp,wrappers/react-native/src"
 
 # --- 0. The negative control ------------------------------------------------------------
 #
@@ -92,10 +106,10 @@ if [ "${1:-}" = "--self-test" ]; then
     status=1
   else
     named=$(echo "$outb" | grep -c "unbound: $fake")
-    if [ "$named" -eq 4 ]; then
-      echo "   ok: red, and all 4 wrappers named it"
+    if [ "$named" -eq 5 ]; then
+      echo "   ok: red, and all 5 wrappers named it"
     else
-      echo "   FAILED: red, but $named of 4 wrappers reported it unbound"
+      echo "   FAILED: red, but $named of 5 wrappers reported it unbound"
       echo "$outb" | sed 's/^/      /'
       status=1
     fi
@@ -109,10 +123,29 @@ if [ "${1:-}" = "--self-test" ]; then
   else
     hits=$(echo "$outc" | grep -c "unbound: pd_print$")
     if [ "$hits" -eq 1 ]; then
-      echo "   ok: red for swift, green for the other three"
+      echo "   ok: red for swift, green for the other four"
     else
       echo "   FAILED: expected exactly one wrapper to report it, got $hits"
       echo "$outc" | sed 's/^/      /'
+      status=1
+    fi
+  fi
+
+  # Control C never touches the one wrapper whose source tree is more than one directory,
+  # so on its own it would stay green if that lane matched everything or nothing. This is
+  # the same control aimed at it.
+  echo "== control D: the same, for the wrapper assembled from two directories"
+  outd=$(PD_PARITY_DROP="reactnative:pd_render_document" "$self" 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "   FAILED: hiding pd_render_document from the React Native sources stayed green"
+    status=1
+  else
+    hits=$(echo "$outd" | grep -c "unbound: pd_render_document$")
+    if [ "$hits" -eq 1 ]; then
+      echo "   ok: red for reactnative, green for the other four"
+    else
+      echo "   FAILED: expected exactly one wrapper to report it, got $hits"
+      echo "$outd" | sed 's/^/      /'
       status=1
     fi
   fi
@@ -263,15 +296,21 @@ echo
 failed=0
 for entry in $wrappers; do
   name=${entry%%:*}
-  dir=${entry#*:}
+  dirs=$(echo "${entry#*:}" | tr ',' ' ')
 
-  if [ ! -d "$dir" ]; then
+  missing_dir=0
+  for dir in $dirs; do
+    [ -d "$dir" ] && continue
     echo "   $name: $dir does not exist"
+    missing_dir=1
+  done
+  if [ "$missing_dir" -ne 0 ]; then
     failed=1
     continue
   fi
 
-  grep -rhoE 'pd_[A-Za-z0-9_]+' "$dir" 2>/dev/null | sort -u > "$work/found.$name"
+  # shellcheck disable=SC2086
+  grep -rhoE 'pd_[A-Za-z0-9_]+' $dirs 2>/dev/null | sort -u > "$work/found.$name"
 
   # Test hook: hide a real binding from one wrapper, so the check can be watched going red.
   for drop in ${PD_PARITY_DROP:-}; do
@@ -296,10 +335,10 @@ for entry in $wrappers; do
   missing=$(wc -l < "$work/missing.$name" | tr -d ' ')
 
   if [ "$missing" -eq 0 ]; then
-    echo "   $name ($dir)"
+    echo "   $name ($(echo "$dirs" | sed 's/ /, /g'))"
     echo "      bound $bound/$required_count, allowlisted $exempt, missing 0  -- ok"
   else
-    echo "   $name ($dir)"
+    echo "   $name ($(echo "$dirs" | sed 's/ /, /g'))"
     echo "      bound $bound/$required_count, allowlisted $exempt, MISSING $missing"
     sed 's/^/         unbound: /' "$work/missing.$name"
     failed=1

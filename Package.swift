@@ -22,6 +22,15 @@ let package = Package(
     .target(
       name: "CPrinterDriver",
       path: ".",
+      // `path: "."` makes the whole repository this target's directory, so SwiftPM scans all
+      // of it for RESOURCES even though `sources` is explicit. wrappers/ holds no C++ this
+      // target compiles, and it does hold things SwiftPM would rather have an opinion about
+      // -- notably the React Native package's node_modules, whose React Native copy carries
+      // .lproj directories that SwiftPM reads as localized resources and then refuses to
+      // build without a defaultLocalization. Excluding the directory keeps `swift test`
+      // working in a checkout where someone has run `npm install`, which is every checkout
+      // that touches the React Native wrapper.
+      exclude: ["wrappers"],
       sources: [
         "core/src",
         "capi/src",
@@ -60,6 +69,7 @@ let package = Package(
       name: "CPrinterDriverTestSupport",
       dependencies: ["CPrinterDriver"],
       path: ".",
+      exclude: ["wrappers"],  // Same reason as above.
       sources: [
         "capi/tests/pd_test_support.cpp"
       ],

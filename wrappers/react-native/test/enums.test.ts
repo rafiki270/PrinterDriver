@@ -40,7 +40,7 @@ test('every pd.h enum has a mirror, and no mirror is invented', () => {
     [],
     'this package mirrors an enum pd.h does not declare'
   );
-  assert.ok(generated.size >= 26, `expected at least 26 enums, saw ${generated.size}`);
+  assert.ok(generated.size >= 28, `expected at least 28 enums, saw ${generated.size}`);
 });
 
 for (const item of generatedEnums) {

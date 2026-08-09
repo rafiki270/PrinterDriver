@@ -205,6 +205,44 @@ export interface Spec extends TurboModule {
   registerBlockHandler(driver: Int32, handler: UnsafeObject): boolean;
   registerFormatter(driver: Int32, formatter: UnsafeObject): boolean;
   registerDrawerKick(driver: Int32, registration: UnsafeObject): boolean;
+
+  // --- the receipt DSL (M19) ------------------------------------------------------------
+  //
+  // Both renders BLOCK, and not only because rendering costs time: a document may reach a
+  // registered formatter or block handler, and those are the questions that travel out
+  // through the sink and park a core thread until JavaScript answers. Running either of
+  // these inline on the JS thread would be the exact deadlock PrinterDriverModule.h
+  // describes — the JS thread waiting inside the ABI for an answer only the JS thread can
+  // give. Hence a Promise on both, as with every other blocking entry point here.
+
+  /**
+   * Renders and returns `{ bytes, codePage, hasCut, cut, topFeedDots, bottomFeedDots,
+   * report }`. Nothing prints and no job exists. Resolves null when there are no bytes;
+   * the report is still readable with `renderReportAt`.
+   */
+  renderDocument(
+    driver: Int32,
+    printer: Int32,
+    documentJson: string,
+    modelJson: string,
+    options: UnsafeObject
+  ): Promise<UnsafeObject | null>;
+  /**
+   * The same render, submitted through the ordinary fenced engine. Resolves
+   * `{ job, report }` — an ordinary job token — or null when nothing was submitted.
+   */
+  printDocumentJson(
+    driver: Int32,
+    printer: Int32,
+    documentJson: string,
+    modelJson: string,
+    options: UnsafeObject
+  ): Promise<UnsafeObject | null>;
+  /** The last render's report by index, for a caller that would rather pull. */
+  renderReportAt(driver: Int32, index: Int32): UnsafeObject | null;
+  renderReportCount(driver: Int32): Int32;
+  reportKindName(value: Int32): string;
+  renderPathName(value: Int32): string;
 }
 
 /**

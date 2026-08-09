@@ -9,9 +9,9 @@
 #
 #   <wrapper|*>   <pd_function>   <covering member> -- <why it is equivalent>
 #
-# where <wrapper> is one of swift, dart, dotnet, kotlin, or * for all four. Every field is
-# required: an entry with no covering member fails the check, and so does one naming a
-# function pd.h does not declare, so this file cannot rot into a list of excuses.
+# where <wrapper> is one of swift, dart, dotnet, kotlin, reactnative, or * for all five.
+# Every field is required: an entry with no covering member fails the check, and so does one
+# naming a function pd.h does not declare, so this file cannot rot into a list of excuses.
 
 # --- Index readers for the detection sweeps ---------------------------------------------
 #
@@ -21,7 +21,9 @@
 # is found, which is strictly more than the index reader offers (it also carries progress),
 # so binding the reader as well would add a second, worse path to the same data.
 #
-# Dart and Kotlin bind the readers, because they are why the readers exist.
+# Dart and Kotlin bind the readers, because they are why the readers exist. React Native
+# binds them too: its native module CAN service the callback, but a JS candidate stream and
+# an indexed pull are both offered to app code, so nothing is exempt there either.
 
 swift    pd_detected_at      Detection.autoDetect(...) -> AsyncStream<DetectedPrinter> -- serves pd_auto_detect's own callback, so every candidate arrives as it is found
 swift    pd_discovered_at    Detection.discover(...) -> AsyncStream<DiscoveredDevice> -- serves pd_discover's own callback

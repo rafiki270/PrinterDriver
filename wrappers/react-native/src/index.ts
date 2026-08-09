@@ -20,7 +20,7 @@ export { PrintQueue } from './PrintQueue.ts';
 export { EventStream } from './events.ts';
 export type { Subscription } from './events.ts';
 export { Payloads, Receipt } from './payload.ts';
-export { PayloadError } from './marshal.ts';
+export { PayloadError, describeReportEntry } from './marshal.ts';
 export {
   NativeModuleUnavailableError,
   setNativeModule,
@@ -54,6 +54,8 @@ export {
   PreflightMode,
   ProfileSelection,
   Provenance,
+  RenderPath,
+  ReportKind,
   UnknownEnumValueError,
   codePageOrder,
   confidenceGradeLetters,
@@ -69,6 +71,7 @@ export type {
   DeviceStatus,
   DiscoverOptions,
   DiscoveredDevice,
+  DocumentMeta,
   DocumentOp,
   DocumentPayload,
   DrawerCapabilities,
@@ -79,12 +82,16 @@ export type {
   JobEvent,
   JobOptions,
   JobResult,
+  JsonDocument,
   Payload,
   PrinterCapabilities,
   QueueOptions,
   QueuePolicy,
   RasterPayload,
   RawPayload,
+  RenderOptions,
+  RenderedDocument,
+  ReportEntry,
   ReprintOptions,
   SelfTestOptions,
   TcpPrinterConfig,

@@ -388,6 +388,68 @@ jsi::Value drawerReadingToJs(jsi::Runtime& rt, const pd_drawer_reading& reading)
   return jsi::Value(std::move(object));
 }
 
+// --- M19: the render report -------------------------------------------------------------
+//
+// pd.h is explicit that pd_render_result::bytes and every string reachable through
+// pd_render_report_at belong to the DRIVER and stay valid only until the next render on it.
+// Both renders below run on a worker thread and resolve a Promise, so the JS thread always
+// runs LATER -- possibly after another render has already replaced those strings. The whole
+// report is therefore copied out on the thread that produced it, exactly as the detection
+// structs are, and the index reader is never called from the JS side of the boundary.
+
+struct ReportEntryData {
+  int32_t kind = 0;
+  std::string block;
+  std::string requested;
+  std::string delivered;
+  int32_t path = 0;
+  std::string note;
+};
+
+ReportEntryData copyReportEntry(const pd_report_entry& entry) {
+  ReportEntryData data;
+  data.kind = static_cast<int32_t>(entry.kind);
+  data.block = safe(entry.block);
+  data.requested = safe(entry.requested);
+  data.delivered = safe(entry.delivered);
+  data.path = static_cast<int32_t>(entry.path);
+  data.note = safe(entry.note);
+  return data;
+}
+
+/// The last render's report on `driver`, pulled out through the ABI's indexed reader.
+std::vector<ReportEntryData> readRenderReport(pd_driver* driver) {
+  std::vector<ReportEntryData> entries;
+  if (driver == nullptr) return entries;
+  const size_t count = pd_render_report_count(driver);
+  entries.reserve(count);
+  for (size_t index = 0; index < count; ++index) {
+    pd_report_entry wire{};
+    if (pd_render_report_at(driver, static_cast<int32_t>(index), &wire) != 1) continue;
+    entries.push_back(copyReportEntry(wire));
+  }
+  return entries;
+}
+
+jsi::Value reportEntryToJs(jsi::Runtime& rt, const ReportEntryData& data) {
+  jsi::Object object(rt);
+  object.setProperty(rt, "kind", makeNumber(data.kind));
+  object.setProperty(rt, "block", makeString(rt, data.block));
+  object.setProperty(rt, "requested", makeString(rt, data.requested));
+  object.setProperty(rt, "delivered", makeString(rt, data.delivered));
+  object.setProperty(rt, "path", makeNumber(data.path));
+  object.setProperty(rt, "note", makeString(rt, data.note));
+  return jsi::Value(std::move(object));
+}
+
+jsi::Value reportToJs(jsi::Runtime& rt, const std::vector<ReportEntryData>& entries) {
+  jsi::Array array(rt, entries.size());
+  for (size_t index = 0; index < entries.size(); ++index) {
+    array.setValueAtIndex(rt, index, reportEntryToJs(rt, entries[index]));
+  }
+  return jsi::Value(std::move(array));
+}
+
 // =========================================================================================
 // Module state
 // =========================================================================================
@@ -961,6 +1023,38 @@ pd_job_options readJobOptions(jsi::Runtime& rt, const jsi::Value& value) {
   return options;
 }
 
+/**
+ * pd_job_options plus the storage its `key` points at.
+ *
+ * The synchronous submit paths keep the key in a local because the pd_* call happens in the
+ * same scope. pd_print_document_json does not: it renders first, on a worker thread, so the
+ * options and their strings have to outlive this function. `rebind` is called there, after
+ * the copy, because copying the struct moves the std::string and invalidates any c_str()
+ * taken before it.
+ */
+struct JobOptionsStorage {
+  pd_job_options options{};
+  std::string key;
+
+  void rebind() { options.key = key.empty() ? nullptr : key.c_str(); }
+};
+
+/// pd_render_options plus the three optional override strings it points at. Same rule.
+struct RenderOptionsStorage {
+  pd_render_options options{};
+  std::string locale;
+  std::string currency;
+  std::string tz;
+
+  void rebind() {
+    // pd.h: NULL or "" defers to the document's own `meta`, so an omitted override stays
+    // omitted rather than becoming an empty locale that overrides it with nothing.
+    options.locale = locale.empty() ? nullptr : locale.c_str();
+    options.currency = currency.empty() ? nullptr : currency.c_str();
+    options.tz = tz.empty() ? nullptr : tz.c_str();
+  }
+};
+
 pd_queue_options readQueueOptions(jsi::Runtime& rt, const jsi::Value& value) {
   pd_queue_options options{};
   if (!value.isObject()) return options;
@@ -972,6 +1066,27 @@ pd_queue_options readQueueOptions(jsi::Runtime& rt, const jsi::Value& value) {
   options.preflight = static_cast<pd_preflight>(intField(rt, object, "preflight"));
   options.timeout_ms = uintField(rt, object, "timeoutMs");
   return options;
+}
+
+JobOptionsStorage readJobOptionsStorage(jsi::Runtime& rt, const jsi::Value& value) {
+  JobOptionsStorage storage;
+  storage.options = readJobOptions(rt, value);
+  if (value.isObject()) storage.key = stringField(rt, value.getObject(rt), "key");
+  return storage;
+}
+
+RenderOptionsStorage readRenderOptions(jsi::Runtime& rt, const jsi::Value& value) {
+  RenderOptionsStorage storage;
+  if (!value.isObject()) return storage;
+  const jsi::Object object = value.getObject(rt);
+  storage.options.width_dots = uintField(rt, object, "widthDots");
+  storage.options.cut_clearance_dots =
+      static_cast<uint16_t>(uintField(rt, object, "cutClearanceDots"));
+  storage.options.max_rows_per_band = uintField(rt, object, "maxRowsPerBand");
+  storage.locale = stringField(rt, object, "locale");
+  storage.currency = stringField(rt, object, "currency");
+  storage.tz = stringField(rt, object, "timeZone");
+  return storage;
 }
 
 /// Everything a pd_payload points at, kept alive for the duration of the pd_* call.
@@ -1886,6 +2001,114 @@ const std::vector<MethodEntry>& methodTable() {
          const int32_t ok = pd_register_drawer_kick(driver, &reg);
          if (ok != 0) state.registrations.push_back(std::move(registration));
          return makeBool(ok != 0);
+       }},
+
+      // --- the receipt DSL (M19) --------------------------------------------------------
+      //
+      // Both of these run on the worker, and the reason is stronger than "rendering takes
+      // time": a document may reach a formatter or a block handler registered from
+      // JavaScript, and those park a core thread on the sink until `respond` comes back. On
+      // the JS thread that is a deadlock against itself. Every string handed to the ABI and
+      // every string read back out is copied on the worker for the same reason -- the JS
+      // thread runs later, and by then the driver may have rendered something else.
+      {"renderDocument", 5,
+       [](ModuleState& state, jsi::Runtime& rt, const jsi::Value* args, size_t) -> jsi::Value {
+         pd_driver* driver = requireDriver(state, rt, args[0]);
+         pd_printer* printer = requirePrinter(state, rt, args[1]);
+         auto document = std::make_shared<std::string>(asString(rt, args[2]));
+         auto model = std::make_shared<std::string>(asString(rt, args[3]));
+         auto options = std::make_shared<RenderOptionsStorage>(readRenderOptions(rt, args[4]));
+         return runAsync(state.shared_from_this(), rt,
+                         [driver, printer, document, model, options]() -> JsProducer {
+                           options->rebind();
+                           pd_render_result out{};
+                           const int32_t ok = pd_render_document(
+                               driver, printer, document->c_str(),
+                               model->empty() ? nullptr : model->c_str(), &options->options,
+                               &out);
+                           // The reason is read FIRST, while it is still the reason this
+                           // call failed and not whatever the next ABI call left behind.
+                           const std::string error =
+                               ok == 1 ? std::string() : safe(pd_last_error(driver));
+                           std::vector<uint8_t> bytes;
+                           if (ok == 1 && out.bytes != nullptr && out.size > 0) {
+                             bytes.assign(out.bytes, out.bytes + out.size);
+                           }
+                           // Read on BOTH paths: pd.h fills the report when it refuses, so
+                           // a caller sees the same list it would see for a degradation.
+                           const std::vector<ReportEntryData> report = readRenderReport(driver);
+                           const int32_t codePage = static_cast<int32_t>(out.code_page);
+                           const int32_t hasCut = out.has_cut;
+                           const int32_t cut = static_cast<int32_t>(out.cut);
+                           const double topFeed = static_cast<double>(out.top_feed_dots);
+                           const double bottomFeed = static_cast<double>(out.bottom_feed_dots);
+                           return [ok, bytes, report, error, codePage, hasCut, cut, topFeed,
+                                   bottomFeed](jsi::Runtime& js) {
+                             jsi::Object object(js);
+                             object.setProperty(js, "ok", makeNumber(ok));
+                             object.setProperty(js, "bytes",
+                                                makeBytes(js, bytes.data(), bytes.size()));
+                             object.setProperty(js, "codePage", makeNumber(codePage));
+                             object.setProperty(js, "hasCut", makeNumber(hasCut));
+                             object.setProperty(js, "cut", makeNumber(cut));
+                             object.setProperty(js, "topFeedDots", makeNumber(topFeed));
+                             object.setProperty(js, "bottomFeedDots", makeNumber(bottomFeed));
+                             object.setProperty(js, "report", reportToJs(js, report));
+                             object.setProperty(js, "error", makeString(js, error));
+                             return jsi::Value(std::move(object));
+                           };
+                         });
+       }},
+      {"printDocumentJson", 5,
+       [](ModuleState& state, jsi::Runtime& rt, const jsi::Value* args, size_t) -> jsi::Value {
+         pd_driver* driver = requireDriver(state, rt, args[0]);
+         pd_printer* printer = requirePrinter(state, rt, args[1]);
+         auto document = std::make_shared<std::string>(asString(rt, args[2]));
+         auto model = std::make_shared<std::string>(asString(rt, args[3]));
+         auto options = std::make_shared<JobOptionsStorage>(readJobOptionsStorage(rt, args[4]));
+         std::shared_ptr<ModuleState> shared = state.shared_from_this();
+         return runAsync(shared, rt,
+                         [shared, driver, printer, document, model, options]() -> JsProducer {
+                           options->rebind();
+                           // out_result is NULL on purpose: everything it carries is either
+                           // applied by the engine itself or readable from the report, and
+                           // a struct of driver-owned pointers must not outlive this call.
+                           pd_job* job = pd_print_document_json(
+                               driver, printer, document->c_str(),
+                               model->empty() ? nullptr : model->c_str(), &options->options,
+                               nullptr);
+                           const std::string error =
+                               job == nullptr ? safe(pd_last_error(driver)) : std::string();
+                           const std::vector<ReportEntryData> report = readRenderReport(driver);
+                           const int32_t token = tokenForJob(*shared, job);
+                           return [token, report, error](jsi::Runtime& js) {
+                             jsi::Object object(js);
+                             object.setProperty(js, "job", makeNumber(token));
+                             object.setProperty(js, "report", reportToJs(js, report));
+                             object.setProperty(js, "error", makeString(js, error));
+                             return jsi::Value(std::move(object));
+                           };
+                         });
+       }},
+      {"renderReportAt", 2,
+       [](ModuleState& state, jsi::Runtime& rt, const jsi::Value* args, size_t) -> jsi::Value {
+         pd_driver* driver = requireDriver(state, rt, args[0]);
+         pd_report_entry out{};
+         if (pd_render_report_at(driver, asInt(args[1]), &out) != 1) return jsi::Value::null();
+         return reportEntryToJs(rt, copyReportEntry(out));
+       }},
+      {"renderReportCount", 1,
+       [](ModuleState& state, jsi::Runtime& rt, const jsi::Value* args, size_t) -> jsi::Value {
+         return makeNumber(
+             static_cast<double>(pd_render_report_count(requireDriver(state, rt, args[0]))));
+       }},
+      {"reportKindName", 1,
+       [](ModuleState&, jsi::Runtime& rt, const jsi::Value* args, size_t) -> jsi::Value {
+         return makeString(rt, pd_report_kind_name(static_cast<pd_report_kind>(asInt(args[0]))));
+       }},
+      {"renderPathName", 1,
+       [](ModuleState&, jsi::Runtime& rt, const jsi::Value* args, size_t) -> jsi::Value {
+         return makeString(rt, pd_render_path_name(static_cast<pd_render_path>(asInt(args[0]))));
        }},
   };
   return *table;

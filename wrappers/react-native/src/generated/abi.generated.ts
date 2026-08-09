@@ -5,7 +5,7 @@
 // `npm run abi:check`. Its only consumers are the tests, which compare it against the
 // hand-written mirrors in src/enums.ts and against the native module's method table.
 //
-// Enums: 26. Public pd_* functions: 86.
+// Enums: 28. Public pd_* functions: 92.
 
 export interface GeneratedEnumMember {
   readonly name: string;
@@ -368,6 +368,39 @@ export const generatedEnums: readonly GeneratedEnum[] = [
       { name: 'PD_MATCH_NEED_MORE', key: 'needMore', value: 2 },
     ],
   },
+  {
+    name: 'pd_report_kind',
+    prefix: 'PD_REPORT_',
+    countName: 'PD_REPORT_KIND_COUNT',
+    count: 14,
+    members: [
+      { name: 'PD_REPORT_MISSING_PATH', key: 'missingPath', value: 0 },
+      { name: 'PD_REPORT_UNKNOWN_FORMATTER', key: 'unknownFormatter', value: 1 },
+      { name: 'PD_REPORT_UNFORMATTABLE_VALUE', key: 'unformattableValue', value: 2 },
+      { name: 'PD_REPORT_MALFORMED_TEMPLATE', key: 'malformedTemplate', value: 3 },
+      { name: 'PD_REPORT_UNKNOWN_STYLE', key: 'unknownStyle', value: 4 },
+      { name: 'PD_REPORT_STYLE_CYCLE', key: 'styleCycle', value: 5 },
+      { name: 'PD_REPORT_UNSUPPORTED_STYLE', key: 'unsupportedStyle', value: 6 },
+      { name: 'PD_REPORT_UNSUPPORTED_BLOCK', key: 'unsupportedBlock', value: 7 },
+      { name: 'PD_REPORT_MISSING_IMAGE', key: 'missingImage', value: 8 },
+      { name: 'PD_REPORT_TRUNCATED', key: 'truncated', value: 9 },
+      { name: 'PD_REPORT_EMPTY_ITERATION', key: 'emptyIteration', value: 10 },
+      { name: 'PD_REPORT_UNSUPPORTED_TIMEZONE', key: 'unsupportedTimezone', value: 11 },
+      { name: 'PD_REPORT_RAW_FRAMING_RISK', key: 'rawFramingRisk', value: 12 },
+      { name: 'PD_REPORT_NOTE', key: 'note', value: 13 },
+    ],
+  },
+  {
+    name: 'pd_render_path',
+    prefix: 'PD_RENDER_PATH_',
+    countName: 'PD_RENDER_PATH_COUNT',
+    count: 3,
+    members: [
+      { name: 'PD_RENDER_PATH_HARDWARE', key: 'hardware', value: 0 },
+      { name: 'PD_RENDER_PATH_RASTER', key: 'raster', value: 1 },
+      { name: 'PD_RENDER_PATH_NOT_RENDERED', key: 'notRendered', value: 2 },
+    ],
+  },
 ];
 
 export const generatedFunctions: readonly string[] = [
@@ -422,6 +455,7 @@ export const generatedFunctions: readonly string[] = [
   'pd_open_cash_drawer',
   'pd_payload_kind_name',
   'pd_print',
+  'pd_print_document_json',
   'pd_printer_completion',
   'pd_printer_completion_provenance',
   'pd_printer_drain',
@@ -452,6 +486,11 @@ export const generatedFunctions: readonly string[] = [
   'pd_register_drawer_kick',
   'pd_register_formatter',
   'pd_register_probe_step',
+  'pd_render_document',
+  'pd_render_path_name',
+  'pd_render_report_at',
+  'pd_render_report_count',
+  'pd_report_kind_name',
   'pd_self_test',
   'pd_subscribe_device',
   'pd_subscribe_job',

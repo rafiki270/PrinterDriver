@@ -113,12 +113,38 @@ const snapshot = printer.status();    // never a live query, so it cannot block 
 snapshot.paperNearEnd;                // 'yes' | 'no' | 'unknown' — never a silent false
 ```
 
+### Receipts from JSON templates
+
+```ts
+// Preview: renders against this printer's profile, prints nothing, costs no paper.
+const preview = await printer.renderDocument(template, { order });
+preview.bytes;                        // the ESC/POS a printer would receive
+preview.report.forEach(entry => {     // every degradation the profile forced
+  console.log(entry.block, entry.kind, entry.requested, '→', entry.delivered);
+});
+
+// The same render, printed. An ordinary job: same fence, same dedupe, same tri-state.
+const job = await printer.printDocument(template, { order }, { key: 'order-7F3A' });
+job.renderReport;                     // what was declared on the way to the paper
+switch ((await job.result).outcome) { /* 'done' | 'failed' | 'unknown' */ }
+```
+
+`template` and the model each take JSON text or the plain object you already have. A
+missing `{{path}}`, an unknown formatter or a barcode this profile cannot draw still
+prints — as a `ReportEntry`, never silently. Only three things stop bytes being produced,
+and each rejects rather than printing a receipt full of `{{order.total}}`: JSON that is not
+JSON, a structure that is not a document, and a template handed no model. See
+[docs/receipt-dsl.md](../../docs/receipt-dsl.md).
+
 ## API surface
 
 Everything the C ABI exposes is reachable from this package. `test/parity.test.ts` checks
 that mechanically, at three levels: every `pd_*` function in `pd.h` has a TurboModule
 method, the spec really declares it, and `cpp/PrinterDriverModule.cpp` really calls it
-([docs/api.md §17](../../docs/api.md)).
+([docs/api.md §17](../../docs/api.md)). The repository-wide gate,
+`scripts/check_parity.sh`, holds this package to the same list as the Swift, Dart, .NET and
+Kotlin wrappers, reading both halves of its source tree — `cpp/` for the module that calls
+the ABI, `src/` for the TypeScript an app imports.
 
 | Area | Surface |
 |---|---|
@@ -126,6 +152,7 @@ method, the spec really declares it, and `cpp/PrinterDriverModule.cpp` really ca
 | Printers | `addPrinter(tcpConfig)`, `printer(host, width, profile)`, `addCustomPrinter(transport)`, `id`, `widthDots`, `completion`, `completionProvenance`, `language`, `drain()` |
 | Printing | `printer.print(payload, options)`, `printer.send(payload, {onProgress})`, `printer.forceReprint(key, {banner})` |
 | Payload tiers | `Payloads.text([...])`, `Payloads.document(new Receipt()…)`, `Payloads.raster({pixels, width, height})`, `Payloads.raw(bytes)` |
+| Receipt DSL | `printer.printDocument(document, model, options)`, `printer.renderDocument(document, model, options)` (preview: nothing prints), `job.renderReport`, `driver.renderReport()` |
 | Jobs | `id`, `key`, `printToken`, `cutToken`, `attempt`, `state`, `confidence`, `isTerminal`, `events`, `result`, `awaitResult(timeoutMs)` |
 | Job lookup | `driver.findJob(key)`, `driver.jobByToken('K73F')` — paper → job |
 | Status | `printer.status()`, `printer.refreshStatus(timeoutMs)`, `printer.events` |
@@ -134,7 +161,7 @@ method, the spec really declares it, and `cpp/PrinterDriverModule.cpp` really ca
 | Detection | `printer.selfTest(options)`, `driver.autoDetect(options)`, `driver.discover(options)`, `detectedAt`, `discoveredAt` |
 | Extension | `registerCompletionMethod`, `registerProbeStep`, `registerBlockHandler`, `registerFormatter`, `registerDrawerKick` |
 | Transports | `CustomTransport` (`connect`/`write`/`close`), `printer.feedBytes(bytes)`, `printer.reportLinkDropped(message)` |
-| Enums | 26 closed enums as `const` objects plus string-literal unions, mirrored from `pd.h` and checked by a test |
+| Enums | 28 closed enums as `const` objects plus string-literal unions, mirrored from `pd.h` and checked by a test |
 
 ### Job options
 
@@ -239,7 +266,7 @@ wrappers/react-native/
 │   ├── NativePrinterDriver.ts  the codegen spec: one method per pd_* function
 │   ├── methodNames.ts          those method names, importable without React Native
 │   ├── native.ts               module accessor + the sink router
-│   ├── enums.ts                26 closed enums mirrored from pd.h
+│   ├── enums.ts                28 closed enums mirrored from pd.h
 │   ├── generated/              abi.generated.ts, extracted from pd.h by a script
 │   ├── marshal.ts              pure JS ⇄ ABI translation (all of it directly testable)
 │   ├── types.ts                the value types an app sees
@@ -300,13 +327,13 @@ checked and exactly what was not.
 | What | How | Result |
 |---|---|---|
 | The TypeScript API type-checks | `tsc --noEmit`, `strict` + `noUncheckedIndexedAccess` + `erasableSyntaxOnly`, against **React Native 0.86.2's own `.d.ts` files** (installed as a peer, not a hand-written stub) | clean |
-| 26 enum mirrors match `pd.h` member-for-member and value-for-value | `test/enums.test.ts` against `src/generated/abi.generated.ts`, extracted from the header by `scripts/generate-abi-mirror.mjs` | 59 tests |
+| 28 enum mirrors match `pd.h` member-for-member and value-for-value | `test/enums.test.ts` against `src/generated/abi.generated.ts`, extracted from the header by `scripts/generate-abi-mirror.mjs` | 63 tests |
 | The tri-state result has three outcomes, no `success` boolean, and an exhaustive `switch` | `test/tristate.test.ts`, including a source scan of all of `src/` | 5 tests |
 | Payload encoding and option marshalling, including both inverted flags | `test/marshal.test.ts` | 18 tests |
-| Every public `pd_*` function is reachable: method name, spec declaration, **and a real call in the C++ module** | `test/parity.test.ts` over all 86 functions | 8 tests |
+| Every public `pd_*` function is reachable: method name, spec declaration, **and a real call in the C++ module** | `test/parity.test.ts` over all 92 functions | 8 tests |
 | The event stream, the sink router, and every "handler missing / throws / rejects / unknown kind" path | `test/events.test.ts`, `test/bridge.test.ts` | 21 tests |
-| The public API against a recording module double | `test/api.test.ts` | 24 tests |
-| **135 TypeScript tests total** | `npm test` | 135 pass, 0 fail |
+| The public API against a recording module double | `test/api.test.ts` | 31 tests |
+| **146 TypeScript tests total** | `npm test` | 146 pass, 0 fail |
 | The C++ module's syntax and types against the **real `pd.h`** | `clang++ -std=c++17 -fsyntax-only -Wall -Wextra -Wpedantic` with `cpp/__tests__/rn_stub.h` standing in for the RN headers | clean |
 | That the C++ check can go red | three negative controls, each required to fail *for its stated reason*: a `pd_driver*` passed to `pd_printer_id`; a `jsi::Value` copied (the stub models JSI's move-only ownership); and the module compiled **without** the stub, which must fail with `'ReactCommon/CallInvoker.h' file not found` — proving the React Native code path is really being compiled and not preprocessed away | all three fail correctly |
 | The npm package is well-formed and self-contained | `npm pack --dry-run`, including the staged `native/` sources and the exclusion of the test stub | clean: the staged `native/` sources are in the tarball, `cpp/__tests__/rn_stub.h` is not |

@@ -16,9 +16,12 @@ import {
   provenanceFromNative,
 } from './enums.ts';
 import {
+  describeReportEntry,
   marshalDrawerRequest,
   marshalJobOptions,
+  marshalJsonDocument,
   marshalPayload,
+  marshalRenderOptions,
   marshalReprintOptions,
   marshalSelfTestOptions,
   unmarshalDeviceStatus,
@@ -27,6 +30,8 @@ import {
   unmarshalDrawerResult,
   unmarshalDetectionSummary,
   unmarshalJobResult,
+  unmarshalRenderedDocument,
+  unmarshalReport,
 } from './marshal.ts';
 import type {
   NativeDeviceStatus,
@@ -35,6 +40,8 @@ import type {
   NativeDrawerReading,
   NativeDrawerResult,
   NativeJobResult,
+  NativePrintDocumentResult,
+  NativeRenderResult,
 } from './marshal.ts';
 import { addDeviceListener, nativeModule } from './native.ts';
 import { toArrayBuffer } from './payload.ts';
@@ -49,7 +56,11 @@ import type {
   JobEvent,
   JobOptions,
   JobResult,
+  JsonDocument,
   Payload,
+  RenderOptions,
+  RenderedDocument,
+  ReportEntry,
   ReprintOptions,
   SelfTestOptions,
 } from './types.ts';
@@ -59,6 +70,16 @@ export class PrinterDriverError extends Error {
     super(message.length === 0 ? 'the native call failed and reported no reason' : message);
     this.name = 'PrinterDriverError';
   }
+}
+
+/**
+ * The three hard refusals of docs/receipt-dsl.md carry the report as well as the reason:
+ * JSON that is not JSON, a structure that is not a document, and a template with no model
+ * each produce at least one entry explaining itself.
+ */
+function renderFailure(error: string, report: readonly ReportEntry[]): PrinterDriverError {
+  const lines = report.map(describeReportEntry);
+  return new PrinterDriverError([error, ...lines].filter((line) => line.length > 0).join('\n'));
 }
 
 export interface SelfTestResult {
@@ -173,6 +194,90 @@ export class Printer {
           );
     if (handle === 0) throw new PrinterDriverError(module.lastError(this.driverHandle));
     return new PrintJob(this.driverHandle, handle);
+  }
+
+  // --- the receipt DSL (docs/receipt-dsl.md) -----------------------------------------------
+  //
+  // No rendering logic lives here. Which blocks a profile can draw, what a missing model
+  // path does, how `meta.cut` reaches a job: all of it is in the core behind
+  // `pd_render_document` and `pd_print_document_json`. Both are async because the render may
+  // call back into JavaScript-registered formatters and block handlers — see
+  // src/NativePrinterDriver.ts.
+
+  /**
+   * Renders a receipt-DSL document against this printer's capability profile.
+   *
+   * **Nothing prints and no job exists.** This is the preview path: the bytes a printer
+   * would receive, plus every degradation the profile forced, before any paper is
+   * committed.
+   *
+   * `document` and `model` each take the JSON text an app already has or the plain object
+   * it would stringify anyway. `model` is the parameter model bound into a template
+   * (`{{path.to.value}}`, `each`, `if`); omit it for a document that carries its own
+   * content.
+   *
+   * Rejects with `PrinterDriverError` when the JSON is not JSON, the structure is not a
+   * document, or a template arrived with no model — a receipt full of `{{order.total}}` is
+   * worse than no receipt, because it looks like one. Everything softer is a `ReportEntry`
+   * in `report` and still renders.
+   */
+  async renderDocument(
+    document: JsonDocument,
+    model?: JsonDocument | null,
+    options?: RenderOptions
+  ): Promise<RenderedDocument> {
+    const raw = await nativeModule().renderDocument(
+      this.driverHandle,
+      this.handle,
+      marshalJsonDocument(document, 'document'),
+      marshalJsonDocument(model, 'model'),
+      marshalRenderOptions(options)
+    );
+    if (raw === null || raw === undefined) {
+      throw new PrinterDriverError(nativeModule().lastError(this.driverHandle));
+    }
+    const value = raw as unknown as NativeRenderResult;
+    // The report is read on the failure path too: a caller that wants to show what went
+    // wrong gets the same list it would show for a degradation.
+    if (value.ok !== 1) throw renderFailure(value.error, unmarshalReport(value.report));
+    return unmarshalRenderedDocument(value);
+  }
+
+  /**
+   * Renders a receipt-DSL document and prints it.
+   *
+   * The job is an ordinary `PrintJob`: same worker, same preflight, same completion fence,
+   * same confidence grading, same idempotency-key dedupe as `print`. There is no second
+   * engine — a template job proves exactly what a raster job proves.
+   *
+   * The document's `meta` reaches the job through `options`: omitting them lets the
+   * document decide its own cut and margins, and any field set explicitly wins over it.
+   * What the renderer declared is on the returned job, as `job.renderReport`.
+   *
+   * Rejects with `PrinterDriverError` when there are no bytes to send, and submits nothing
+   * in that case: a malformed document never becomes a blank receipt.
+   */
+  async printDocument(
+    document: JsonDocument,
+    model?: JsonDocument | null,
+    options?: JobOptions
+  ): Promise<PrintJob> {
+    const raw = await nativeModule().printDocumentJson(
+      this.driverHandle,
+      this.handle,
+      marshalJsonDocument(document, 'document'),
+      marshalJsonDocument(model, 'model'),
+      marshalJobOptions(options)
+    );
+    if (raw === null || raw === undefined) {
+      throw new PrinterDriverError(nativeModule().lastError(this.driverHandle));
+    }
+    const value = raw as unknown as NativePrintDocumentResult;
+    const report = unmarshalReport(value.report);
+    if (value.job === 0) throw renderFailure(value.error, report);
+    const job = new PrintJob(this.driverHandle, value.job);
+    job.setRenderReport(report);
+    return job;
   }
 
   // --- status ------------------------------------------------------------------------------

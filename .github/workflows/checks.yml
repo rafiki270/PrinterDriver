@@ -1,5 +1,5 @@
-# The checks that run on every push: the C++ core and its suites, the four wrapper test
-# suites, and the two source-level checks that need no toolchain of their own.
+# The checks that run on every push: the C++ core and its suites, the wrapper test suites,
+# and the two source-level checks that need no toolchain of their own.
 #
 # The Windows job is deliberately NOT here — see .github/workflows/windows.yml for why it
 # is manual-dispatch only.
@@ -17,7 +17,7 @@ permissions:
 jobs:
   # First, because it needs nothing built and fails in seconds: docs/api.md §17's wrapper
   # parity contract. Every public pd_ function in capi/include/printerdriver/pd.h must be
-  # bound in all four wrappers, or listed in scripts/parity_allowlist.txt with the member
+  # bound in all five wrappers, or listed in scripts/parity_allowlist.txt with the member
   # that covers it idiomatically. --self-test runs the negative controls first, so a check
   # that could no longer go red fails here rather than passing quietly forever.
   parity:
@@ -94,6 +94,30 @@ jobs:
         env:
           PRINTERDRIVER_LIB_PATH: ${{ github.workspace }}/native/libprinterdriver_capi_testing.so
         run: dart test
+
+  # No React Native application, no Xcode and no NDK here either. What CAN be checked is:
+  # the generated ABI mirror is in sync with pd.h, the TypeScript type-checks against React
+  # Native's own .d.ts files, the whole JS layer runs against a recording module double,
+  # and the C++ TurboModule syntax- and type-checks against the real pd.h with its three
+  # negative controls. That is `npm run verify`. No lockfile is committed (the package
+  # deliberately resolves React Native as an auto-installed peer), so this is npm install.
+  react-native:
+    name: React Native wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: npm install
+        working-directory: wrappers/react-native
+        run: npm install --no-audit --no-fund
+      - name: npm run verify
+        working-directory: wrappers/react-native
+        run: npm run verify
+      - name: npm pack --dry-run
+        working-directory: wrappers/react-native
+        run: npm pack --dry-run
 
   # No JVM check: there is no kotlinc, Gradle or Android SDK in this workflow either, and
   # wrappers/android/README.md is blunt about what that means. What CAN be checked is

@@ -25,6 +25,8 @@ import type {
   PreflightMode,
   ProfileSelection,
   Provenance,
+  RenderPath,
+  ReportKind,
   Tristate,
 } from './enums.ts';
 
@@ -360,6 +362,101 @@ export interface SelfTestOptions {
   barcodeData?: string;
   noVerificationId?: boolean;
   timeoutMs?: number;
+}
+
+// --- the receipt DSL (docs/receipt-dsl.md) ------------------------------------------------------------
+
+/**
+ * A document or a parameter model, as either the JSON text an app already has or the plain
+ * object it would `JSON.stringify` anyway. A string is passed through untouched, so a
+ * stored `.json` template and an object built in JavaScript reach the identical parser in
+ * the core.
+ */
+export type JsonDocument = string | Record<string, unknown>;
+
+/**
+ * One declared degradation — `pd_report_entry`.
+ *
+ * A missing model path, an unknown formatter and a barcode the profile cannot draw all
+ * land here, and the receipt still prints. That is the honesty contract of
+ * docs/receipt-dsl.md: a declared degradation is not a failure, but it is never silent.
+ */
+export interface ReportEntry {
+  readonly kind: ReportKind;
+  /**
+   * Where it happened, as a path into the document — `"blocks[3].cells[1]"`, `"meta.tz"`,
+   * or `"document"` for one that belongs to no block.
+   */
+  readonly block: string;
+  /** What the document asked for, in the words it is printed in. */
+  readonly requested: string;
+  /** What the paper got. Often `"omitted"`. */
+  readonly delivered: string;
+  readonly path: RenderPath;
+  /** Why, when the pair above does not say it all. Empty when it does. */
+  readonly note: string;
+}
+
+/**
+ * What a document asks the engine for, read back from its `meta`.
+ *
+ * Reported by `renderDocument` and applied by `printDocument`, under the precedence of
+ * docs/receipt-dsl.md: what the caller put in `JobOptions` wins, this fills in what the
+ * caller left alone, and the printer's profile answers what neither said.
+ */
+export interface DocumentMeta {
+  /** null when the document asked for no particular cut. */
+  readonly cut: CutSetting | null;
+  /** Blank paper before the first content line. 0 when the document said nothing. */
+  readonly topFeedDots: number;
+  /**
+   * The TOTAL whitespace between the last content and the cut. The engine feeds
+   * max(the profile's blade clearance, this), so no document can clip its own trailer.
+   */
+  readonly bottomFeedDots: number;
+}
+
+/**
+ * A rendered receipt-DSL document: the bytes a printer would receive, and everything that
+ * was declared along the way.
+ */
+export interface RenderedDocument {
+  /**
+   * The ESC/POS the renderer produced. Never the whole job: the engine adds its own
+   * initialise, trailing feed, cut and completion fence around this.
+   */
+  readonly bytes: ArrayBuffer;
+  readonly codePage: CodePage;
+  readonly meta: DocumentMeta;
+  /** Empty when every block rendered exactly as written. */
+  readonly report: readonly ReportEntry[];
+}
+
+/** Options for `printer.renderDocument`. Every default defers to the printer and to the
+ * document. */
+export interface RenderOptions {
+  /**
+   * 0 lays the document out for this printer's own configured width, which is what the
+   * engine rasterizes to. Anything else previews a different media width.
+   */
+  widthDots?: number;
+  /**
+   * Extra whitespace before a MID-DOCUMENT `cut` block. The renderer feeds
+   * max(the profile's blade clearance, this): more is always granted, less never.
+   */
+  cutClearanceDots?: number;
+  /** 0 means 1024 — the Epson tall-image split, applied to `image` blocks. */
+  maxRowsPerBand?: number;
+  /** Overrides the document's own `meta.locale`. Omitted defers to it. */
+  locale?: string;
+  /** Overrides `meta.currency`. */
+  currency?: string;
+  /**
+   * Overrides `meta.tz`. A fixed offset such as `"+02:00"`; an IANA name is reported as an
+   * `unsupportedTimezone` degradation, because a core that ships no dependencies ships no
+   * timezone database.
+   */
+  timeZone?: string;
 }
 
 // --- print queue -------------------------------------------------------------------------------------

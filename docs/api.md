@@ -106,7 +106,7 @@ printer.renderDocument(documentJson, model: modelJson)             -> { bytes, m
 ```
 
 Two entry points, in the C ABI as `pd_print_document_json` and `pd_render_document`, and
-bound in all four wrappers. Three properties are normative:
+bound in all five wrappers. Three properties are normative:
 
 1. **`printDocument` is `print`.** The rendered bytes go through the identical engine
    path: same worker, same preflight, same completion fence, same confidence grading,
@@ -515,11 +515,22 @@ function pointers (`CustomCompletionMethod.fromLibrary(...)` and its four siblin
 shape a vendor plugin already has — and that asymmetry is a property of the runtime, not a
 gap in the wrapper.
 
+React Native takes a third shape, and for a third reason. JavaScript is single-threaded and
+may only be touched on the JS thread, so its TurboModule marshals each question onto that
+thread through the `CallInvoker` and blocks the core thread on a condition variable until
+`respond` comes back — with a deadline, after which the registration's own documented
+failure is used (a short write, a `notMine` verdict, a declined formatter). That is only
+safe because no blocking `pd_*` call ever runs on the JS thread: every one of them,
+`pd_render_document` and `pd_print_document_json` included, runs on a worker and surfaces
+as a `Promise`. A JS thread parked inside the ABI could be the very thread a core worker is
+waiting on, and the two would deadlock. The registration APIs still take ordinary
+closures.
+
 ## 17. Wrapper parity contract
 
 **Every capability of the C++ core is available in every wrapper, through an idiomatic
 interface.** No wrapper is a subset. The chain is: C++ core → C ABI (`pd.h`) → each
-wrapper (Swift, Dart, .NET, Kotlin). Two obligations:
+wrapper (Swift, Dart, .NET, Kotlin, React Native). Two obligations:
 
 1. **Every core capability is exposed in the C ABI.** A feature that only exists as a
    C++ method, unreachable through `pd.h`, is incomplete — the wrappers bind `pd.h`, not
@@ -532,28 +543,46 @@ wrapper (Swift, Dart, .NET, Kotlin). Two obligations:
 Enforced, not trusted: a parity check (`scripts/check_parity.sh`) enumerates the public
 `pd_*` functions in `pd.h` and asserts each wrapper references every one, mirroring how
 the enum-bridge tests already enforce enum parity. A `pd_` function added to the ABI
-without a binding in all four wrappers fails the check. Idiomatic wrappers may satisfy a
+without a binding in all five wrappers fails the check. Idiomatic wrappers may satisfy a
 function through a property or a higher-level method; those cases are listed explicitly
 in the check's allowlist (`scripts/parity_allowlist.txt`) with the member that covers
 them, so the mapping stays visible rather than silently absent.
 
 The check searches each wrapper's SOURCE tree only — `wrappers/swift/Sources`,
-`wrappers/dart/lib`, `wrappers/dotnet/PrinterDriver`, `wrappers/android/src/main` — never
-its tests, which can bind the ABI directly and would satisfy every line of the contract
-while the public surface stayed empty. Two further properties keep it honest: when a built
-C ABI library is present, every `pd_` symbol it exports must appear in the list parsed out
-of the header, so a declaration the parser misses cannot quietly excuse itself; and
-`scripts/check_parity.sh --self-test` runs three negative controls (a function nobody has
-bound must fail all four wrappers, one binding hidden from one wrapper must fail that
-wrapper alone, and the plain run must be green), because a check nobody has watched go red
-proves nothing. CI runs the self-test before the check itself.
+`wrappers/dart/lib`, `wrappers/dotnet/PrinterDriver`, `wrappers/android/src/main`, and
+both halves of the React Native package (`wrappers/react-native/cpp` for the TurboModule
+that calls `pd.h`, `wrappers/react-native/src` for the TypeScript API an app imports) —
+never its tests, which can bind the ABI directly and would satisfy every line of the
+contract while the public surface stayed empty. A wrapper split across two languages is
+graded on both halves for the same reason: `cpp/` alone would grade it by its glue, `src/`
+alone would look for C function names in a language that never spells them.
+
+Two further properties keep it honest: when a built C ABI library is present, every `pd_`
+symbol it exports must appear in the list parsed out of the header, so a declaration the
+parser misses cannot quietly excuse itself; and `scripts/check_parity.sh --self-test` runs
+four negative controls (the plain run must be green; a function nobody has bound must fail
+all five wrappers; one binding hidden from one wrapper must fail that wrapper alone; and
+the same, aimed at the multi-directory wrapper, since the third control never touches it
+and would stay green if that lane matched everything or nothing), because a check nobody
+has watched go red proves nothing. CI runs the self-test before the check itself.
+
+The React Native package carries the same three questions locally, so a developer who never
+leaves `wrappers/react-native/` still finds a missing binding: `npm run abi:check` compares
+a generated mirror of `pd.h` against the checked-in one, and `test/parity.test.ts` asserts
+that every `pd_*` function has a TurboModule method, that the codegen spec declares it, and
+that `cpp/PrinterDriverModule.cpp` really calls it. `scripts/check_parity.sh` is still the
+gate; that is the same question asked where the work happens.
 
 Two consequences are worth stating, because they are what the contract costs. First,
-"every wrapper" includes the one whose tests cannot run on the build machine: the Android
+"every wrapper" includes the ones whose tests cannot run on the build machine: the Android
 wrapper is held to the same list, verified through the JNI glue's types and its
-external-symbol check rather than through a JVM (`wrappers/android/README.md`). Second, a
-wrapper is allowed to be shaped by its runtime — §16's Dart registration surface is the
-standing example — but never to be smaller.
+external-symbol check rather than through a JVM (`wrappers/android/README.md`), and the
+React Native package the same way, through a `clang++ -fsyntax-only` pass over its
+TurboModule against the real `pd.h` rather than through a built app
+(`wrappers/react-native/README.md`). Second, a wrapper is allowed to be shaped by its
+runtime — §16's Dart registration surface is the standing example, and React Native's
+rule that no blocking `pd_*` call may run on the JS thread is another — but never to be
+smaller.
 
 ### 17.1 What the C ABI does not reach yet
 
@@ -561,7 +590,7 @@ Obligation 2 above is now enforced. Obligation 1 — *every core capability is e
 the C ABI* — is not yet, and the difference is a list rather than a feeling. A reverse
 audit of the public C++ headers against `pd.h` found the following stranded, in rough order
 of what it costs a wrapper. Nothing here is a wrapper's fault and no wrapper can fix it;
-each item is an ABI addition, and adding one means binding it in four wrappers, which is
+each item is an ABI addition, and adding one means binding it in five wrappers, which is
 why they are written down instead of rushed.
 
 Items are struck through as they are closed, rather than deleted: a list that only ever
@@ -570,7 +599,7 @@ shrinks silently is a list nobody can audit.
 - ~~**The receipt DSL and the template layer**~~ — **closed by M19.** `pd_render_document`
   and `pd_print_document_json` (§3, tier 2b) parse, bind and render a DSL document against
   a printer's profile, returning the ESC/POS bytes and a typed render report read back with
-  `pd_render_report_at`; all four wrappers bind both. **The consequence for §16 is closed
+  `pd_render_report_at`; all five wrappers bind both. **The consequence for §16 is closed
   with it**: the block handler and the formatter now have a reachable call site, so all
   five registration points fire end to end from every wrapper. What is still C++-only in
   this layer is narrower and worth naming: `dsl::Json` as a value type, `documentToJson` /

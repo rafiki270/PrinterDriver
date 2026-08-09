@@ -11,7 +11,14 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ConfidenceGrade, CompletionAuthority, ConfidenceLevel, JobOutcome } from '../src/enums.ts';
+import {
+  ConfidenceGrade,
+  CompletionAuthority,
+  ConfidenceLevel,
+  JobOutcome,
+  RenderPath,
+  ReportKind,
+} from '../src/enums.ts';
 import { installSinkForTesting, resetBridgeForTesting, setNativeModule } from '../src/native.ts';
 import { Payloads, Receipt } from '../src/payload.ts';
 import { PrinterDriver } from '../src/PrinterDriver.ts';
@@ -507,6 +514,200 @@ test('selfTest returns the ticket text alongside the ordinary tri-state result',
   assert.equal(outcome.printToken, 'K73F');
   assert.match(outcome.ticketText, /SELF-TEST/);
   assert.equal(outcome.detection.gradeCeiling, 'aJobLevelConfirmation');
+});
+
+// --- the receipt DSL ------------------------------------------------------------------------------------------
+
+const documentJson = JSON.stringify({
+  meta: { width: 576 },
+  blocks: [{ type: 'text', text: 'Order {{order.id}}' }],
+});
+
+/** One degradation and one hard refusal, in the wire shape the C++ module writes. */
+const missingPathEntry = {
+  kind: 0,
+  block: 'blocks[0]',
+  requested: '{{order.note}}',
+  delivered: 'omitted',
+  path: 2,
+  note: 'no such path in the model',
+};
+
+test('renderDocument previews without printing and types every report entry', async () => {
+  fake.answers.set('renderDocument', {
+    ok: 1,
+    bytes: new ArrayBuffer(12),
+    codePage: 16,
+    hasCut: 1,
+    cut: 1,
+    topFeedDots: 0,
+    bottomFeedDots: 90,
+    report: [missingPathEntry],
+    error: '',
+  });
+  const printer = driver().addPrinter({ host: '192.168.1.101' });
+  const rendered = await printer.renderDocument(
+    { blocks: [{ type: 'text', text: 'hi' }] },
+    { order: { id: '7F3A' } },
+    { widthDots: 384, timeZone: '+02:00' }
+  );
+
+  const call = fake.lastCall('renderDocument');
+  assert.equal(call?.args[0], 1);
+  assert.equal(call?.args[1], 10);
+  // A plain object is stringified here; the core's own strict reader parses it, so an
+  // object and a stored .json template reach the identical parser.
+  assert.equal(call?.args[2], '{"blocks":[{"type":"text","text":"hi"}]}');
+  assert.equal(call?.args[3], '{"order":{"id":"7F3A"}}');
+  assert.deepEqual(call?.args[4], {
+    widthDots: 384,
+    cutClearanceDots: 0,
+    maxRowsPerBand: 0,
+    locale: '',
+    currency: '',
+    timeZone: '+02:00',
+  });
+
+  assert.equal(rendered.bytes.byteLength, 12);
+  assert.equal(rendered.codePage, 'wpc1252');
+  assert.equal(rendered.meta.cut, 'partial');
+  assert.equal(rendered.meta.bottomFeedDots, 90);
+  assert.equal(rendered.report.length, 1);
+  const entry = rendered.report[0];
+  assert.equal(entry?.kind, 'missingPath');
+  assert.equal(entry?.path, 'notRendered');
+  assert.equal(entry?.block, 'blocks[0]');
+  assert.equal(entry?.note, 'no such path in the model');
+  // Nothing printed and no job exists.
+  assert.equal(fake.callsTo('print').length, 0);
+  assert.equal(fake.callsTo('printDocumentJson').length, 0);
+});
+
+test('a document that asked for no cut reports no cut, not the profile default', async () => {
+  fake.answers.set('renderDocument', {
+    ok: 1,
+    bytes: new ArrayBuffer(0),
+    codePage: 0,
+    hasCut: 0,
+    cut: 0,
+    topFeedDots: 0,
+    bottomFeedDots: 0,
+    report: [],
+    error: '',
+  });
+  const printer = driver().addPrinter({ host: '10.0.0.1' });
+  const rendered = await printer.renderDocument(documentJson);
+  assert.equal(rendered.meta.cut, null);
+  assert.deepEqual(rendered.report, []);
+  // A JSON string is passed through untouched, and an absent model stays absent.
+  assert.equal(fake.lastCall('renderDocument')?.args[2], documentJson);
+  assert.equal(fake.lastCall('renderDocument')?.args[3], '');
+});
+
+test('a refused render carries both the reason and the report that explains it', async () => {
+  fake.answers.set('renderDocument', {
+    ok: 0,
+    bytes: new ArrayBuffer(0),
+    codePage: 0,
+    hasCut: 0,
+    cut: 0,
+    topFeedDots: 0,
+    bottomFeedDots: 0,
+    report: [
+      {
+        kind: 3,
+        block: 'document',
+        requested: 'template',
+        delivered: 'nothing',
+        path: 2,
+        note: 'a template was submitted with no model',
+      },
+    ],
+    error: 'the document is a template and no model was supplied',
+  });
+  const printer = driver().addPrinter({ host: '10.0.0.1' });
+  await assert.rejects(printer.renderDocument(documentJson), (error: Error) => {
+    assert.equal(error.name, 'PrinterDriverError');
+    assert.match(error.message, /no model was supplied/);
+    assert.match(error.message, /document {2}malformedTemplate/);
+    return true;
+  });
+});
+
+test('printDocument submits an ordinary job and attaches the render report to it', async () => {
+  fake.answers.set('printDocumentJson', {
+    job: 100,
+    report: [missingPathEntry],
+    error: '',
+  });
+  fake.answers.set('jobAwait', {
+    outcome: JobOutcome.done,
+    confidence: ConfidenceLevel.cutFaultFree,
+    reason: 0,
+    grade: ConfidenceGrade.aJobLevelConfirmation,
+    authority: 0,
+    method: 'GS(H) fn48',
+  });
+  const printer = driver().addPrinter({ host: '10.0.0.1' });
+  const job = await printer.printDocument(documentJson, { order: { id: '7F3A' } }, {
+    key: 'order-7F3A#kitchen-1',
+    bottomFeedDots: 120,
+  });
+
+  // The document's meta reaches the job through the ordinary pd_job_options.
+  assert.deepEqual(fake.lastCall('printDocumentJson')?.args[4], {
+    key: 'order-7F3A#kitchen-1',
+    cut: 0,
+    openDrawer: 0,
+    preflight: 0,
+    timeoutMs: 0,
+    topFeedDots: 0,
+    bottomFeedDots: 120,
+    suppressVerificationId: 0,
+  });
+  // It IS a print job: same handle table, same events, same tri-state result.
+  assert.equal(job.key, 'order-1');
+  assert.equal(job.renderReport.length, 1);
+  assert.equal(job.renderReport[0]?.kind, 'missingPath');
+  const result = await job.result;
+  assert.equal(result.outcome, 'done');
+  // A receipt that printed with a dropped placeholder is a receipt that printed.
+  assert.equal(job.renderReport[0]?.delivered, 'omitted');
+});
+
+test('a document that produces no bytes submits nothing at all', async () => {
+  fake.answers.set('printDocumentJson', {
+    job: 0,
+    report: [{ ...missingPathEntry, kind: 3, block: 'document' }],
+    error: 'the document JSON did not parse',
+  });
+  const printer = driver().addPrinter({ host: '10.0.0.1' });
+  await assert.rejects(printer.printDocument('{ not json'), /did not parse/);
+});
+
+test('a document that cannot be stringified never reaches the ABI', async () => {
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  const printer = driver().addPrinter({ host: '10.0.0.1' });
+  await assert.rejects(printer.renderDocument(cyclic), /not representable as JSON/);
+  assert.equal(fake.callsTo('renderDocument').length, 0);
+});
+
+test('the driver reads the last report back through the index reader', () => {
+  fake.answers.set('renderReportCount', 2);
+  fake.answers.set('renderReportAt', (_driver: unknown, index: unknown) =>
+    index === 0 ? missingPathEntry : { ...missingPathEntry, kind: 9, path: 0 }
+  );
+  const instance = driver();
+  const report = instance.renderReport();
+  assert.equal(report.length, 2);
+  assert.equal(report[0]?.kind, 'missingPath');
+  assert.equal(report[1]?.kind, 'truncated');
+  assert.equal(report[1]?.path, 'hardware');
+  assert.equal(instance.reportKindName('missingPath'), 'MissingPath');
+  assert.equal(fake.lastCall('reportKindName')?.args[0], ReportKind.missingPath);
+  assert.equal(instance.renderPathName('notRendered'), 'Hardware');
+  assert.equal(fake.lastCall('renderPathName')?.args[0], RenderPath.notRendered);
 });
 
 // --- lifetime -------------------------------------------------------------------------------------------------

@@ -81,6 +81,12 @@ const defaultAnswers: Record<string, unknown> = {
   discoveredAt: null,
   selfTest: null,
   jobAwait: null,
+  renderDocument: null,
+  printDocumentJson: null,
+  renderReportAt: null,
+  renderReportCount: 0,
+  reportKindName: 'MissingPath',
+  renderPathName: 'Hardware',
 };
 
 export function createFakeNative(): FakeNative {
@@ -135,4 +141,8 @@ export const asyncMethods = new Set<string>([
   'selfTest',
   'autoDetect',
   'discover',
+  // Both renders may reach a JavaScript formatter or block handler, so the native module
+  // runs them off the JS thread and they surface as Promises. See NativePrinterDriver.ts.
+  'renderDocument',
+  'printDocumentJson',
 ]);
