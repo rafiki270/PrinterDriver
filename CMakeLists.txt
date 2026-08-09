@@ -140,6 +140,11 @@ add_library(printerdriver_dsl STATIC
   dsl/src/bind.cpp
   dsl/src/barcode.cpp
   dsl/src/render.cpp
+  # M19 — parse → bind → render as one call (docs/api.md §3, §17.1). pdctl's template
+  # path and the ABI's pd_render_document / pd_print_document_json are the same three
+  # steps in the same order; sharing them here is what keeps the CLI and every wrapper
+  # from disagreeing about what a document means.
+  dsl/src/pipeline.cpp
   # M15 — Printer::selfTest (docs/api.md §15). Declared in core/driver.hpp, defined here
   # because the diagnostic ticket is a DSL document and the DSL depends on the core, not
   # the other way round. See the linkage note at the top of printerdriver/self_test.hpp.

@@ -247,6 +247,10 @@ public sealed class AbiLayoutTests
         Assert.Equal(4, Marshal.SizeOf<PdDrawerRequest>());       // u8+pad, u16
         Assert.Equal(16, Marshal.SizeOf<PdDrawerResult>());       // 2 int, u8+pad, u16, u32
         Assert.Equal(20, Marshal.SizeOf<PdDrawerReading>());      // 5 x int
+        // M19 -- docs/receipt-dsl.md.
+        Assert.Equal(40, Marshal.SizeOf<PdRenderOptions>());      // u32, u16+pad, u32+pad, 3 ptr
+        Assert.Equal(48, Marshal.SizeOf<PdRenderResult>());       // ptr, size_t, 3 int, 2 u32+pad, size_t
+        Assert.Equal(48, Marshal.SizeOf<PdReportEntry>());        // int+pad, 3 ptr, int+pad, ptr
     }
 
     [Fact]

@@ -25,7 +25,9 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'src/allocation.dart';
 import 'src/bindings.dart';
@@ -148,6 +150,27 @@ final class PrinterDriver {
 
   /// Why the last call on this driver returned null; empty when it succeeded.
   String get lastError => readNativeString(_bindings.lastError(_handle));
+
+  /// The last document render's report, pulled out through the ABI's index reader.
+  ///
+  /// Read immediately after the call that produced it: pd.h owns these strings until the
+  /// next render on this driver, and this is where they stop being borrowed. Callers
+  /// normally reach it through [RenderedDocument.report] or [PrintJob.renderReport],
+  /// which do exactly that at the right moment.
+  List<ReportEntry> get renderReport {
+    final count = _bindings.renderReportCount(_handle);
+    if (count == 0) return const <ReportEntry>[];
+    return Arena.using((arena) {
+      final slot = arena.allocate<PdReportEntry>(sizeOf<PdReportEntry>());
+      final entries = <ReportEntry>[];
+      for (var index = 0; index < count; index++) {
+        if (_bindings.renderReportAt(_handle, index, slot) == 1) {
+          entries.add(ReportEntry.fromNative(slot.ref));
+        }
+      }
+      return List<ReportEntry>.unmodifiable(entries);
+    });
+  }
 
   /// The profile ids [addTcpPrinter] accepts, enumerated from the library rather than
   /// hardcoded.
@@ -998,6 +1021,121 @@ final class Printer {
     });
   }
 
+  // --- M19: the receipt DSL (docs/receipt-dsl.md) -----------------------------------
+  //
+  // No rendering logic lives here. Which blocks a profile can draw, what a missing model
+  // path does, how `meta.cut` reaches a job: all of it is in the core behind
+  // `pd_render_document` and `pd_print_document_json`.
+
+  /// Renders a receipt-DSL document against this printer's capability profile.
+  ///
+  /// **Nothing prints and no job exists.** This is the preview path: the bytes a printer
+  /// would receive, plus every degradation the profile forced, before any paper is
+  /// committed.
+  ///
+  /// [document] and [model] each accept a JSON string or any value `jsonEncode` handles
+  /// — a `Map` straight out of a POS is the common case. [model] is the parameter model
+  /// bound into a template (`{{path.to.value}}`, `each`, `if`); null for a document that
+  /// carries its own content.
+  ///
+  /// Throws [PrinterDriverException] when the JSON is not JSON, the structure is not a
+  /// document, or a template arrived with no model — a receipt full of `{{order.total}}`
+  /// is worse than no receipt, because it looks like one. Everything softer is a
+  /// [ReportEntry] in [RenderedDocument.report] and still renders.
+  RenderedDocument renderDocument(
+    Object document, {
+    Object? model,
+    RenderDocumentOptions options = const RenderDocumentOptions(),
+  }) {
+    _driver._checkAlive();
+    final rendered = Arena.using((arena) {
+      final nativeOptions =
+          arena.allocate<PdRenderOptions>(sizeOf<PdRenderOptions>());
+      options.fillNative(arena, nativeOptions);
+      final out = arena.allocate<PdRenderResult>(sizeOf<PdRenderResult>());
+      final ok = _bindings.renderDocument(
+        _driver._handle,
+        _handle,
+        arena.string(_documentJson(document, 'document')),
+        arena.string(_documentJson(model, 'model')),
+        nativeOptions,
+        out,
+      );
+      if (ok != 1) {
+        // The report is read before the throw: a caller that wants to show what went
+        // wrong gets the same list it would show for a degradation.
+        throw PrinterDriverException(
+            '${_driver.lastError}\n${_driver.renderReport.join('\n')}');
+      }
+      return RenderedDocument(
+        bytes: out.ref.size == 0
+            ? Uint8List(0)
+            : Uint8List.fromList(out.ref.bytes.asTypedList(out.ref.size)),
+        codePage: CodePage.fromNative(out.ref.codePage),
+        meta: DocumentMeta(
+          cut: out.ref.hasCut == 0 ? null : CutSetting.fromNative(out.ref.cut),
+          topFeedDots: out.ref.topFeedDots,
+          bottomFeedDots: out.ref.bottomFeedDots,
+        ),
+        report: _driver.renderReport,
+      );
+    });
+    return rendered;
+  }
+
+  /// Renders a receipt-DSL document and prints it.
+  ///
+  /// The job is an ordinary [PrintJob]: same worker, same preflight, same completion
+  /// fence, same confidence grading, same idempotency-key dedupe as [print]. There is no
+  /// second engine — a template job proves exactly what a raster job proves.
+  ///
+  /// The document's `meta` reaches the job through [options]: a default [JobOptions] lets
+  /// the document decide its own cut and margins, and any field set explicitly wins over
+  /// it. What the renderer declared is on the returned job, as [PrintJob.renderReport].
+  ///
+  /// Throws [PrinterDriverException] when there are no bytes to send, and submits
+  /// nothing in that case: a malformed document never becomes a blank receipt.
+  PrintJob printDocument(
+    Object document, {
+    Object? model,
+    JobOptions options = const JobOptions(),
+  }) {
+    _driver._checkAlive();
+    final handle = Arena.using((arena) {
+      final nativeOptions =
+          arena.allocate<PdJobOptions>(sizeOf<PdJobOptions>());
+      options.fillNative(arena, nativeOptions);
+      return _bindings.printDocumentJson(
+        _driver._handle,
+        _handle,
+        arena.string(_documentJson(document, 'document')),
+        arena.string(_documentJson(model, 'model')),
+        nativeOptions,
+        nullptr,
+      );
+    });
+    if (handle == nullptr) {
+      throw PrinterDriverException(
+          '${_driver.lastError}\n${_driver.renderReport.join('\n')}');
+    }
+    final job = _driver._internJob(handle);
+    job._renderReport = _driver.renderReport;
+    return job;
+  }
+
+  /// A JSON string stays as it is; anything else goes through `jsonEncode`, so a `Map`
+  /// from a POS and a stored `.json` template reach the identical parser.
+  static String? _documentJson(Object? value, String what) {
+    if (value == null) return null;
+    if (value is String) return value;
+    try {
+      return jsonEncode(value);
+    } on JsonUnsupportedObjectError catch (error) {
+      throw PrinterDriverException(
+          'the $what is not representable as JSON: $error');
+    }
+  }
+
   /// Blocks until this printer's queue is empty and its active job is terminal.
   void drain() {
     _driver._checkAlive();
@@ -1334,6 +1472,17 @@ final class PrintJob {
     final value = readNativeString(_bindings.jobPrintToken(_handle));
     return value.isEmpty ? null : value;
   }
+
+  /// What the receipt-DSL renderer declared while producing this job's bytes.
+  ///
+  /// Empty for a job submitted through [Printer.print], whose payload tiers have nothing
+  /// to degrade. Non-empty means the ticket printed and something on it is not what the
+  /// document asked for — a barcode this profile cannot draw, a model path that was not
+  /// there — which is worth reading on the SUCCESS path, because a receipt that printed
+  /// with a dropped barcode is a receipt that printed.
+  List<ReportEntry> get renderReport => _renderReport;
+
+  List<ReportEntry> _renderReport = const <ReportEntry>[];
 
   /// The identifier the job's cut fence carried. Same rules as [printToken]; it
   /// resolves through [PrinterDriver.jobByToken] too.

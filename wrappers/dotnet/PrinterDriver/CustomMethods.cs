@@ -269,9 +269,12 @@ public sealed partial class PrinterDriver
 
     /// <summary>Registers a renderer for a new DSL block kind (docs/api.md §16).</summary>
     /// <remarks>
-    /// The core stores this and the receipt-DSL render path calls it — but that path has no
-    /// entry point in <c>pd.h</c> yet, so a registration made from .NET is not reached by
-    /// <see cref="Printer.Print(Payload, JobOptions?)"/> today. See docs/api.md §17.1.
+    /// The handler always owns its kind: an unknown block kind otherwise fails the parse,
+    /// and this intercepts first. Reached through
+    /// <see cref="Printer.RenderDocument(string, string?, RenderOptions?)"/> and
+    /// <see cref="Printer.PrintDocument(string, string?, JobOptions?)"/> — the receipt-DSL
+    /// entry points — not through <see cref="Printer.Print(Payload, JobOptions?)"/>, whose
+    /// payload tiers have no block kinds.
     /// </remarks>
     /// <param name="handler">The handler.</param>
     /// <exception cref="PrinterDriverException">A bad or duplicate kind.</exception>
@@ -304,8 +307,10 @@ public sealed partial class PrinterDriver
 
     /// <summary>Registers a template formatter (docs/api.md §16).</summary>
     /// <remarks>
-    /// Same reachability caveat as <see cref="RegisterBlockHandler(BlockHandler)"/>: the
-    /// template layer is not in <c>pd.h</c> yet (docs/api.md §17.1).
+    /// Consulted wherever a template is bound:
+    /// <see cref="Printer.RenderDocument(string, string?, RenderOptions?)"/>,
+    /// <see cref="Printer.PrintDocument(string, string?, JobOptions?)"/> and this driver's
+    /// self-test tickets.
     /// </remarks>
     /// <param name="formatter">The formatter. Checked before the built-in table.</param>
     /// <exception cref="PrinterDriverException">A bad or duplicate name.</exception>

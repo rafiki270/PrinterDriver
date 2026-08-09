@@ -11,6 +11,10 @@
 #include "pd_internal.hpp"
 #include "printerdriver/capability_profile.hpp"
 #include "printerdriver/device_profiles.hpp"
+// M19 — the receipt DSL through this ABI (docs/receipt-dsl.md). parse → bind → render
+// lives in the DSL library, shared with pdctl's --template path, so the CLI and every
+// wrapper render a document identically.
+#include "printerdriver/dsl/pipeline.hpp"
 #include "printerdriver/escpos_encoder.hpp"
 // M16 — the five per-driver registries the pd_register_* functions below feed.
 #include "printerdriver/registrations.hpp"
@@ -1480,6 +1484,45 @@ static_assert(PD_MATCH_MATCHED == value_of(pd::CustomMatchKind::Matched));
 static_assert(PD_MATCH_NOT_MINE == value_of(pd::CustomMatchKind::NotMine));
 static_assert(PD_MATCH_NEED_MORE == value_of(pd::CustomMatchKind::NeedMore));
 
+// M19 — the render report's two enums. pd::dsl has no kAll* arrays (the DSL is a pure
+// function library and never iterates its own report kinds), so the _COUNTs are asserted
+// against the last member instead: adding one to the middle of either C++ enum without
+// regenerating pd.h fails here, and adding one to the end fails the count.
+static_assert(PD_REPORT_MISSING_PATH == value_of(pd::dsl::ReportKind::MissingPath));
+static_assert(PD_REPORT_UNKNOWN_FORMATTER ==
+              value_of(pd::dsl::ReportKind::UnknownFormatter));
+static_assert(PD_REPORT_UNFORMATTABLE_VALUE ==
+              value_of(pd::dsl::ReportKind::UnformattableValue));
+static_assert(PD_REPORT_MALFORMED_TEMPLATE ==
+              value_of(pd::dsl::ReportKind::MalformedTemplate));
+static_assert(PD_REPORT_UNKNOWN_STYLE == value_of(pd::dsl::ReportKind::UnknownStyle));
+static_assert(PD_REPORT_STYLE_CYCLE == value_of(pd::dsl::ReportKind::StyleCycle));
+static_assert(PD_REPORT_UNSUPPORTED_STYLE ==
+              value_of(pd::dsl::ReportKind::UnsupportedStyle));
+static_assert(PD_REPORT_UNSUPPORTED_BLOCK ==
+              value_of(pd::dsl::ReportKind::UnsupportedBlock));
+static_assert(PD_REPORT_MISSING_IMAGE == value_of(pd::dsl::ReportKind::MissingImage));
+static_assert(PD_REPORT_TRUNCATED == value_of(pd::dsl::ReportKind::Truncated));
+static_assert(PD_REPORT_EMPTY_ITERATION == value_of(pd::dsl::ReportKind::EmptyIteration));
+static_assert(PD_REPORT_UNSUPPORTED_TIMEZONE ==
+              value_of(pd::dsl::ReportKind::UnsupportedTimezone));
+static_assert(PD_REPORT_RAW_FRAMING_RISK ==
+              value_of(pd::dsl::ReportKind::RawFramingRisk));
+static_assert(PD_REPORT_NOTE == value_of(pd::dsl::ReportKind::Note));
+static_assert(PD_REPORT_KIND_COUNT == value_of(pd::dsl::ReportKind::Note) + 1);
+
+static_assert(PD_RENDER_PATH_HARDWARE == value_of(pd::dsl::RenderPath::Hardware));
+static_assert(PD_RENDER_PATH_RASTER == value_of(pd::dsl::RenderPath::Raster));
+static_assert(PD_RENDER_PATH_NOT_RENDERED == value_of(pd::dsl::RenderPath::NotRendered));
+static_assert(PD_RENDER_PATH_COUNT == value_of(pd::dsl::RenderPath::NotRendered) + 1);
+
+// pd_render_result reports the document's requested cut as a pd_cut, so the two enums
+// have to agree member for member. They do, and this is where that stays true.
+static_assert(PD_CUT_PROFILE == value_of(pd::dsl::CutRequest::Profile));
+static_assert(PD_CUT_PARTIAL == value_of(pd::dsl::CutRequest::Partial));
+static_assert(PD_CUT_FULL == value_of(pd::dsl::CutRequest::Full));
+static_assert(PD_CUT_NONE == value_of(pd::dsl::CutRequest::None));
+
 namespace {
 
 const char* const kProfileSelectionNames[PD_PROFILE_SELECTION_COUNT] = {
@@ -2075,3 +2118,232 @@ extern "C" const char* pd_match_kind_name(pd_match_kind value) {
 }
 
 // ================================ end M16 ==========================================
+
+// ================================ M19 ==============================================
+// The receipt DSL through this ABI (docs/receipt-dsl.md, docs/api.md §3).
+//
+// Both entry points are the same three lines of work — build the pipeline options from
+// the printer's own capability profile, run pd::dsl::renderDocumentJson, publish the
+// answer into the driver's storage — and pd_print_document_json then submits the bytes
+// through the identical path pd_print takes. There is no second renderer and no second
+// engine: the CLI's `--template`, a wrapper's printDocument and pdctl's preview all walk
+// pd::dsl::renderDocumentJson, which is why they cannot disagree.
+
+namespace {
+
+const char* const kReportKindNames[PD_REPORT_KIND_COUNT] = {
+    "missingPath",   "unknownFormatter",   "unformattableValue", "malformedTemplate",
+    "unknownStyle",  "styleCycle",         "unsupportedStyle",   "unsupportedBlock",
+    "missingImage",  "truncated",          "emptyIteration",     "unsupportedTimezone",
+    "rawFramingRisk", "note"};
+
+const char* const kRenderPathNames[PD_RENDER_PATH_COUNT] = {"hardware", "raster",
+                                                            "notRendered"};
+
+// The pipeline options a document is rendered under: this printer's media, code page and
+// cutter facts, and this driver's registries. Nothing here is a wrapper's decision —
+// which is the point of the profile living in the core.
+pd::dsl::DocumentPipelineOptions pipelineOptions(pd_driver* driver, pd_printer* printer,
+                                                 const pd_render_options* options) {
+  const pd::CapabilityProfile profile = printer->printer->profile();
+  // The printer's CONFIGURED width, not the profile's nominal one: that is what the
+  // engine rasterizes to, and a preview laid out against a different number would
+  // eventually disagree with the paper. An explicit width_dots overrides it, which is
+  // what a designer previewing 58 mm output on an 80 mm printer is asking for.
+  const uint32_t width = (options != nullptr && options->width_dots != 0)
+                             ? options->width_dots
+                             : printer->printer->widthDots();
+
+  pd::dsl::DocumentPipelineOptions built;
+  built.render.profile = pd::dsl::RenderProfile::from(profile, width);
+  // The engine sends ESC @ itself and owns the code page for banner text, so the renderer
+  // must not initialise; it does select the code page, because the document's own text is
+  // transliterated against it.
+  built.render.emit_initialize = false;
+  built.render.emit_code_page = true;
+  if (options != nullptr) {
+    built.render.cut_clearance_dots = options->cut_clearance_dots;
+    if (options->max_rows_per_band != 0) {
+      built.render.max_rows_per_band = options->max_rows_per_band;
+    }
+    if (options->locale != nullptr) {
+      built.bind.locale = options->locale;
+    }
+    if (options->currency != nullptr) {
+      built.bind.currency = options->currency;
+    }
+    if (options->tz != nullptr) {
+      built.bind.tz = options->tz;
+    }
+  }
+  // M16: the registries reach the parser, the binder and the renderer in one assignment,
+  // which is what makes pd_register_formatter and pd_register_block_handler fire here.
+  built.registrations = &driver->driver->registrations();
+  return built;
+}
+
+// Publishes an outcome into the driver's single render slot and builds the C view of it.
+// Takes driver->mutex itself, and returns a struct whose pointers are valid until the
+// next call that takes the same slot — the contract pd.h states.
+pd_render_result publishRender(pd_driver* driver,
+                               const pd::dsl::DocumentPipelineOutcome& outcome) {
+  pd_render_result wire{};
+  std::lock_guard<std::mutex> lock(driver->mutex);
+  pd_render_storage& slot = driver->render;
+  slot.bytes.clear();
+  slot.entries.clear();
+
+  if (outcome.ok) {
+    const pd::escpos::Bytes& rendered = outcome.output.bytes();
+    slot.bytes.assign(rendered.begin(), rendered.end());
+  }
+
+  slot.entries.reserve(outcome.report.entries.size());
+  for (const pd::dsl::ReportEntry& entry : outcome.report.entries) {
+    pd_report_storage stored;
+    stored.kind = static_cast<pd_report_kind>(entry.kind);
+    stored.path = static_cast<pd_render_path>(entry.path);
+    // "document" rather than "": an entry that belongs to no block still has to say where
+    // it happened, and every reader would otherwise invent that word for itself.
+    stored.block = entry.block.empty() ? "document" : entry.block;
+    stored.requested = entry.requested;
+    stored.delivered = entry.delivered;
+    stored.note = entry.detail;
+    slot.entries.push_back(std::move(stored));
+  }
+
+  wire.bytes = slot.bytes.empty() ? nullptr : slot.bytes.data();
+  wire.size = slot.bytes.size();
+  wire.code_page = outcome.ok ? static_cast<pd_code_page>(outcome.output.codePage())
+                              : PD_CODE_PAGE_PC437;
+  if (outcome.ok && outcome.output.requested_cut.has_value()) {
+    wire.has_cut = 1;
+    wire.cut = static_cast<pd_cut>(*outcome.output.requested_cut);
+  }
+  if (outcome.ok) {
+    wire.top_feed_dots = outcome.output.requested_margins.top_dots.value_or(0);
+    wire.bottom_feed_dots = outcome.output.requested_margins.bottom_dots.value_or(0);
+  }
+  wire.report_count = slot.entries.size();
+  return wire;
+}
+
+// The shared front half of both entry points: validate, render, publish. Returns false
+// with pd_last_error set and `*out_wire` already filled when there are no bytes.
+bool renderIntoDriver(pd_driver* driver, pd_printer* printer, const char* document_json,
+                      const char* model_json, const pd_render_options* options,
+                      pd::dsl::DocumentPipelineOutcome* out_outcome,
+                      pd_render_result* out_wire) {
+  if (document_json == nullptr) {
+    setError(driver, "a document needs its JSON");
+    *out_wire = pd_render_result{};
+    return false;
+  }
+  const std::string model = model_json != nullptr ? std::string(model_json) : std::string();
+  *out_outcome = pd::dsl::renderDocumentJson(
+      document_json, model_json != nullptr ? &model : nullptr,
+      pipelineOptions(driver, printer, options));
+  *out_wire = publishRender(driver, *out_outcome);
+  if (!out_outcome->ok) {
+    setError(driver, out_outcome->error);
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+extern "C" int32_t pd_render_document(pd_driver* driver, pd_printer* printer,
+                                      const char* document_json, const char* model_json,
+                                      const pd_render_options* options,
+                                      pd_render_result* out_result) {
+  if (!checkHandles(driver, printer)) {
+    return 0;
+  }
+  if (out_result == nullptr) {
+    setError(driver, "pd_render_document needs somewhere to put the result");
+    return 0;
+  }
+  pd::dsl::DocumentPipelineOutcome outcome;
+  if (!renderIntoDriver(driver, printer, document_json, model_json, options, &outcome,
+                        out_result)) {
+    return 0;
+  }
+  return 1;
+}
+
+extern "C" int32_t pd_render_report_at(pd_driver* driver, int32_t index,
+                                       pd_report_entry* out) {
+  if (driver == nullptr || out == nullptr || index < 0) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(driver->mutex);
+  if (static_cast<size_t>(index) >= driver->render.entries.size()) {
+    return 0;
+  }
+  const pd_report_storage& stored = driver->render.entries[static_cast<size_t>(index)];
+  pd_report_entry wire{};
+  wire.kind = stored.kind;
+  wire.block = stored.block.c_str();
+  wire.requested = stored.requested.c_str();
+  wire.delivered = stored.delivered.c_str();
+  wire.path = stored.path;
+  wire.note = stored.note.c_str();
+  *out = wire;
+  return 1;
+}
+
+extern "C" size_t pd_render_report_count(pd_driver* driver) {
+  if (driver == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(driver->mutex);
+  return driver->render.entries.size();
+}
+
+extern "C" pd_job* pd_print_document_json(pd_driver* driver, pd_printer* printer,
+                                          const char* document_json,
+                                          const char* model_json,
+                                          const pd_job_options* job_options,
+                                          pd_render_result* out_result) {
+  if (!checkHandles(driver, printer)) {
+    return nullptr;
+  }
+  pd_render_result rendered{};
+  pd::dsl::DocumentPipelineOutcome outcome;
+  const bool ok = renderIntoDriver(driver, printer, document_json, model_json, nullptr,
+                                   &outcome, &rendered);
+  if (out_result != nullptr) {
+    *out_result = rendered;
+  }
+  if (!ok) {
+    // Nothing is submitted. A document that could not be rendered must never reach the
+    // engine as an empty payload: a blank receipt looks like a printer fault, and an
+    // operator would go looking for one.
+    return nullptr;
+  }
+
+  // docs/receipt-dsl.md: caller > document meta > profile. toOptions() has already turned
+  // whatever the caller said into JobOptions, so applyDocumentMeta only fills the fields
+  // still holding their "the caller said nothing" value.
+  pd::JobOptions options = toOptions(job_options);
+  pd::dsl::applyDocumentMeta(outcome.output, &options);
+
+  std::shared_ptr<pd::PrintJob> job =
+      printer->printer->print(pd::Payload::document(outcome.output.ops), options);
+  if (!job) {
+    setError(driver, "the core did not accept the job");
+    return nullptr;
+  }
+  return pd::capi::internJob(driver, job);
+}
+
+extern "C" const char* pd_report_kind_name(pd_report_kind value) {
+  return nameAt(kReportKindNames, value);
+}
+
+extern "C" const char* pd_render_path_name(pd_render_path value) {
+  return nameAt(kRenderPathNames, value);
+}
+
+// ================================ end M19 ==========================================

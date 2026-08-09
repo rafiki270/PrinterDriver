@@ -1015,52 +1015,32 @@ void printDslReport(const pd::dsl::RenderReport& report) {
   }
 }
 
-// Parses the template and, when a model is supplied, binds it. Returns false and
-// explains itself on stdout when a file is missing or the JSON is not a document;
-// everything softer than that becomes a render-report entry instead.
-bool loadDocument(const std::string& template_path, const std::string& model_path,
-                  pd::dsl::Document* out, pd::dsl::RenderReport* report) {
+// Reads the two files and runs the shared parse → bind → render pipeline
+// (dsl/pipeline.hpp) — the same one pd_render_document and pd_print_document_json walk,
+// so this CLI and every wrapper turn one document into the same bytes.
+//
+// Returns false and explains itself on stdout only for the failures that have no receipt
+// on the other side: a file that cannot be read, JSON that is not JSON, a template with
+// no model. Everything softer is already an entry in the outcome's render report.
+bool loadAndRender(const std::string& template_path, const std::string& model_path,
+                   const pd::dsl::DocumentPipelineOptions& options,
+                   pd::dsl::DocumentPipelineOutcome* out) {
   std::string template_text;
   if (!readFile(template_path, &template_text)) {
     std::cout << "cannot read template: " << template_path << "\n";
     return false;
   }
-  std::vector<std::string> warnings;
-  pd::dsl::Document document;
-  try {
-    document = pd::dsl::parseDocument(template_text, &warnings);
-  } catch (const std::exception& error) {
-    std::cout << "template rejected: " << error.what() << "\n";
-    return false;
-  }
-  for (const std::string& warning : warnings) {
-    report->add(pd::dsl::ReportKind::Note, "template", warning, "ignored",
-                pd::dsl::RenderPath::Hardware);
-  }
-
-  if (model_path.empty()) {
-    if (document.is_template) {
-      std::cout << "this document is a template: --model is required\n";
-      return false;
-    }
-    *out = std::move(document);
-    return true;
-  }
-
   std::string model_text;
-  if (!readFile(model_path, &model_text)) {
+  if (!model_path.empty() && !readFile(model_path, &model_text)) {
     std::cout << "cannot read model: " << model_path << "\n";
     return false;
   }
-  pd::dsl::Json model;
-  std::string error;
-  if (!pd::dsl::tryParseJson(model_text, &model, &error)) {
-    std::cout << "model rejected: " << error << "\n";
+  *out = pd::dsl::renderDocumentJson(
+      template_text, model_path.empty() ? nullptr : &model_text, options);
+  if (!out->ok) {
+    std::cout << out->error << "\n";
     return false;
   }
-  pd::dsl::BindOutcome bound = pd::dsl::bind(document, model);
-  report->append(bound.report);
-  *out = std::move(bound.document);
   return true;
 }
 
@@ -1445,32 +1425,33 @@ void printCutAndMargins(const pd::dsl::RenderOutput& output) {
 
 int runRender(const RenderArgs& args) {
   const pd::CapabilityProfile profile = profileByName(args.profile);
-  pd::dsl::RenderReport report;
-  pd::dsl::Document document;
-  if (!loadDocument(args.template_path, args.model_path, &document, &report)) {
+
+  pd::dsl::DocumentPipelineOptions options;
+  options.render.profile = pd::dsl::RenderProfile::from(profile, args.width);
+  pd::dsl::DocumentPipelineOutcome outcome;
+  if (!loadAndRender(args.template_path, args.model_path, options, &outcome)) {
     return kExitFailed;
   }
-
-  pd::dsl::RenderOptions options;
-  options.profile = pd::dsl::RenderProfile::from(profile, args.width);
-  const pd::dsl::TextPreview preview = pd::dsl::renderText(document, options);
-  const pd::dsl::RenderOutput output = pd::dsl::render(document, options);
-  report.append(preview.report);
+  const pd::dsl::RenderOutput& output = outcome.output;
+  // The preview runs the same layout the bytes came from — a preview with its own layout
+  // would eventually disagree with the paper, which is the one thing it must never do.
+  const pd::dsl::TextPreview preview =
+      pd::dsl::renderText(outcome.document, options.render);
 
   const pd::dsl::ResolvedStyle plain;
-  const uint32_t columns = options.profile.charsPerLine(plain);
+  const uint32_t columns = options.render.profile.charsPerLine(plain);
 
   std::cout << "Receipt render - " << args.template_path << "\n";
   section("Media");
   row("profile", profile.name);
-  row("printable width", std::to_string(options.profile.width_dots) + " dots");
+  row("printable width", std::to_string(options.render.profile.width_dots) + " dots");
   row("characters per line", std::to_string(columns) + " (font A)");
-  row("code page", std::to_string(static_cast<int>(options.profile.code_page)));
+  row("code page", std::to_string(static_cast<int>(options.render.profile.code_page)));
   row("escpos bytes", std::to_string(output.bytes().size()));
   printCutAndMargins(output);
 
   section("Render report");
-  printDslReport(report);
+  printDslReport(outcome.report);
 
   section("Text approximation");
   // A line in font B or at a width multiplier is laid out against its own column count,
@@ -1522,52 +1503,25 @@ int runPrint(const Endpoint& endpoint, const PrintArgs& args) {
 
   pd::Payload payload = pd::Payload::raw({});
   if (!args.template_path.empty()) {
-    pd::dsl::RenderReport report;
-    pd::dsl::Document document;
-    if (!loadDocument(args.template_path, args.model_path, &document, &report)) {
+    pd::dsl::DocumentPipelineOptions render_options;
+    render_options.render.profile = pd::dsl::RenderProfile::from(profile, args.width);
+    pd::dsl::DocumentPipelineOutcome outcome;
+    if (!loadAndRender(args.template_path, args.model_path, render_options, &outcome)) {
       return kExitFailed;
     }
-    pd::dsl::RenderOptions render_options;
-    render_options.profile = pd::dsl::RenderProfile::from(profile, args.width);
-    const pd::dsl::RenderOutput output = pd::dsl::render(document, render_options);
-    report.append(output.report);
 
     section("Render report");
-    printDslReport(report);
+    printDslReport(outcome.report);
     section("Document meta");
-    printCutAndMargins(output);
+    printCutAndMargins(outcome.output);
 
-    // The three-level precedence of docs/receipt-dsl.md, applied by the caller: an
-    // explicit --no-cut wins over the document, and the document wins over the profile.
-    if (args.cut && output.requested_cut.has_value()) {
-      switch (*output.requested_cut) {
-        case pd::dsl::CutRequest::Profile: options.cut = pd::CutSetting::Profile; break;
-        case pd::dsl::CutRequest::Partial: options.cut = pd::CutSetting::Partial; break;
-        case pd::dsl::CutRequest::Full: options.cut = pd::CutSetting::Full; break;
-        case pd::dsl::CutRequest::None: options.cut = pd::CutSetting::None; break;
-      }
-    }
-
-    // The top margin is whitespace the caller feeds before the content, so it belongs
-    // in the payload. The bottom margin is the engine's (it has to survive the
-    // blade-clearance floor), and this build's JobOptions cannot carry it yet.
-    pd::escpos::Bytes bytes;
-    if (output.requested_margins.top_dots.value_or(0) > 0) {
-      pd::escpos::Encoder lead;
-      lead.feedDots(static_cast<uint16_t>(
-          std::min<uint32_t>(*output.requested_margins.top_dots, 0xFFFF)));
-      bytes = lead.take();
-    }
-    const pd::escpos::Bytes& rendered = output.bytes();
-    bytes.insert(bytes.end(), rendered.begin(), rendered.end());
-    payload = pd::Payload::document(std::move(bytes), output.codePage());
-    if (output.requested_margins.bottom_dots.has_value()) {
-      std::cout << "\n  note: the document asks for a "
-                << *output.requested_margins.bottom_dots << " dot bottom margin.\n"
-                << "        Reported, not applied: the trailing feed belongs to the\n"
-                   "        engine, which always feeds at least the blade-clearance\n"
-                   "        distance before a cut.\n";
-    }
+    // The three-level precedence of docs/receipt-dsl.md, applied once in the shared
+    // pipeline: --no-cut has already put CutSetting::None in `options` and is left alone,
+    // and a cut still at Profile — "the caller said nothing" — is filled by the document.
+    // The margins ride on JobOptions, so the engine feeds
+    // max(blade clearance, bottom margin) and no document can clip its own trailer.
+    pd::dsl::applyDocumentMeta(outcome.output, &options);
+    payload = pd::Payload::document(outcome.output.ops);
     std::cout << "\n";
   } else {
     pd::escpos::Encoder receipt;

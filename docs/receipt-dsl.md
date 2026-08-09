@@ -3,6 +3,14 @@
 Design (2026-08-08) for the "any receipt imaginable" description system. Extends
 [api.md](api.md) §3 Tier 2.
 
+**How to reach it (M19).** From C++, `pd::dsl::renderDocumentJson` (`dsl/pipeline.hpp`) is
+parse → bind → render in one call, and `pd::dsl::applyDocumentMeta` folds a document's
+`meta` into `JobOptions` under the precedence below. From every other language it is
+`pd_render_document` / `pd_print_document_json` and their wrapper surfaces
+`printer.renderDocument(...)` / `printer.printDocument(...)` — see [api.md](api.md) §3,
+tier 2b. All three walk the same pipeline, so `pdctl print --template` and an app's
+`printDocument` cannot disagree about what a document means.
+
 ## Core decisions
 
 1. **A receipt is a serializable document, not code.** The canonical form is a plain

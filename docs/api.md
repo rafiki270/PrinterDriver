@@ -94,6 +94,40 @@ Standard receipt semantics only — text, style, alignment, feed, barcode/QR, ra
 inline. Encodes to the conservative ESC/POS subset; code pages (e.g. CP852) handled per
 capability profile.
 
+### Tier 2b — Receipt-DSL documents and templates (normative, M19)
+
+The document tier's richer form: a JSON document or a template with a bound parameter
+model ([receipt-dsl.md](receipt-dsl.md)), rendered against the printer's own capability
+profile.
+
+```
+printer.printDocument(documentJson, model: modelJson, options: …)  -> PrintJob
+printer.renderDocument(documentJson, model: modelJson)             -> { bytes, meta, report }
+```
+
+Two entry points, in the C ABI as `pd_print_document_json` and `pd_render_document`, and
+bound in all four wrappers. Three properties are normative:
+
+1. **`printDocument` is `print`.** The rendered bytes go through the identical engine
+   path: same worker, same preflight, same completion fence, same confidence grading,
+   same idempotency-key dedupe, same `PrintJob`. There is no second engine.
+2. **`renderDocument` prints nothing.** It returns the bytes a printer would receive and
+   the render report, so a caller can inspect the declared degradations before committing
+   paper. No job exists.
+3. **Degradations are declared, refusals are explained.** A missing model path, an unknown
+   formatter, a barcode a profile has no `GS k` for: all of these RENDER, and each becomes
+   a typed render-report entry (`kind`, where, `requested`, `delivered`, `path`, note).
+   Only three things stop bytes being produced — JSON that is not JSON, a structure that
+   is not a document, and a template submitted with no model — and each returns an error
+   **plus** a report entry, submitting nothing. A malformed document never becomes a blank
+   receipt.
+
+The document's `meta` reaches the job under the precedence of
+[receipt-dsl.md](receipt-dsl.md): the caller's `JobOptions` wins, the document's `meta.cut`
+and `meta.margins` fill in what the caller left alone, and the printer's profile answers
+what neither said. The engine's blade-clearance floor is applied on top and is
+unconditional.
+
 ### Tier 3 — Raw bytes (escape hatch)
 
 ```
@@ -460,6 +494,14 @@ their ids), ids are namespaced strings (`"acme.x-idle"`), and anything a registr
 claims (grade, authority) is attributed to it by id in results and `pdctl verify`
 output, so a custom method's claims are auditable like the built-ins.
 
+**Where each one fires.** The completion mechanism, the probe step and the drawer kick are
+driven by the engine every `print` goes through. The block handler and the formatter are
+consulted by the receipt-DSL render path, which since M19 has entry points of its own:
+`pd_render_document` / `pd_print_document_json` (§3, tier 2b) wire this driver's registries
+into the parser, the binder and the renderer, so a formatter registered from any wrapper
+backs `{{ v | name }}` on a template printed from that wrapper. Before M19 those two were
+accepted and stored but reachable only from C++, and §17.1 said so.
+
 **Callbacks and the wrapper that cannot serve them.** Every callback above is invoked on a
 core thread and must answer there and then — a fence before the payload is flushed, a
 matcher before the next chunk arrives. Swift, Kotlin and .NET can do that (a `@convention(c)`
@@ -516,23 +558,25 @@ standing example — but never to be smaller.
 ### 17.1 What the C ABI does not reach yet
 
 Obligation 2 above is now enforced. Obligation 1 — *every core capability is exposed in
-the C ABI* — is not, and the difference is a list rather than a feeling. A reverse audit of
-the public C++ headers against `pd.h` found the following stranded, in rough order of what
-it costs a wrapper. Nothing here is a wrapper's fault and no wrapper can fix it; each item
-is an ABI addition, and adding one means binding it in four wrappers, which is why they are
-written down instead of rushed.
+the C ABI* — is not yet, and the difference is a list rather than a feeling. A reverse
+audit of the public C++ headers against `pd.h` found the following stranded, in rough order
+of what it costs a wrapper. Nothing here is a wrapper's fault and no wrapper can fix it;
+each item is an ABI addition, and adding one means binding it in four wrappers, which is
+why they are written down instead of rushed.
 
-- **The receipt DSL and the template layer** (`dsl/include/**`). `pd.h`'s document tier is a
-  flat `pd_op` array with five kinds; `dsl::render`, `parseDocument`, `bind`,
-  `applyFormatter`, the barcode encoder, the UTF-8 column-width helpers and `dsl::Json` have
-  no `pd_*` entry point. The renderer is reachable from C only from inside `pd_self_test`,
-  which lays out one fixed diagnostic ticket. **This has a consequence for §16**: a wrapper
-  can register a formatter or a block handler, and the core stores it, but the only code
-  that consults those records is the DSL render path — so from a wrapper today they are
-  registrations with no reachable call site. The three that do fire end to end are the
-  completion method, the probe step and the drawer kick. A `pd_render_document` /
-  `pd_bind_template` pair is the missing piece, and until it exists that asymmetry belongs
-  in this document rather than in a surprised integrator's afternoon.
+Items are struck through as they are closed, rather than deleted: a list that only ever
+shrinks silently is a list nobody can audit.
+
+- ~~**The receipt DSL and the template layer**~~ — **closed by M19.** `pd_render_document`
+  and `pd_print_document_json` (§3, tier 2b) parse, bind and render a DSL document against
+  a printer's profile, returning the ESC/POS bytes and a typed render report read back with
+  `pd_render_report_at`; all four wrappers bind both. **The consequence for §16 is closed
+  with it**: the block handler and the formatter now have a reachable call site, so all
+  five registration points fire end to end from every wrapper. What is still C++-only in
+  this layer is narrower and worth naming: `dsl::Json` as a value type, `documentToJson` /
+  `serializeDocument` (a wrapper composes JSON in its own language instead), `bindString`
+  for one-off labels, `renderText`'s character-cell preview, and named `ImageAsset`s for
+  `image` blocks — a document must carry its pixels inline to cross this ABI.
 - **`CapabilityProfile` is opaque in C.** Only flattened facets come back (width,
   completion, provenance, language, the drawer facet, `pd_detection_summary`). The
   Bluetooth capability record is not among them, so an iOS wrapper cannot ask the SDK for a

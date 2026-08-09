@@ -41,6 +41,11 @@ extern "C" {
  *                           PD_DRAWER_FAILED_TO_OPEN.
  *   "drawer-unknown-port" — an unclassified 6P6C socket. Every pulse is refused with
  *                           zero bytes written.
+ *
+ * M19 — docs/receipt-dsl.md "Degradation rules":
+ *   "no-barcode"          — a healthy GS ( H printer whose profile has no GS k path, so a
+ *                           `barcode` block in a DSL document is declared in the render
+ *                           report and omitted instead of printed as literal text.
  * Returns NULL for an unknown id.
  */
 pd_printer* pd_add_printer_scripted(pd_driver* driver, const char* printer_id,
@@ -143,6 +148,21 @@ void pd_test_listener_destroy(pd_test_listener* listener);
  */
 size_t pd_test_acme_fence_bytes(void* ctx, const char* job_token, uint8_t* out, size_t cap);
 pd_match_result pd_test_acme_matcher(void* ctx, const uint8_t* data, size_t size);
+
+/* --- M19: a reference formatter for the receipt-DSL render path ---------------------
+ *
+ * `{{ v | acme.stars }}` -> `***v***`. Exported for the same reason the two symbols above
+ * are: pd_formatter's callback is invoked on the thread that renders the document and has
+ * to answer there and then, which `dart:ffi` cannot do from Dart code, so the Dart
+ * wrapper's registration API takes native function pointers. Without this symbol that
+ * wrapper could bind pd_register_formatter but never watch a registered formatter reach
+ * paper through pd_print_document_json — which is the whole point of M19.
+ *
+ * `ctx` is ignored, so a test may pass NULL.
+ */
+size_t pd_test_stars_formatter(void* ctx, const char* value, const char* args,
+                               const char* locale, char* out, size_t cap,
+                               int32_t* handled);
 
 /* --- Enum bridge ------------------------------------------------------------------ */
 

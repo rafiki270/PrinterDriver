@@ -407,9 +407,12 @@ extension PrinterDriver {
 
   /// Registers a renderer for a new DSL block kind (docs/api.md §16).
   ///
-  /// - Note: The core stores this, and the receipt-DSL render path calls it — but that path
-  ///   has no entry point in `pd.h` yet, so a registration made from Swift is not reached by
-  ///   `print(_:options:)` today. See docs/api.md §17.1.
+  /// The handler always owns its kind: an unknown block kind otherwise fails the parse,
+  /// and this intercepts first.
+  ///
+  /// Reached through ``Printer/renderDocument(_:model:options:)`` and
+  /// ``Printer/printDocument(_:model:options:)`` — the receipt-DSL entry points — not
+  /// through ``Printer/print(_:options:)``, whose payload tiers have no block kinds.
   public func register(blockHandler handler: BlockHandler) throws {
     let trampoline = BlockHandlerTrampoline(handler)
     core.retain(trampoline: trampoline)
@@ -424,8 +427,8 @@ extension PrinterDriver {
   /// Registers a template formatter (docs/api.md §16). Checked before the built-in table,
   /// so a name that shadows a built-in wins for this driver.
   ///
-  /// - Note: Same reachability caveat as ``register(blockHandler:)`` — the template layer
-  ///   is not in `pd.h` yet (docs/api.md §17.1).
+  /// Consulted wherever a template is bound: ``Printer/renderDocument(_:model:options:)``,
+  /// ``Printer/printDocument(_:model:options:)`` and this driver's self-test tickets.
   public func register(formatter: TemplateFormatter) throws {
     let trampoline = FormatterTrampoline(formatter)
     core.retain(trampoline: trampoline)

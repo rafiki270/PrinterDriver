@@ -23,7 +23,19 @@ import kotlinx.coroutines.withContext
  */
 class PrintJob internal constructor(
     private val driver: PrinterDriver,
-    internal val handle: Long
+    internal val handle: Long,
+    /**
+     * What the receipt-DSL renderer declared while producing this job's bytes
+     * (M19, docs/receipt-dsl.md).
+     *
+     * Empty for a job submitted through [Printer.print], whose payload tiers have nothing
+     * to degrade, and for one re-wrapped by [PrinterDriver.findJob] or
+     * [PrinterDriver.jobByToken] -- a report belongs to one submission of one document and
+     * is not journaled. Non-empty means the ticket printed and something on it is not what
+     * the document asked for, which is worth reading on the SUCCESS path: a receipt that
+     * printed with a dropped barcode is a receipt that printed.
+     */
+    val renderReport: List<ReportEntry> = emptyList()
 ) {
     val id: String get() { driver.checkOpen(); return NativeBridge.jobId(handle) }
     val key: String get() { driver.checkOpen(); return NativeBridge.jobKey(handle) }

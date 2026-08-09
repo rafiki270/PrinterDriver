@@ -116,6 +116,15 @@ extern "C" pd_printer* pd_add_printer_scripted(pd_driver* driver, const char* pr
     pdfake::Script script;
     script.answer_vendor_idle = false;
     link.device->setScript(script);
+  } else if (id == "no-barcode") {
+    // M19 (docs/receipt-dsl.md "Degradation rules"). A healthy GS ( H printer whose
+    // firmware has no GS k at all — Star line mode is the real case. A `barcode` block on
+    // this profile is DECLARED as a degradation and omitted, rather than emitted as a
+    // command the firmware prints as literal text across half a receipt. The printer is
+    // otherwise ordinary, so a document that also carries text still prints normally:
+    // that combination is exactly what a render report has to be able to describe.
+    profile = pdfake::fastProfile(pd::CompletionMechanism::GsParenH);
+    profile.render.barcode_gs_k = false;
   } else {
     return nullptr;
   }
@@ -625,4 +634,24 @@ extern "C" pd_match_result pd_test_acme_matcher(void* ctx, const uint8_t* data,
   }
   result.kind = PD_MATCH_NOT_MINE;
   return result;
+}
+
+// M19 (docs/receipt-dsl.md, docs/api.md §16). `{{ v | acme.stars }}` -> `***v***`. Lives
+// here rather than in a wrapper's test for the same reason the two functions above do:
+// the callback runs on the thread rendering the document and must answer there and then,
+// which `dart:ffi` cannot do from Dart code.
+extern "C" size_t pd_test_stars_formatter(void* ctx, const char* value, const char* args,
+                                          const char* locale, char* out, size_t cap,
+                                          int32_t* handled) {
+  (void)ctx;
+  (void)args;
+  (void)locale;
+  const std::string text = std::string("***") + (value != nullptr ? value : "") + "***";
+  if (out == nullptr || handled == nullptr || text.size() + 1 > cap) {
+    // Over cap is the registration's error, never a silent truncation.
+    return cap + 1;
+  }
+  std::memcpy(out, text.c_str(), text.size() + 1);
+  *handled = 1;
+  return text.size();
 }

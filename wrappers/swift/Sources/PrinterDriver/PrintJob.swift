@@ -23,6 +23,7 @@ public final class PrintJob: @unchecked Sendable {
   private let awaiter: JobResultAwaiter
   private let lock = NSLock()
   private var isSubscribed = false
+  private var storedRenderReport: [ReportEntry] = []
 
   /// The core's own job id.
   public let id: String
@@ -48,6 +49,25 @@ public final class PrintJob: @unchecked Sendable {
     trampoline = JobEventTrampoline(hub: hub, delivery: core.delivery)
     awaiter = JobResultAwaiter(core: core, handle: handle)
     core.retain(trampoline: trampoline)
+  }
+
+  /// What the receipt-DSL renderer declared while producing this job's bytes.
+  ///
+  /// Empty for a job submitted through ``Printer/print(_:options:)``, whose payload tiers
+  /// have nothing to degrade. Non-empty means the ticket printed and something on it is
+  /// not what the document asked for — a barcode this profile cannot draw, a model path
+  /// that was not there — which is worth reading on the SUCCESS path, because a receipt
+  /// that printed with a dropped barcode is a receipt that printed.
+  public var renderReport: [ReportEntry] {
+    lock.lock()
+    defer { lock.unlock() }
+    return storedRenderReport
+  }
+
+  func setRenderReport(_ entries: [ReportEntry]) {
+    lock.lock()
+    defer { lock.unlock() }
+    storedRenderReport = entries
   }
 
   /// The receipt verification identifier this attempt printed under — the four

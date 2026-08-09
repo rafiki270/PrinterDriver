@@ -531,4 +531,68 @@ internal object NativeBridge {
      *  result, which pd_job_await answers immediately once a job is terminal. Returns
      *  "" if the job is somehow still running. */
     @JvmStatic external fun jobMethod(driverHandle: Long, jobHandle: Long): String
+
+    // --- M19: the receipt DSL (docs/receipt-dsl.md) ---------------------------------
+    //
+    // Same numbers-and-strings split as the detection block above, and the render report
+    // is read BY INDEX rather than through a callback: a JNI upcall per degradation would
+    // attach a thread to say a barcode was dropped.
+
+    /** pd_render_document. Binds and renders; NOTHING PRINTS. [values] must have room for
+     *  7 ints and receives, in order:
+     *  [ok, codePage, hasCut, cut, topFeedDots, bottomFeedDots, reportCount].
+     *  `ok` is 0 when there are no bytes -- malformed JSON, a structure that is not a
+     *  document, a template with no model -- and the report still explains why; see
+     *  [renderReportAt] and driverLastError. Returns the rendered ESC/POS bytes, empty on
+     *  a refusal. Blocks. */
+    @JvmStatic external fun renderDslDocument(
+        driverHandle: Long,
+        printerHandle: Long,
+        documentJson: String,
+        modelJson: String?,
+        widthDots: Int,
+        cutClearanceDots: Int,
+        maxRowsPerBand: Int,
+        locale: String?,
+        currency: String?,
+        timeZone: String?,
+        values: IntArray
+    ): ByteArray
+
+    /** pd_render_report_count -- entries the last render on this driver declared. */
+    @JvmStatic external fun renderReportCount(driverHandle: Long): Int
+
+    /** pd_render_report_at. [values] must have room for 2 ints and receives [kind, path];
+     *  returns [block, requested, delivered, note]. Empty array when [index] is out of
+     *  range. Read immediately after the render: the ABI owns these strings only until
+     *  the next one on the same driver. */
+    @JvmStatic external fun renderReportAt(
+        driverHandle: Long,
+        index: Int,
+        values: IntArray
+    ): Array<String>
+
+    /** pd_print_document_json -- the same render, submitted through the ordinary engine.
+     *  Returns an ordinary pd_job handle, or 0L when there were no bytes to send (and
+     *  nothing was submitted; a malformed document never becomes a blank receipt). */
+    @JvmStatic external fun printDslDocument(
+        driverHandle: Long,
+        printerHandle: Long,
+        documentJson: String,
+        modelJson: String?,
+        key: String?,
+        cut: Int,
+        openDrawer: Boolean,
+        preflight: Int,
+        timeoutMs: Int,
+        topFeedDots: Int,
+        bottomFeedDots: Int,
+        suppressVerificationId: Boolean
+    ): Long
+
+    /** pd_report_kind_name */
+    @JvmStatic external fun reportKindName(value: Int): String
+
+    /** pd_render_path_name */
+    @JvmStatic external fun renderPathName(value: Int): String
 }

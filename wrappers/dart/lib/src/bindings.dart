@@ -803,6 +803,67 @@ final class PdDiscoveredDevice extends Struct {
   external Pointer<Char> dleEotHex;
 }
 
+// --- M19: the receipt DSL (docs/receipt-dsl.md) --------------------------------------
+
+/// `pd_render_options` — all-zeroes means this printer's own media and the document's
+/// own locale.
+final class PdRenderOptions extends Struct {
+  @Uint32()
+  external int widthDots;
+
+  @Uint16()
+  external int cutClearanceDots;
+
+  @Uint32()
+  external int maxRowsPerBand;
+
+  external Pointer<Char> locale;
+  external Pointer<Char> currency;
+  external Pointer<Char> tz;
+}
+
+/// `pd_render_result` — the bytes, the code page, and what the document's `meta` asks
+/// the engine for.
+final class PdRenderResult extends Struct {
+  external Pointer<Uint8> bytes;
+
+  @Size()
+  external int size;
+
+  @Int32()
+  external int codePage;
+
+  @Int32()
+  external int hasCut;
+
+  @Int32()
+  external int cut;
+
+  @Uint32()
+  external int topFeedDots;
+
+  @Uint32()
+  external int bottomFeedDots;
+
+  @Size()
+  external int reportCount;
+}
+
+/// `pd_report_entry` — one declared degradation, read back by index.
+final class PdReportEntry extends Struct {
+  @Int32()
+  external int kind;
+
+  external Pointer<Char> block;
+  external Pointer<Char> requested;
+  external Pointer<Char> delivered;
+
+  @Int32()
+  external int path;
+
+  external Pointer<Char> note;
+}
+
 /// `pd_test_enum` — the enum-bridge ids of `pd_test_support.h`.
 enum PdTestEnum {
   jobState(0),
@@ -1336,6 +1397,64 @@ final class PrinterDriverBindings {
   late final Pointer<Char> Function(int) drainOrderName =
       _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
     'pd_drain_order_name',
+  );
+
+  // --- M19: the receipt DSL through the ABI (docs/receipt-dsl.md) -------------------
+  //
+  // The report comes back through an INDEX READER rather than a callback, which is the
+  // shape this wrapper needs and the reason pd_detected_at exists too: an isolate blocked
+  // inside an FFI call cannot service a native callback until that call returns.
+
+  /// `pd_render_document` — bind + render, and nothing prints.
+  late final int Function(Pointer<PdDriver>, Pointer<PdPrinter>, Pointer<Char>,
+          Pointer<Char>, Pointer<PdRenderOptions>, Pointer<PdRenderResult>)
+      renderDocument = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdPrinter>, Pointer<Char>,
+              Pointer<Char>, Pointer<PdRenderOptions>, Pointer<PdRenderResult>),
+          int Function(
+              Pointer<PdDriver>,
+              Pointer<PdPrinter>,
+              Pointer<Char>,
+              Pointer<Char>,
+              Pointer<PdRenderOptions>,
+              Pointer<PdRenderResult>)>('pd_render_document');
+
+  /// `pd_render_report_at`
+  late final int Function(Pointer<PdDriver>, int, Pointer<PdReportEntry>)
+      renderReportAt = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Int32, Pointer<PdReportEntry>),
+          int Function(Pointer<PdDriver>, int,
+              Pointer<PdReportEntry>)>('pd_render_report_at');
+
+  /// `pd_render_report_count`
+  late final int Function(Pointer<PdDriver>) renderReportCount =
+      _library.lookupFunction<Size Function(Pointer<PdDriver>),
+          int Function(Pointer<PdDriver>)>('pd_render_report_count');
+
+  /// `pd_print_document_json` — the same render, submitted through the ordinary engine.
+  late final Pointer<PdJob> Function(Pointer<PdDriver>, Pointer<PdPrinter>,
+          Pointer<Char>, Pointer<Char>, Pointer<PdJobOptions>, Pointer<PdRenderResult>)
+      printDocumentJson = _library.lookupFunction<
+          Pointer<PdJob> Function(Pointer<PdDriver>, Pointer<PdPrinter>, Pointer<Char>,
+              Pointer<Char>, Pointer<PdJobOptions>, Pointer<PdRenderResult>),
+          Pointer<PdJob> Function(
+              Pointer<PdDriver>,
+              Pointer<PdPrinter>,
+              Pointer<Char>,
+              Pointer<Char>,
+              Pointer<PdJobOptions>,
+              Pointer<PdRenderResult>)>('pd_print_document_json');
+
+  /// `pd_report_kind_name`
+  late final Pointer<Char> Function(int) reportKindName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_report_kind_name',
+  );
+
+  /// `pd_render_path_name`
+  late final Pointer<Char> Function(int) renderPathName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_render_path_name',
   );
 
   /// Whether this library carries `capi/tests/pd_test_support.h`, i.e. whether it was

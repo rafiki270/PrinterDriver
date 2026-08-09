@@ -33,6 +33,12 @@ enum ScriptedDevice: String {
   case drawerLocked = "drawer-locked"
   /// An unclassified 6P6C socket. Every pulse is refused with zero bytes written.
   case drawerUnknownPort = "drawer-unknown-port"
+
+  // M19 — docs/receipt-dsl.md "Degradation rules".
+
+  /// A healthy `GS ( H` printer whose profile has no `GS k` path, so a `barcode` block is
+  /// declared in the render report and omitted rather than printed as literal text.
+  case noBarcode = "no-barcode"
 }
 
 extension PrinterDriver {

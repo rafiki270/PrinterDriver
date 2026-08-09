@@ -42,6 +42,12 @@ void main() {
       expect(sizeOf<PdReprintOptions>(), 48);
       // Three function pointers and the description.
       expect(sizeOf<PdTransportVtable>(), 32);
+      // M19 — docs/receipt-dsl.md. uint32, uint16 (+2 pad), uint32 (+4 pad), 3 pointers.
+      expect(sizeOf<PdRenderOptions>(), 40);
+      // pointer, size_t, 3 int32, 2 uint32 (+4 pad), size_t.
+      expect(sizeOf<PdRenderResult>(), 48);
+      // int32 (+4 pad), 3 pointers, int32 (+4 pad), pointer.
+      expect(sizeOf<PdReportEntry>(), 48);
     });
 
     test('the payload union is one storage area shared by the three tiers', () {
