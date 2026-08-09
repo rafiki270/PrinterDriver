@@ -459,3 +459,25 @@ Rules: registrations are process-local (never persisted into shared journals bey
 their ids), ids are namespaced strings (`"acme.x-idle"`), and anything a registration
 claims (grade, authority) is attributed to it by id in results and `pdctl verify`
 output, so a custom method's claims are auditable like the built-ins.
+
+## 17. Wrapper parity contract
+
+**Every capability of the C++ core is available in every wrapper, through an idiomatic
+interface.** No wrapper is a subset. The chain is: C++ core → C ABI (`pd.h`) → each
+wrapper (Swift, Dart, .NET, Kotlin). Two obligations:
+
+1. **Every core capability is exposed in the C ABI.** A feature that only exists as a
+   C++ method, unreachable through `pd.h`, is incomplete — the wrappers bind `pd.h`, not
+   the C++ headers.
+2. **Every public `pd.h` function is bound in every wrapper**, presented naturally for
+   the language (async streams for subscriptions, sealed types for the tri-state result,
+   `Flow`/`AsyncStream`/`Stream`/`IAsyncEnumerable` for event and discovery feeds — not a
+   raw 1:1 translation of C signatures).
+
+Enforced, not trusted: a parity check (`scripts/check_parity.sh`) enumerates the public
+`pd_*` functions in `pd.h` and asserts each wrapper references every one, mirroring how
+the enum-bridge tests already enforce enum parity. A `pd_` function added to the ABI
+without a binding in all four wrappers fails the check. Idiomatic wrappers may satisfy a
+function through a property or a higher-level method; those cases are listed explicitly
+in the check's allowlist with the member that covers them, so the mapping stays visible
+rather than silently absent.
