@@ -64,6 +64,11 @@ add_library(printerdriver_core STATIC
   core/src/job_store.cpp
   core/src/discovery.cpp
   core/src/driver.cpp
+  # M16 — custom method registration (docs/api.md §16): the five per-driver registries
+  # (completion, probe step, drawer kick, formatter, block handler) and their id/validation
+  # rules. Consumed by the engine (driver.cpp), the probe (capability_probe.cpp) and the
+  # DSL (format/render), so it sits in the core every layer already links.
+  core/src/registrations.cpp
   # M15 — auto-detection (docs/api.md §15): discovery + identify + the printless probe
   # subset, composed, plus the report structure the self-test shares with it. Nothing
   # here prints and nothing here fires.

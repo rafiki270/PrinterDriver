@@ -23,9 +23,10 @@
 #     A. a Winsock SOCKET narrowed into an int -- the canonical Windows port bug, and
 #        the exact thing win32_stub.h's UINT_PTR typedef exists to catch;
 #     B. FlushFileBuffers called on a std::string instead of a file handle;
-#     C. the whole check run WITHOUT -DPD_FORCE_WINDOWS_PLATFORM, which must fail
-#        because the POSIX branch of transport.hpp declares different members --
-#        i.e. proof that the selector macro really is selecting something.
+#     C. pd::net::Socket initialised from a 64-bit handle WITHOUT
+#        -DPD_FORCE_WINDOWS_PLATFORM, which must fail because the POSIX branch of
+#        net_platform.hpp makes Socket a plain `int` -- the mirror image of control A,
+#        so the two bracket the selector from both sides and prove it really selects.
 #
 # Usage: scripts/check_windows_syntax.sh   (from anywhere; paths are resolved from the
 # repository root, which is this script's parent directory.)
@@ -136,13 +137,33 @@ expect_rejection "control B (FlushFileBuffers on a std::string)" \
   "${control_b}" "${flags[@]}" -DPD_FORCE_WINDOWS_PLATFORM
 
 # --- C. the selector macro actually selects -------------------------------------------
-# Compiled as an ordinary POSIX translation unit: no stub, no PD_FORCE_WINDOWS_PLATFORM.
-# transport.hpp then declares fd_/wake_read_fd_/wake_write_fd_ instead of the Winsock
-# members, so this file cannot compile -- which is the proof that every "ok" above was
-# checking the Windows branch and not the POSIX one.
-expect_rejection "control C (no PD_FORCE_WINDOWS_PLATFORM: POSIX members, Windows code)" \
-  "use of undeclared identifier 'socket_'" \
-  "${root}/core/src/transport_win.cpp" \
+# The original control here compiled core/src/transport_win.cpp as an ordinary POSIX
+# translation unit and expected an undeclared `socket_`. But that whole file is wrapped in
+# a platform guard, so as POSIX it preprocesses to an EMPTY translation unit that compiles
+# cleanly -- the control could never go red, and "compiled" was scored as a failure that
+# proved nothing. A single platform macro cannot make the Windows *body* visible while
+# leaving the *members* POSIX, because both derive from that one macro, so the old premise
+# was unreachable by construction.
+#
+# Assert the selector directly instead, and symmetrically with control A. Compiled as
+# POSIX (no stub, no PD_FORCE_WINDOWS_PLATFORM), pd::net::Socket is a plain `int`, so
+# initialising one from a 64-bit handle is a narrowing conversion and ill-formed. Under
+# the Windows selector Socket is the pointer-width Winsock handle and the same line
+# compiles -- exactly the inverse of control A's SOCKET-narrowed-to-int, so the pair
+# brackets the selector from both directions and each half fails only in its own config.
+control_c="${temp_dir}/negative_selector.cpp"
+{
+  echo '#include "printerdriver/net_platform.hpp"'
+  echo 'namespace pd_negative_control {'
+  echo 'inline pd::net::Socket fromWideHandle(unsigned long long handle) {'
+  echo '  pd::net::Socket socket{handle};  // 64-bit -> int narrowing: ill-formed under POSIX'
+  echo '  return socket;'
+  echo '}'
+  echo '}'
+} > "${control_c}"
+expect_rejection "control C (no PD_FORCE_WINDOWS_PLATFORM: POSIX Socket is int, not the handle)" \
+  "cannot be narrowed from type 'unsigned long long' to 'pd::net::Socket'" \
+  "${control_c}" \
   -std=c++17 -fsyntax-only -I "${root}/core/include" -I "${root}/core/src"
 
 echo

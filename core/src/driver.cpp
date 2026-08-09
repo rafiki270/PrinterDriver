@@ -449,13 +449,15 @@ class PrinterRuntime {
                  std::shared_ptr<MarkerAllocator> markers,
                  std::shared_ptr<DriverEventHub> hub, std::shared_ptr<JobIndex> index,
                  std::shared_ptr<FindingsStore> capabilities,
-                 std::shared_ptr<DrawerPolarityStore> drawer_polarities)
+                 std::shared_ptr<DrawerPolarityStore> drawer_polarities,
+                 std::shared_ptr<Registrations> registrations)
       : config_(std::move(config)),
         store_(std::move(store)),
         markers_(std::move(markers)),
         hub_(std::move(hub)),
         index_(std::move(index)),
         capabilities_(std::move(capabilities)),
+        registrations_(std::move(registrations)),
         drawer_polarities_(std::move(drawer_polarities)) {}
 
   ~PrinterRuntime() { stop(); }
@@ -568,6 +570,9 @@ class PrinterRuntime {
   // Sends GS r 2 and waits for the queued answer. Runs on the worker thread only.
   std::optional<bool> pollDrawerPin(const CapabilityProfile& profile,
                                     std::chrono::milliseconds timeout);
+  // M16. The registered vendor kick for this profile, when its kick method is Vendor and
+  // its vendor_id is registered on this driver; empty otherwise (docs/api.md §16).
+  std::optional<DrawerKickReg> vendorDrawerKick(const CapabilityProfile& profile) const;
   // The whole opening sequence, on the worker thread.
   DrawerOpenResult runDrawerSequence(const CapabilityProfile& profile,
                                      const DrawerRequest& request);
@@ -595,9 +600,16 @@ class PrinterRuntime {
   // resolvable before a byte carrying them can leave. Returns an empty lease when the
   // profile has no GS ( H fence, and therefore no wire token to promote.
   std::unique_ptr<MarkerLease> leaseTokens(const std::shared_ptr<PrintJob>& job,
-                                           const CapabilityProfile& profile);
+                                           const CapabilityProfile& profile,
+                                           bool custom_completion);
 
   void beginJobIo();
+  // M16. Binds the active job to its registered completion method and arms the matcher
+  // for the next fence; awaitCustomToken waits for that fence's echoed token, disarming
+  // afterwards so a late answer cannot be handed to the next job (the GS ( H lease rule).
+  void setCustomMethod(const std::optional<CompletionMethod>& method);
+  void armCustomFence();
+  WaitOutcome awaitCustomToken(const std::string& token, std::chrono::milliseconds timeout);
   WaitOutcome awaitToken(const std::string& token, std::chrono::milliseconds timeout);
   // `out_byte`, when non-null, receives the raw answer byte the expectation consumed.
   // The fence path ignores it — a GS r 1 answer is a completion signal and nothing
@@ -638,6 +650,7 @@ class PrinterRuntime {
   std::shared_ptr<JobIndex> index_;
   std::shared_ptr<FindingsStore> capabilities_;
   std::shared_ptr<CapabilityProbe> probe_;
+  std::shared_ptr<Registrations> registrations_;  // M16; shared with the owning driver
   mutable std::mutex probe_mutex_;
   // M14. Shared with the driver; the polarity is per printer id.
   std::shared_ptr<DrawerPolarityStore> drawer_polarities_;
@@ -686,6 +699,19 @@ class PrinterRuntime {
   // start of a session, because "we have never looked" and "it is zero" are different.
   std::optional<uint8_t> star_counter_;
   uint16_t star_sequence_ = 0;
+
+  // --- M16: custom completion fence state, all under io_mutex_ (docs/api.md §16) -----
+  //
+  // A registered completion method (CompletionMechanism::VendorIdle + a registered id)
+  // drives completion through its own matcher rather than the GS ( H / GS r parser. The
+  // built-in parser_ ABOVE still runs on every byte in this mode, so ASB/DLE EOT status,
+  // the queued/realtime expectations and ForeignWriterDetected keep working exactly as
+  // they do for a GS ( H profile; the matcher is fed the same raw bytes ALONGSIDE it and
+  // owns nothing but completion. See onBytes() and runJob().
+  std::optional<CompletionMethod> custom_method_;  // the method the active job is fenced by
+  bool custom_fence_outstanding_ = false;          // a fence is out; feed the matcher
+  std::vector<uint8_t> custom_rx_;                 // bytes accumulated for the matcher
+  std::vector<std::string> custom_tokens_;         // tokens the matcher has confirmed
 
   mutable std::mutex status_mutex_;
   DeviceStatus status_;
@@ -859,6 +885,10 @@ void PrinterRuntime::runProbe(std::optional<bool> print_test_lines) {
   if (print_test_lines.has_value()) {
     options.print_test_lines = *print_test_lines;
   }
+  // M16. Registered probe steps extend this printer's fingerprint (docs/api.md §16).
+  if (registrations_) {
+    options.custom_steps = registrations_->probeSteps();
+  }
   auto probe = std::make_shared<CapabilityProbe>(options);
   {
     std::lock_guard<std::mutex> lock(probe_mutex_);
@@ -980,6 +1010,37 @@ void PrinterRuntime::onBytes(const uint8_t* data, size_t size) {
             break;
         }
       }
+      // --- M16: the custom completion matcher, fed ALONGSIDE the built-in parser -------
+      //
+      // The parser_ loop above has already classified these same bytes for status,
+      // ForeignWriterDetected and any armed GS ( H / queued / realtime expectation, so
+      // none of those paths is weakened. Here the raw bytes are additionally handed to the
+      // registered matcher, which owns nothing but completion. It is consulted only while
+      // a custom fence is outstanding. Contract: the matcher must not block or re-enter
+      // any pd_* on this driver, the same rule every transport callback runs under, which
+      // is why calling it here under io_mutex_ is safe.
+      if (custom_fence_outstanding_ && custom_method_) {
+        custom_rx_.insert(custom_rx_.end(), data, data + size);
+        const CustomMatch match =
+            custom_method_->matcher(custom_rx_.data(), custom_rx_.size());
+        switch (match.kind) {
+          case CustomMatchKind::Matched:
+            // A token this driver never issued is a second writer on this printer's custom
+            // scheme, reported and dropped exactly like a foreign GS ( H echo (§14).
+            if (markers_ && !markers_->isOurs(match.token)) {
+              events.push_back(DeviceEvent::ForeignWriterDetected);
+            } else {
+              custom_tokens_.push_back(match.token);
+            }
+            custom_rx_.clear();
+            break;
+          case CustomMatchKind::NotMine:
+            custom_rx_.clear();
+            break;
+          case CustomMatchKind::NeedMore:
+            break;
+        }
+      }
     }
   }
   io_cv_.notify_all();
@@ -1056,6 +1117,11 @@ void PrinterRuntime::beginJobIo() {
   star_mode_ = false;
   star_fence_outstanding_ = false;
   star_fence_signalled_ = false;
+  // M16. The custom-completion state is per job, like the GS ( H token buffers above.
+  custom_method_.reset();
+  custom_fence_outstanding_ = false;
+  custom_rx_.clear();
+  custom_tokens_.clear();
 }
 
 void PrinterRuntime::clearRealtime() {
@@ -1066,6 +1132,49 @@ void PrinterRuntime::clearRealtime() {
     // are dropped once the phase that asked for them is over.
     parser_.reset();
   }
+}
+
+// --- M16: custom completion fences (docs/api.md §16) --------------------------------
+
+void PrinterRuntime::setCustomMethod(const std::optional<CompletionMethod>& method) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
+  custom_method_ = method;
+  custom_fence_outstanding_ = false;
+  custom_rx_.clear();
+  custom_tokens_.clear();
+}
+
+void PrinterRuntime::armCustomFence() {
+  std::lock_guard<std::mutex> lock(io_mutex_);
+  // Armed before the fence bytes leave, for the same reason the Star fence is: the answer
+  // can arrive inside the very write that asks for it. The receive buffer is cleared so a
+  // previous fence's trailing bytes cannot be read as this one's answer.
+  custom_fence_outstanding_ = true;
+  custom_rx_.clear();
+}
+
+WaitOutcome PrinterRuntime::awaitCustomToken(const std::string& token,
+                                             std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(io_mutex_);
+  io_cv_.wait_for(lock, timeout, [this, &token] {
+    return stopping_.load() || link_down_ ||
+           std::find(custom_tokens_.begin(), custom_tokens_.end(), token) !=
+               custom_tokens_.end();
+  });
+  // Disarm either way: a late answer to a fence whose job has given up must not be handed
+  // to the next job, the same rule the GS ( H marker lease and the Star fence enforce.
+  custom_fence_outstanding_ = false;
+  if (std::find(custom_tokens_.begin(), custom_tokens_.end(), token) !=
+      custom_tokens_.end()) {
+    return WaitOutcome::Signalled;
+  }
+  if (link_down_) {
+    return WaitOutcome::LinkDown;
+  }
+  if (stopping_.load()) {
+    return WaitOutcome::Aborted;
+  }
+  return WaitOutcome::Timeout;
 }
 
 WaitOutcome PrinterRuntime::awaitToken(const std::string& token,
@@ -1350,8 +1459,14 @@ TransportResult PrinterRuntime::sendPaced(const CapabilityProfile& profile,
 }
 
 std::unique_ptr<MarkerLease> PrinterRuntime::leaseTokens(
-    const std::shared_ptr<PrintJob>& job, const CapabilityProfile& profile) {
-  if (!markers_ || profile.completion != CompletionMechanism::GsParenH) {
+    const std::shared_ptr<PrintJob>& job, const CapabilityProfile& profile,
+    bool custom_completion) {
+  // M16. A registered custom completion echoes a per-job token exactly like GS ( H, so it
+  // gets the same leased, journalled, resolvable RVI — jobByToken and `pdctl verify`
+  // resolve a custom-fenced receipt the same way. Every other mechanism has no wire token
+  // to promote and leases nothing.
+  if (!markers_ ||
+      (profile.completion != CompletionMechanism::GsParenH && !custom_completion)) {
     return nullptr;
   }
   auto lease = std::unique_ptr<MarkerLease>(new MarkerLease(markers_, markers_->acquire()));
@@ -1393,7 +1508,24 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   const JobEvidence status_evidence{ConfidenceGrade::C_DeviceStatusAround,
                                     CompletionAuthority::PhysicalPrinter, "DLE EOT"};
 
-  if (!profile.drivableByEscposEngine()) {
+  // M16 (docs/api.md §16). A VendorIdle profile bound to a registered completion method is
+  // driven on THIS engine's ESC/POS path — same preflight, same payload framing, same
+  // pacing — with only the fence and the confirmation swapped for the registered
+  // fence_bytes/matcher. The registered grade/authority/method ride the result, attributed
+  // by id. A VendorIdle profile with no matching registration stays undrivable and is
+  // refused Unsupported below, which is the honest answer: nothing can confirm the job.
+  std::optional<CompletionMethod> custom;
+  if (profile.completion == CompletionMechanism::VendorIdle && registrations_ &&
+      !profile.completion_vendor_id.empty()) {
+    custom = registrations_->completionMethod(profile.completion_vendor_id);
+  }
+  // What a confirmed Done on this job actually claims: the registered method's grade for a
+  // custom fence, the profile's own evidence otherwise.
+  const JobEvidence success_evidence =
+      custom ? JobEvidence{custom->grade, custom->authority, custom->method_name.c_str()}
+             : profile.evidence();
+
+  if (!profile.drivableByEscposEngine() && !custom) {
     // M13b: Star Line Mode / StarPRNT fenced by ETB or ESC GS ETX is now a real path, so
     // it is dispatched rather than refused (docs/wire-protocols.md §2). Everything else —
     // the StarPRNT SDK's checked block, the ePOS JobID, ZPL, CPCL, Brother raster — is
@@ -1417,6 +1549,10 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     return;
   }
   beginJobIo();
+  // M16. Bind the backchannel to the registered method for the rest of this job, after
+  // beginJobIo has cleared the per-job IO state. No-op (clears the binding) when custom is
+  // empty, so a plain GS ( H / GS r job is unaffected.
+  setCustomMethod(custom);
 
   // --- Preflight (docs/techspec.md §5.2 steps 3-4) --------------------------------
   if (options.preflight == PreflightMode::Strict && profile.status.dle_eot) {
@@ -1487,7 +1623,7 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
 
   // Held for the rest of the job: a token stays outstanding until the receipt it
   // fences is finished, so no later job can be handed an echo meant for this one.
-  const std::unique_ptr<MarkerLease> lease = leaseTokens(job, profile);
+  const std::unique_ptr<MarkerLease> lease = leaseTokens(job, profile, custom.has_value());
   const std::string print_token = lease ? lease->pair.print_token : std::string();
   const std::string cut_token = lease ? lease->pair.cut_token : std::string();
 
@@ -1516,30 +1652,39 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   const CutVariant cut = effectiveCut(options.cut, profile);
 
   escpos::Bytes fence;
-  switch (profile.completion) {
-    case CompletionMechanism::GsParenH:
-      fence = escpos::processIdMarker(print_token);
-      break;
-    case CompletionMechanism::GsR1: {
-      std::lock_guard<std::mutex> lock(io_mutex_);
-      parser_.expectQueued();
-      fence = escpos::gsPaperStatus();
-      break;
-    }
-    case CompletionMechanism::VendorIdle:
-    case CompletionMechanism::EposJobId:
-    case CompletionMechanism::StarCheckedBlock:
-    // M13b: unreachable on this path — a Star profile is dispatched to runStarJob above.
-    case CompletionMechanism::StarEtb:
-    case CompletionMechanism::StarEscGsEtx:
-    case CompletionMechanism::None:
-      // Nothing will ever be waited for, so the cut goes out with the payload rather
-      // than after an acknowledgement that is never coming. The non-ESC/POS
-      // mechanisms never reach here: the job was refused as Unsupported above.
-      if (cut != CutVariant::None) {
-        fence = buildCut(profile, options, cut, print_token);
+  if (custom) {
+    // M16. The registered fence rides behind the payload exactly where GS ( H's process-ID
+    // marker does; arm the matcher first, because the answer can arrive inside this very
+    // write. The cut is NOT sent here — like GS ( H, it follows print confirmation.
+    armCustomFence();
+    fence = custom->fence_bytes(print_token);
+  } else {
+    switch (profile.completion) {
+      case CompletionMechanism::GsParenH:
+        fence = escpos::processIdMarker(print_token);
+        break;
+      case CompletionMechanism::GsR1: {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        parser_.expectQueued();
+        fence = escpos::gsPaperStatus();
+        break;
       }
-      break;
+      case CompletionMechanism::VendorIdle:
+      case CompletionMechanism::EposJobId:
+      case CompletionMechanism::StarCheckedBlock:
+      // M13b: unreachable on this path — a Star profile is dispatched to runStarJob above.
+      case CompletionMechanism::StarEtb:
+      case CompletionMechanism::StarEscGsEtx:
+      case CompletionMechanism::None:
+        // Nothing will ever be waited for, so the cut goes out with the payload rather
+        // than after an acknowledgement that is never coming. VendorIdle reaches here only
+        // when no completion method is registered for it (custom is empty); the other
+        // non-ESC/POS mechanisms never reach here — the job was refused Unsupported above.
+        if (cut != CutVariant::None) {
+          fence = buildCut(profile, options, cut, print_token);
+        }
+        break;
+    }
   }
   if (!fence.empty()) {
     const TransportResult fence_sent = sendPaced(profile, fence);
@@ -1562,8 +1707,10 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   }
 
   const WaitOutcome print_ack =
-      profile.completion == CompletionMechanism::GsParenH ? awaitToken(print_token, timeout)
-                                                          : awaitQueued(timeout);
+      custom ? awaitCustomToken(print_token, timeout)
+             : (profile.completion == CompletionMechanism::GsParenH
+                    ? awaitToken(print_token, timeout)
+                    : awaitQueued(timeout));
   if (print_ack != WaitOutcome::Signalled) {
     // Bytes were sent. A timeout here is exactly the case the legacy 5 s DLE EOT
     // check gets wrong (docs/api.md §4): the receipt may well be printing.
@@ -1580,16 +1727,22 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
 
   if (cut == CutVariant::None) {
     terminate(job, JobState::DoneSoftware,
-              JobResult::done(reached()).with(profile.evidence()));
+              JobResult::done(reached()).with(success_evidence));
     return;
   }
 
-  if (profile.completion == CompletionMechanism::GsR1) {
+  // M16. The cut command carries the registered fence behind it for a custom method,
+  // exactly as GS ( H rides its cut-token marker on the cut bytes; arm the matcher first.
+  escpos::Bytes cut_wire = buildCut(profile, options, cut, cut_token);
+  if (custom) {
+    armCustomFence();
+    const escpos::Bytes cut_fence = custom->fence_bytes(cut_token);
+    cut_wire.insert(cut_wire.end(), cut_fence.begin(), cut_fence.end());
+  } else if (profile.completion == CompletionMechanism::GsR1) {
     std::lock_guard<std::mutex> lock(io_mutex_);
     parser_.expectQueued();
   }
-  const TransportResult cut_sent =
-      sendPaced(profile, buildCut(profile, options, cut, cut_token));
+  const TransportResult cut_sent = sendPaced(profile, cut_wire);
   if (!cut_sent.ok) {
     terminate(job, JobState::Unknown,
               JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
@@ -1597,8 +1750,10 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     return;
   }
   const WaitOutcome cut_ack =
-      profile.completion == CompletionMechanism::GsParenH ? awaitToken(cut_token, timeout)
-                                                          : awaitQueued(timeout);
+      custom ? awaitCustomToken(cut_token, timeout)
+             : (profile.completion == CompletionMechanism::GsParenH
+                    ? awaitToken(cut_token, timeout)
+                    : awaitQueued(timeout));
   if (cut_ack != WaitOutcome::Signalled) {
     terminate(job, JobState::Unknown,
               JobResult{JobOutcome::Unknown, reached(),
@@ -1614,9 +1769,11 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   if (profile.completion != CompletionMechanism::GsParenH) {
     // A second GS r 1 fences the cut command but is not a documented cutter
     // guarantee (docs/techspec.md §3.2), so the claim stops here: print completion
-    // confirmed, cut command processed, no cutter status read.
+    // confirmed, cut command processed, no cutter status read. M16: a custom vendor fence
+    // is the same shape of claim — the printer confirmed the cut command, not the blade —
+    // so it also stops here, with the registered method's grade/authority attributed.
     terminate(job, JobState::DoneSoftware,
-              JobResult::done(reached()).with(profile.evidence()));
+              JobResult::done(reached()).with(success_evidence));
     return;
   }
 
@@ -2130,8 +2287,21 @@ std::optional<bool> PrinterRuntime::drawerPin() const {
   return drawer_pin_;
 }
 
+std::optional<DrawerKickReg> PrinterRuntime::vendorDrawerKick(
+    const CapabilityProfile& profile) const {
+  if (profile.drawer.kick.method != DrawerKickMethod::Vendor || !registrations_ ||
+      profile.drawer.kick.vendor_id.empty()) {
+    return std::nullopt;
+  }
+  return registrations_->drawerKick(profile.drawer.kick.vendor_id);
+}
+
 std::optional<bool> PrinterRuntime::pollDrawerPin(const CapabilityProfile& profile,
                                                   std::chrono::milliseconds timeout) {
+  // M16. A registered vendor method may read the switch through its own request/parse pair
+  // instead of GS r 2; the single queued answer byte is fed to the registered parser.
+  const std::optional<DrawerKickReg> vendor = vendorDrawerKick(profile);
+  const bool use_vendor = vendor && vendor->readable();
   const auto forget = [this] {
     std::lock_guard<std::mutex> lock(io_mutex_);
     // An expectation nobody answered would consume the *next* queued answer and
@@ -2147,7 +2317,9 @@ std::optional<bool> PrinterRuntime::pollDrawerPin(const CapabilityProfile& profi
     std::lock_guard<std::mutex> lock(io_mutex_);
     parser_.expectQueued();
   }
-  if (!sendPaced(profile, escpos::gsDrawerStatus()).ok) {
+  const escpos::Bytes request =
+      use_vendor ? vendor->status_request() : escpos::gsDrawerStatus();
+  if (!sendPaced(profile, request).ok) {
     forget();
     return std::nullopt;
   }
@@ -2156,11 +2328,19 @@ std::optional<bool> PrinterRuntime::pollDrawerPin(const CapabilityProfile& profi
     forget();
     return std::nullopt;
   }
-  const bool high = drawerPinHigh(answer);
+  std::optional<bool> high;
+  if (use_vendor) {
+    high = vendor->status_parse(std::vector<uint8_t>{answer});
+    if (!high.has_value()) {
+      return std::nullopt;  // the vendor parser could not read a level from this reply
+    }
+  } else {
+    high = drawerPinHigh(answer);
+  }
   {
     std::lock_guard<std::mutex> lock(status_mutex_);
     status_.observed = true;
-    drawer_pin_ = high;
+    drawer_pin_ = *high;
   }
   return high;
 }
@@ -2182,7 +2362,10 @@ DrawerOpenResult PrinterRuntime::runDrawerSequence(const CapabilityProfile& prof
 
   const auto poll_timeout = std::chrono::milliseconds(
       caps.status.poll_interval_ms != 0 ? caps.status.poll_interval_ms : 100);
-  const bool sensor = caps.sensorReadable();
+  // M16. A registered vendor method supplies the pulse bytes, and may also supply a switch
+  // read; either widens what "readable" means for this sequence.
+  const std::optional<DrawerKickReg> vendor = vendorDrawerKick(profile);
+  const bool sensor = caps.sensorReadable() || (vendor && vendor->readable());
 
   // Step 1 — read the sensor first. A drawer that is already out is never pulsed
   // again: the solenoid would buzz against an open latch for nothing.
@@ -2213,10 +2396,13 @@ DrawerOpenResult PrinterRuntime::runDrawerSequence(const CapabilityProfile& prof
     }
   }
 
-  // Step 3 — one queued pulse, at the profile's duration, on the requested channel.
+  // Step 3 — one queued pulse, at the profile's duration, on the requested channel. M16:
+  // a registered vendor method produces the pulse bytes; the built-in ESC p otherwise.
   const MonotonicTime pulse_at = MonotonicClock::now();
-  const TransportResult sent =
-      sendPaced(profile, escpos::drawerKick(result.channel, result.pulse_ms));
+  const escpos::Bytes pulse =
+      vendor ? vendor->kick_bytes(result.channel, result.pulse_ms)
+             : escpos::drawerKick(result.channel, result.pulse_ms);
+  const TransportResult sent = sendPaced(profile, pulse);
   last_drawer_pulse_ = MonotonicClock::now();
   drawer_pulsed_ = true;
   if (!sent.ok) {
@@ -2292,11 +2478,19 @@ DrawerOpenResult PrinterRuntime::openDrawer(const DrawerRequest& request) {
 
   DrawerOpenResult refused;
   refused.channel = caps.channelFor(request.channel);
-  // Refusal writes zero bytes and claims nothing. Three ways to get here: no drawer
-  // port on this model, a kick method this engine cannot drive (Star's peripheral
-  // command, ePOS, a vendor SDK), and — the giant-letters rule — a port whose
-  // electrical standard nobody has established.
-  if (!caps.kickable() || !profile.drivableByEscposEngine() || stopping_.load()) {
+  // M16. A registered vendor kick makes DrawerKickMethod::Vendor drivable, but only on a
+  // port whose electrical standard is established — the giant-letters rule holds for a
+  // vendor method exactly as it does for the built-ins, so an unclassified port is still
+  // never energised.
+  const bool vendor_drivable = caps.present && caps.electricalKnown() &&
+                               caps.kick.method == DrawerKickMethod::Vendor &&
+                               vendorDrawerKick(profile).has_value();
+  // Refusal writes zero bytes and claims nothing. Ways to get here: no drawer port on
+  // this model, a kick method this engine cannot drive (Star's peripheral command, ePOS,
+  // an unregistered vendor SDK), and — the giant-letters rule — a port whose electrical
+  // standard nobody has established.
+  if ((!caps.kickable() && !vendor_drivable) || !profile.drivableByEscposEngine() ||
+      stopping_.load()) {
     return refused;
   }
 
@@ -2465,6 +2659,10 @@ PrinterDriver::PrinterDriver(StorageConfig storage)
   // M14. Same directory, same "describes the installation, not this run" rule as the
   // instance nonce above.
   drawer_polarities_ = std::make_shared<DrawerPolarityStore>(storage.directory);
+  // M16. Process-local and shared by every printer's worker: registrations describe this
+  // running instance's extensions, never the journal, so they are born empty on every
+  // start (docs/api.md §16).
+  registrations_ = std::make_shared<Registrations>();
   hub_ = std::make_shared<detail::DriverEventHub>();
   index_ = std::make_shared<detail::JobIndex>();
   // Jobs from a previous run come back as terminal handles so findJob(key) works
@@ -2513,6 +2711,29 @@ const std::string& PrinterDriver::instanceNonce() const noexcept {
   return markers_->nonce();
 }
 
+// --- M16: custom method registration (docs/api.md §16) -------------------------------
+
+bool PrinterDriver::registerCompletionMethod(CompletionMethod method, std::string* error) {
+  return registrations_->addCompletionMethod(std::move(method), error);
+}
+
+bool PrinterDriver::registerProbeStep(ProbeStep step, std::string* error) {
+  return registrations_->addProbeStep(std::move(step), error);
+}
+
+bool PrinterDriver::registerBlockHandler(BlockHandlerReg handler, std::string* error) {
+  return registrations_->addBlockHandler(std::move(handler), error);
+}
+
+bool PrinterDriver::registerFormatter(FormatterReg formatter, std::string* error) {
+  return registrations_->addFormatter(std::move(formatter), error);
+}
+
+bool PrinterDriver::registerDrawerKick(DrawerKickReg kick, std::string* error) {
+  return registrations_->addDrawerKick(std::move(kick), error);
+}
+// --- end M16 -------------------------------------------------------------------------
+
 PrinterDriver::~PrinterDriver() { shutdown(); }
 
 void PrinterDriver::shutdown() {
@@ -2537,7 +2758,8 @@ std::shared_ptr<Printer> PrinterDriver::addPrinter(PrinterConfig config) {
   }
   auto runtime = std::make_shared<detail::PrinterRuntime>(
       std::move(config), store_, markers_, hub_, index_, capabilities_,
-      drawer_polarities_);  // M14
+      drawer_polarities_,  // M14
+      registrations_);     // M16
   runtime->start();
   auto printer = std::shared_ptr<Printer>(new Printer(runtime));
   std::lock_guard<std::mutex> lock(mutex_);

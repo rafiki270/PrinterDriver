@@ -11,6 +11,8 @@
 #include "printerdriver/dsl/json.hpp"
 #include "printerdriver/dsl/report.hpp"
 #include "printerdriver/dsl/text.hpp"
+// M16 — registered block handlers (docs/api.md §16) let parse accept new block kinds.
+#include "printerdriver/registrations.hpp"
 
 // The receipt document model of docs/receipt-dsl.md: named styles plus a vertical list
 // of blocks, serializable to the canonical JSON that travels between a POS and an agent.
@@ -139,9 +141,17 @@ using BlockList = std::vector<Block>;
 struct Block {
   enum class Kind {
     Text, Columns, Image, Qr, Barcode, Divider, Feed, Cut, DrawerKick, Raw, Each, If,
+    // M16 (docs/api.md §16). A block whose kind is a registered handler's kind rather
+    // than a built-in one. Parsed only when the driver's registry knows the kind, so an
+    // otherwise-unknown block still fails the parse when nothing handles it.
+    Custom,
   };
 
   Kind kind = Kind::Text;
+
+  // Custom (M16): the registered handler's kind, and the whole block object as JSON.
+  std::string custom_kind;
+  Json custom_payload;
 
   // Text
   std::string content;
@@ -238,8 +248,13 @@ struct Document {
 
 // Structural failures (a block with no recognised key, a style that is not an object)
 // throw DocumentError. Unknown keys are appended to `warnings` when supplied.
-Document parseDocument(const Json& json, std::vector<std::string>* warnings = nullptr);
-Document parseDocument(std::string_view json, std::vector<std::string>* warnings = nullptr);
+// `registrations` (M16, docs/api.md §16) lets the parser accept a block whose kind is a
+// registered handler's kind; nullptr keeps the strict behaviour where an unknown block
+// kind fails the parse.
+Document parseDocument(const Json& json, std::vector<std::string>* warnings = nullptr,
+                       const ::pd::Registrations* registrations = nullptr);
+Document parseDocument(std::string_view json, std::vector<std::string>* warnings = nullptr,
+                       const ::pd::Registrations* registrations = nullptr);
 
 Json documentToJson(const Document& document);
 std::string serializeDocument(const Document& document, bool pretty = false);

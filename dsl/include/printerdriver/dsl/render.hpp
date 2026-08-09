@@ -69,6 +69,10 @@ struct ImageAsset {
 struct RenderOptions {
   RenderProfile profile;
   std::vector<ImageAsset> images;
+  // M16 (docs/api.md §16). The driver's per-instance registry, or nullptr. A Block::Custom
+  // (a block kind a registered handler owns) is rendered by asking this registry; without
+  // it, a custom block reports an UnsupportedBlock degradation.
+  const ::pd::Registrations* registrations = nullptr;
   // Off by default: the engine sends ESC @ and owns the code page for banner text.
   bool emit_initialize = false;
   bool emit_code_page = true;

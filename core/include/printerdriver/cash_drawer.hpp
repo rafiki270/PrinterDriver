@@ -148,6 +148,11 @@ struct DrawerElectrical {
 
 struct DrawerKick {
   DrawerKickMethod method = DrawerKickMethod::Unsupported;
+  // M16 (docs/api.md §16). When `method` is DrawerKickMethod::Vendor this names the
+  // registered drawer-kick method that produces the pulse (and optionally reads the
+  // switch): a namespaced id looked up in the driver's per-instance registry. Empty on
+  // every built-in profile, and ignored for every other method.
+  std::string vendor_id;
   // 200 ms is the default for known 24 V printer-driven drawers, and it is also
   // Bixolon's own SDK default. Epson programs the pulse in 2 ms units, so every value
   // here is rounded down to an even number of milliseconds on the wire.

@@ -1222,6 +1222,248 @@ static void test_discover_sweeps_a_loopback_address_and_writes_only_dle_eot(void
   pd_test_listener_destroy(answering);
 }
 
+/* --- M16: custom completion method registration (docs/api.md §16) ------------------ */
+
+/*
+ * The made-up "acme.x-idle" vendor completion scheme, defined once here on the C side and
+ * mirrored by the scripted device in pd_test_support: the host sends ESC 'x' + the job's
+ * four-character verification token behind the payload, and an idle device echoes ESC 'y'
+ * + the same token. The registered fence_bytes produces the query and the matcher
+ * recognises the echo, correlating by the token exactly as GS ( H does.
+ */
+static size_t acme_fence_bytes(void* ctx, const char* job_token, uint8_t* out,
+                               size_t cap) {
+  (void)ctx;
+  if (job_token == NULL || strlen(job_token) != 4 || cap < 6) {
+    return cap + 1; /* over cap / malformed: the core fails the job Unknown, never truncates */
+  }
+  out[0] = 0x1B; /* ESC */
+  out[1] = 0x78; /* 'x' */
+  memcpy(out + 2, job_token, 4);
+  return 6;
+}
+
+static pd_match_result acme_matcher(void* ctx, const uint8_t* data, size_t size) {
+  pd_match_result result;
+  size_t i;
+  memset(&result, 0, sizeof(result));
+  (void)ctx;
+  for (i = 0; i + 1 < size; ++i) {
+    if (data[i] == 0x1B && data[i + 1] == 0x79) { /* ESC 'y' ack */
+      if (i + 6 > size) {
+        result.kind = PD_MATCH_NEED_MORE; /* the four token bytes are still in flight */
+        return result;
+      }
+      result.kind = PD_MATCH_MATCHED;
+      memcpy(result.token, data + i + 2, 4);
+      result.token[4] = '\0';
+      return result;
+    }
+  }
+  if (size > 0 && data[size - 1] == 0x1B) {
+    result.kind = PD_MATCH_NEED_MORE; /* a lone trailing ESC may begin an ack */
+    return result;
+  }
+  result.kind = PD_MATCH_NOT_MINE;
+  return result;
+}
+
+static void test_custom_completion_method_earns_the_registered_grade(void) {
+  pd_config config;
+  pd_completion_method method;
+  pd_op ops[1];
+  pd_document doc;
+  pd_payload payload;
+  pd_job_options options;
+  pd_job* job;
+  pd_job_result result;
+  const char* text = "ACME IDLE TICKET";
+  const char* print_token;
+  const char* cut_token;
+  pd_printer* printer;
+  pd_driver* driver;
+
+  memset(&config, 0, sizeof(config));
+  config.fsync_disabled = 1;
+  driver = pd_create(&config);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+
+  /* Register a made-up vendor completion method: grade A, physical printer. */
+  memset(&method, 0, sizeof(method));
+  method.id = "acme.x-idle";
+  method.fence_bytes = acme_fence_bytes;
+  method.matcher = acme_matcher;
+  method.grade = PD_GRADE_A_JOB_LEVEL_CONFIRMATION;
+  method.authority = PD_AUTHORITY_PHYSICAL_PRINTER;
+  method.method_name = "acme.x-idle";
+  CHECK_EQ(pd_register_completion_method(driver, &method), 1);
+  /* A duplicate id is refused, and a record missing a matcher is refused. */
+  CHECK_EQ(pd_register_completion_method(driver, &method), 0);
+  method.id = "acme.broken";
+  method.matcher = NULL;
+  CHECK_EQ(pd_register_completion_method(driver, &method), 0);
+
+  printer = pd_add_printer_scripted(driver, "capi-acme", "vendor-idle");
+  CHECK(printer != NULL);
+  if (printer == NULL) {
+    pd_destroy(driver);
+    return;
+  }
+  CHECK_EQ(pd_printer_completion(printer), PD_COMPLETION_VENDOR_IDLE);
+
+  ops[0].kind = PD_OP_LINE;
+  ops[0].text = text;
+  ops[0].value = 0;
+  doc.ops = ops;
+  doc.count = 1;
+  doc.code_page = PD_CODE_PAGE_PC437;
+  payload.kind = PD_PAYLOAD_DOCUMENT;
+  payload.as.document = doc;
+  memset(&options, 0, sizeof(options));
+  options.key = "acme-1";
+
+  job = pd_print(driver, printer, &payload, &options);
+  CHECK(job != NULL);
+  if (job == NULL) {
+    pd_destroy(driver);
+    return;
+  }
+
+  CHECK_EQ(pd_job_await(driver, job, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+  /* The registered claim rides the result, attributed by id. */
+  CHECK_EQ(result.grade, PD_GRADE_A_JOB_LEVEL_CONFIRMATION);
+  CHECK_EQ(result.authority, PD_AUTHORITY_PHYSICAL_PRINTER);
+  CHECK_STREQ(result.method, "acme.x-idle");
+  CHECK_STREQ(pd_confidence_grade_letter(result.grade), "A");
+  /* A vendor idle fence confirms print completion and the cut command, not a fault-free
+   * blade, so the level caps at CutProcessed exactly as GS r 1 does. */
+  CHECK_EQ(result.confidence, PD_CONFIDENCE_CUT_PROCESSED);
+  CHECK_EQ(pd_job_current_state(job), PD_JOB_STATE_DONE_SOFTWARE);
+  CHECK(pd_test_received_contains(printer, text));
+  CHECK_EQ(pd_test_cuts(printer), 1);
+
+  /* The custom fence promotes its per-job token to a resolvable RVI, exactly like
+   * GS ( H (docs/api.md §14): the ticket resolves by token and `pdctl verify` attributes
+   * it to this job the same way. */
+  print_token = pd_job_print_token(job);
+  cut_token = pd_job_cut_token(job);
+  CHECK_EQ(strlen(print_token), 4u);
+  CHECK_EQ(strlen(cut_token), 4u);
+  CHECK(strcmp(print_token, cut_token) != 0);
+  CHECK(pd_job_by_token(driver, print_token) == job);
+  CHECK(pd_job_by_token(driver, cut_token) == job);
+
+  pd_destroy(driver);
+}
+
+/* A VendorIdle profile whose method is not registered is refused Unsupported before a
+ * byte reaches the link: the honest answer when nothing can confirm the job. */
+static void test_unregistered_vendor_idle_is_unsupported(void) {
+  pd_config config;
+  pd_payload payload;
+  pd_job_options options;
+  pd_job* job;
+  pd_job_result result;
+  const char* raw = "hello";
+  pd_printer* printer;
+  pd_driver* driver;
+
+  memset(&config, 0, sizeof(config));
+  config.fsync_disabled = 1;
+  driver = pd_create(&config);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+  /* Deliberately no pd_register_completion_method. */
+  printer = pd_add_printer_scripted(driver, "capi-acme-none", "vendor-idle");
+  CHECK(printer != NULL);
+  if (printer == NULL) {
+    pd_destroy(driver);
+    return;
+  }
+
+  payload.kind = PD_PAYLOAD_RAW;
+  payload.as.raw.bytes = (const uint8_t*)raw;
+  payload.as.raw.size = 5;
+  memset(&options, 0, sizeof(options));
+  options.key = "acme-none-1";
+  job = pd_print(driver, printer, &payload, &options);
+  CHECK(job != NULL);
+  if (job == NULL) {
+    pd_destroy(driver);
+    return;
+  }
+  CHECK_EQ(pd_job_await(driver, job, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_FAILED);
+  CHECK_EQ(result.reason, PD_REASON_UNSUPPORTED);
+  CHECK_EQ(pd_test_print_data_bytes(printer), 0u);
+
+  pd_destroy(driver);
+}
+
+static pd_probe_finding acme_classify(void* ctx, const uint8_t* response, size_t size) {
+  pd_probe_finding finding;
+  memset(&finding, 0, sizeof(finding));
+  (void)ctx;
+  (void)response;
+  finding.answered = size > 0 ? 1 : 0;
+  strcpy(finding.label, "acme-probe");
+  return finding;
+}
+
+/* The other four pd_register_* entry points are wired and validate their inputs: the
+ * probe step's non-printing rule is enforced at registration, and each point refuses a
+ * record missing a required callback. */
+static void test_other_registration_points_are_wired(void) {
+  pd_config config;
+  pd_driver* driver;
+  pd_probe_step step;
+  pd_formatter formatter;
+  pd_drawer_kick_reg drawer;
+  static const uint8_t printing_request[] = {'H', 'i'};  /* printable -> must be refused */
+  static const uint8_t silent_request[] = {0x1B, 0x05};  /* ESC ENQ, all < 0x20 -> accepted */
+
+  memset(&config, 0, sizeof(config));
+  config.fsync_disabled = 1;
+  driver = pd_create(&config);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+
+  /* (2) probe step: a printing request is refused; the same step with non-printing bytes
+   * is accepted. This is the printable-byte lint of §16, enforced at registration. */
+  memset(&step, 0, sizeof(step));
+  step.id = "acme.printing-probe";
+  step.request_bytes = printing_request;
+  step.request_size = sizeof(printing_request);
+  step.classify = acme_classify;
+  CHECK_EQ(pd_register_probe_step(driver, &step), 0);
+  step.id = "acme.silent-probe";
+  step.request_bytes = silent_request;
+  step.request_size = sizeof(silent_request);
+  CHECK_EQ(pd_register_probe_step(driver, &step), 1);
+
+  /* (4) formatter: a NULL callback is refused. */
+  memset(&formatter, 0, sizeof(formatter));
+  formatter.name = "acme.upper";
+  formatter.formatter = NULL;
+  CHECK_EQ(pd_register_formatter(driver, &formatter), 0);
+
+  /* (5) drawer kick: a NULL kick_bytes is refused. */
+  memset(&drawer, 0, sizeof(drawer));
+  drawer.id = "acme.kick";
+  drawer.kick_bytes = NULL;
+  CHECK_EQ(pd_register_drawer_kick(driver, &drawer), 0);
+
+  pd_destroy(driver);
+}
+
 int main(void) {
   test_submit_reaches_terminal_done();
   test_verification_identifier_round_trip();
@@ -1242,6 +1484,9 @@ int main(void) {
   test_self_test_prints_one_ticket_and_reports_the_detection();
   test_auto_detect_classifies_three_listeners_without_printing();
   test_discover_sweeps_a_loopback_address_and_writes_only_dle_eot();
+  test_custom_completion_method_earns_the_registered_grade();
+  test_unregistered_vendor_idle_is_unsupported();
+  test_other_registration_points_are_wired();
 
   if (g_failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", g_failures);

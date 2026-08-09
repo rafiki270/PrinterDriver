@@ -1,6 +1,8 @@
+#include <optional>
 #include <string>
 
 #include "printerdriver/dsl/format.hpp"
+#include "printerdriver/registrations.hpp"
 #include "test_harness.hpp"
 
 using namespace pd::dsl;
@@ -249,4 +251,41 @@ PD_TEST(value_to_text_prints_what_the_model_wrote) {
   CHECK_EQ(valueToText(parseJson("null")), std::string());
   CHECK_EQ(valueToText(parseJson("\"text\"")), std::string("text"));
   CHECK_EQ(valueToText(parseJson("[1,2]")), std::string("[1,2]"));
+}
+
+// M16 (docs/api.md §16): a registered formatter is checked before the built-in table,
+// and declining falls through to the built-in — so a registration extends the table.
+PD_TEST(a_registered_formatter_is_checked_before_the_builtin_table) {
+  pd::Registrations registrations;
+  std::string error;
+  CHECK(registrations.addFormatter(
+      pd::FormatterReg{"acme.stars",
+                       [](const std::string& value, const std::string&,
+                          const std::string&) -> std::optional<std::string> {
+                         return "*" + value + "*";
+                       }},
+      &error));
+  // A registration may shadow a built-in name, and may decline for some inputs.
+  CHECK(registrations.addFormatter(
+      pd::FormatterReg{"upper",
+                       [](const std::string& value, const std::string&,
+                          const std::string&) -> std::optional<std::string> {
+                         if (value == "keep") {
+                           return std::nullopt;  // decline -> the built-in "upper" runs
+                         }
+                         return std::string("CUSTOM");
+                       }},
+      &error));
+
+  FormatContext context = american();
+  context.registrations = &registrations;
+
+  // The namespaced custom name renders.
+  CHECK_EQ(format(Json::string("hi"), "acme.stars", context), std::string("*hi*"));
+  // A registered name that shadows a built-in wins when it handles the value.
+  CHECK_EQ(format(Json::string("x"), "upper", context), std::string("CUSTOM"));
+  // When it declines, the built-in runs.
+  CHECK_EQ(format(Json::string("keep"), "upper", context), std::string("KEEP"));
+  // With no registry, the built-in table is unchanged.
+  CHECK_EQ(format(Json::string("x"), "upper", american()), std::string("X"));
 }

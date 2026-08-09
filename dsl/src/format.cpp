@@ -698,6 +698,19 @@ FormatOutcome applyFormatter(const Json& value, std::string_view spec,
   trim(name);
   const std::string key = lowered(name);
 
+  // M16 (docs/api.md §16). A registered formatter is checked before the built-in table,
+  // matched on the namespaced name as written. Declining (returning nothing) falls
+  // through to the built-ins below, so a registration extends the table without hiding it.
+  if (context.registrations != nullptr && context.registrations->hasFormatter(name)) {
+    const std::optional<std::string> custom =
+        context.registrations->format(name, outcome.text, argument, context.locale);
+    if (custom.has_value()) {
+      outcome.text = *custom;
+      outcome.ok = true;
+      return outcome;
+    }
+  }
+
   if (key == "upper") {
     outcome.text = text::upper(outcome.text);
     return outcome;

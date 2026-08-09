@@ -367,6 +367,11 @@ struct CapabilityProfile {
   CommandLanguages languages;
   TransportCapabilities transport;
   CompletionMechanism completion = CompletionMechanism::GsR1;
+  // M16 (docs/api.md §16). When `completion` is CompletionMechanism::VendorIdle this names
+  // the registered completion method that drives it: a namespaced id like "acme.x-idle",
+  // looked up in the driver's per-instance registry. Empty on every built-in profile, and
+  // ignored for every other mechanism.
+  std::string completion_vendor_id;
   CompletionCapabilities completion_caps;
   StatusCapabilities status;
   RecoveryCapabilities recovery;

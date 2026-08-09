@@ -10,6 +10,8 @@
 
 #include "printerdriver/capability_profile.hpp"
 #include "printerdriver/identity.hpp"
+// M16 — registered probe steps (docs/api.md §16) extend the fingerprint below.
+#include "printerdriver/registrations.hpp"
 #include "printerdriver/response_parser.hpp"
 
 // Non-destructive capability interrogation and the promotion of a profile from its
@@ -37,6 +39,16 @@ struct ProbeOptions {
   bool print_test_lines = true;
   std::string endpoint;
   IdentityHints hints;
+  // M16 (docs/api.md §16). House-specific probe steps registered on the driver, run after
+  // the built-in phases. Each is non-printing (enforced at registration), so they hold on
+  // the printless autoDetect path as well as the full probe.
+  std::vector<ProbeStep> custom_steps;
+};
+
+// M16. The outcome of one registered probe step, attributed to its id.
+struct CustomProbeResult {
+  std::string id;
+  ProbeFinding finding;
 };
 
 // Everything the probe established first-hand. Every field is optional because "not
@@ -63,6 +75,9 @@ struct CapabilityFindings {
   // Bytes the response parser could not classify. On unfamiliar hardware this is the
   // interesting part of the probe, so it is kept rather than discarded.
   std::vector<uint8_t> unclassified;
+  // M16. Results of the registered custom probe steps, attributed by id. Not persisted:
+  // the steps themselves are process-local, so their findings are recomputed each run.
+  std::vector<CustomProbeResult> custom_probe;
 
   BehaviourSignals behaviour() const;
   bool empty() const;

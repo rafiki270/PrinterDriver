@@ -373,6 +373,7 @@ BindOutcome bind(const Document& document, const Json& model,
   binder.options = &options;
   binder.report = &outcome.report;
   binder.context.tables = &options.tables;
+  binder.context.registrations = options.registrations;  // M16
   binder.context.locale =
       options.locale.empty() ? document.meta.locale : options.locale;
   binder.context.currency =

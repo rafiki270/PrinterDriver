@@ -215,7 +215,7 @@ namespace {
 // One candidate, start to finish. Runs on a worker thread and touches nothing shared
 // except the findings store, which has its own lock.
 DetectedPrinter classify(const Candidate& candidate, const AutoDetectOptions& options,
-                         FindingsStore* cache) {
+                         FindingsStore* cache, const std::vector<ProbeStep>& custom_steps) {
   DetectedPrinter out;
   out.host = candidate.host;
   out.port = candidate.port;
@@ -273,6 +273,9 @@ DetectedPrinter classify(const Candidate& candidate, const AutoDetectOptions& op
     probe_options.status_timeout_ms = options.status_timeout_ms;
     probe_options.identity_timeout_ms = options.identity_timeout_ms;
     probe_options.completion_timeout_ms = options.completion_timeout_ms;
+    // M16. Registered probe steps run on the printless autoDetect path too; their
+    // non-printing rule (enforced at registration) is what keeps this sweep printless.
+    probe_options.custom_steps = custom_steps;
 
     TcpConfig tcp;
     tcp.host = candidate.host;
@@ -392,6 +395,9 @@ std::vector<DetectedPrinter> PrinterDriver::autoDetect(
   }
 
   FindingsStore* cache = capabilities_.get();
+  // M16. Snapshot the registered probe steps once and share them across the workers.
+  const std::vector<ProbeStep> custom_steps =
+      registrations_ ? registrations_->probeSteps() : std::vector<ProbeStep>{};
   std::atomic<size_t> next{0};
   std::atomic<uint64_t> completed{0};
   std::mutex callback_mutex;
@@ -407,7 +413,7 @@ std::vector<DetectedPrinter> PrinterDriver::autoDetect(
         if (index >= candidates.size()) {
           return;
         }
-        results[index] = classify(candidates[index], options, cache);
+        results[index] = classify(candidates[index], options, cache, custom_steps);
         const uint64_t done = completed.fetch_add(1) + 1;
         if (on_candidate) {
           // Serialised, because a UI callback that has to be thread-safe as well as
