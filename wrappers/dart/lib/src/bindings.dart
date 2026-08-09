@@ -1283,6 +1283,61 @@ final class PrinterDriverBindings {
       _library.lookupFunction<_PdTestSetDrawerOpenNative,
           void Function(Pointer<PdPrinter>, int)>('pd_test_set_drawer_open');
 
+  // --- M16: custom method registration (docs/api.md §16) ----------------------------
+  //
+  // Lazy, like the blocks above. Every callback in this group is invoked on a CORE thread
+  // and has to answer there and then, which `dart:ffi` cannot do from Dart code -- see the
+  // header comment of custom_methods.dart for the three callback kinds and why none of
+  // them fits. So these take native function pointers, exactly as the custom-transport
+  // vtable does, and the structs below are transcriptions of pd.h and nothing more.
+
+  /// `pd_register_completion_method`
+  late final int Function(Pointer<PdDriver>, Pointer<PdCompletionMethod>)
+      registerCompletionMethod = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdCompletionMethod>),
+          int Function(Pointer<PdDriver>,
+              Pointer<PdCompletionMethod>)>('pd_register_completion_method');
+
+  /// `pd_register_probe_step`
+  late final int Function(Pointer<PdDriver>, Pointer<PdProbeStep>) registerProbeStep =
+      _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdProbeStep>),
+          int Function(
+              Pointer<PdDriver>, Pointer<PdProbeStep>)>('pd_register_probe_step');
+
+  /// `pd_register_block_handler`
+  late final int Function(Pointer<PdDriver>, Pointer<PdBlockHandler>)
+      registerBlockHandler = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdBlockHandler>),
+          int Function(Pointer<PdDriver>,
+              Pointer<PdBlockHandler>)>('pd_register_block_handler');
+
+  /// `pd_register_formatter`
+  late final int Function(Pointer<PdDriver>, Pointer<PdFormatter>) registerFormatter =
+      _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdFormatter>),
+          int Function(
+              Pointer<PdDriver>, Pointer<PdFormatter>)>('pd_register_formatter');
+
+  /// `pd_register_drawer_kick`
+  late final int Function(Pointer<PdDriver>, Pointer<PdDrawerKickReg>)
+      registerDrawerKick = _library.lookupFunction<
+          Int32 Function(Pointer<PdDriver>, Pointer<PdDrawerKickReg>),
+          int Function(Pointer<PdDriver>,
+              Pointer<PdDrawerKickReg>)>('pd_register_drawer_kick');
+
+  /// `pd_match_kind_name`
+  late final Pointer<Char> Function(int) matchKindName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_match_kind_name',
+  );
+
+  /// `pd_drain_order_name`
+  late final Pointer<Char> Function(int) drainOrderName =
+      _library.lookupFunction<_PdEnumNameNative, Pointer<Char> Function(int)>(
+    'pd_drain_order_name',
+  );
+
   /// Whether this library carries `capi/tests/pd_test_support.h`, i.e. whether it was
   /// built from the `printerdriver_capi_testing` target.
   bool get hasTestSupport => _library.providesSymbol('pd_add_printer_scripted');
@@ -1401,4 +1456,112 @@ final class PrinterDriverBindings {
       .lookupFunction<_PdTestEnumLabelNative, Pointer<Char> Function(int)>(
     'pd_test_enum_label',
   );
+}
+
+// --- M16: custom method registration (docs/api.md §16) --------------------------------
+
+/// `pd_match_result` — a custom matcher's verdict plus the token it matched.
+final class PdMatchResult extends Struct {
+  @Int32()
+  external int kind;
+
+  /// NUL-terminated; the core copies it out before the matcher returns.
+  @Array(8)
+  external Array<Uint8> token;
+}
+
+/// `pd_probe_finding` — what one custom probe step concluded.
+final class PdProbeFinding extends Struct {
+  @Int32()
+  external int answered;
+
+  @Array(64)
+  external Array<Uint8> label;
+}
+
+/// `pd_fence_bytes_fn`
+typedef PdFenceBytesNative = Size Function(
+    Pointer<Void>, Pointer<Char>, Pointer<Uint8>, Size);
+
+/// `pd_completion_matcher_fn`
+typedef PdCompletionMatcherNative = PdMatchResult Function(
+    Pointer<Void>, Pointer<Uint8>, Size);
+
+/// `pd_probe_classify_fn`
+typedef PdProbeClassifyNative = PdProbeFinding Function(
+    Pointer<Void>, Pointer<Uint8>, Size);
+
+/// `pd_block_handler_fn`
+typedef PdBlockHandlerNative = Size Function(Pointer<Void>, Pointer<Char>, Pointer<Char>,
+    Pointer<Uint8>, Size, Pointer<Int32>, Pointer<Char>, Size);
+
+/// `pd_formatter_fn`
+typedef PdFormatterNative = Size Function(Pointer<Void>, Pointer<Char>, Pointer<Char>,
+    Pointer<Char>, Pointer<Char>, Size, Pointer<Int32>);
+
+/// `pd_drawer_kick_bytes_fn`
+typedef PdDrawerKickBytesNative = Size Function(
+    Pointer<Void>, Uint8, Uint16, Pointer<Uint8>, Size);
+
+/// `pd_drawer_status_request_fn`
+typedef PdDrawerStatusRequestNative = Size Function(
+    Pointer<Void>, Pointer<Uint8>, Size);
+
+/// `pd_drawer_status_parse_fn`
+typedef PdDrawerStatusParseNative = Int32 Function(
+    Pointer<Void>, Pointer<Uint8>, Size);
+
+/// `pd_completion_method`
+final class PdCompletionMethod extends Struct {
+  external Pointer<Char> id;
+  external Pointer<NativeFunction<PdFenceBytesNative>> fenceBytes;
+  external Pointer<NativeFunction<PdCompletionMatcherNative>> matcher;
+  external Pointer<Void> ctx;
+
+  @Int32()
+  external int grade;
+
+  @Int32()
+  external int authority;
+
+  external Pointer<Char> methodName;
+}
+
+/// `pd_probe_step`
+final class PdProbeStep extends Struct {
+  external Pointer<Char> id;
+  external Pointer<Uint8> requestBytes;
+
+  @Size()
+  external int requestSize;
+
+  external Pointer<NativeFunction<PdProbeClassifyNative>> classify;
+  external Pointer<Void> ctx;
+}
+
+/// `pd_block_handler`
+final class PdBlockHandler extends Struct {
+  external Pointer<Char> kind;
+  external Pointer<NativeFunction<PdBlockHandlerNative>> handler;
+  external Pointer<Void> ctx;
+}
+
+/// `pd_formatter`
+final class PdFormatter extends Struct {
+  external Pointer<Char> name;
+  external Pointer<NativeFunction<PdFormatterNative>> formatter;
+  external Pointer<Void> ctx;
+}
+
+/// `pd_drawer_kick_reg`
+final class PdDrawerKickReg extends Struct {
+  external Pointer<Char> id;
+  external Pointer<NativeFunction<PdDrawerKickBytesNative>> kickBytes;
+
+  /// Optional, and they go together: both `nullptr` means the vendor method has no
+  /// readable switch, so a kick reports KICK_SENT_UNVERIFIED rather than a verified open.
+  external Pointer<NativeFunction<PdDrawerStatusRequestNative>> statusRequest;
+  external Pointer<NativeFunction<PdDrawerStatusParseNative>> statusParse;
+
+  external Pointer<Void> ctx;
 }

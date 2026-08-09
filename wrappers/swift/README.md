@@ -161,6 +161,13 @@ in-process scripted device supplied by `capi/tests/pd_test_support.cpp`. That fi
 compiled into the test target and into nothing else, so no application binary carries a
 test double.
 
+## Parity with the other wrappers
+
+`scripts/check_parity.sh` (docs/api.md §17) asserts that this wrapper references every
+public `pd_*` function in `capi/include/printerdriver/pd.h`, and that anything it covers
+through a higher-level member instead is named in `scripts/parity_allowlist.txt`. **No
+wrapper is a subset**: a `pd_` function added to the ABI without a binding here fails CI.
+
 ## License
 
 MIT. See [LICENSE](../../LICENSE).

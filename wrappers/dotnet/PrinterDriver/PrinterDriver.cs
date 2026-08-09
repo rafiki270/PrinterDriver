@@ -214,6 +214,37 @@ public sealed partial class PrinterDriver : IDisposable
     }
 
     /// <summary>
+    /// Paper to job (docs/api.md §14): resolves the four-character <c>V:</c> code printed
+    /// on a receipt.
+    /// </summary>
+    /// <remarks>
+    /// Accepts either of a job's identifiers — the print fence's or the cut fence's — and
+    /// answers most-recent-first, because the sequence wraps and the receipt somebody is
+    /// holding is far more likely to be the recent one. Includes jobs reconstructed from
+    /// the journal, so a receipt printed before the last restart still resolves.
+    /// </remarks>
+    /// <param name="token">The four characters on the paper.</param>
+    /// <returns>The job, or null when no job on this driver ever carried that token.</returns>
+    public PrintJob? JobByToken(string token)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        var job = NativeMethods.pd_job_by_token(Handle, token);
+        return job == 0 ? null : InternJob(job);
+    }
+
+    /// <summary>
+    /// The two characters every verification identifier this driver issues starts with:
+    /// which driver instance owns an echo, and therefore which instance printed a given
+    /// receipt. Persisted in the storage directory, so it survives a restart.
+    /// </summary>
+    /// <remarks>
+    /// A token that does not start with this came from somewhere else — the case
+    /// <see cref="DeviceEvent.ForeignWriterDetected"/> reports.
+    /// </remarks>
+    public string InstanceNonce =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_instance_nonce(Handle));
+
+    /// <summary>
     /// The path the native library was loaded from, for diagnosing a deployment that
     /// bound the wrong build.
     /// </summary>

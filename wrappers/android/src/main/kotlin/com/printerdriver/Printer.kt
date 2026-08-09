@@ -39,6 +39,32 @@ class Printer internal constructor(
         get() { driver.checkOpen(); return CompletionMechanism.fromRaw(NativeBridge.printerCompletionMechanism(handle)) }
 
     /**
+     * What the fence [completionMechanism] reports is actually worth
+     * (docs/compatibility-brief.md §28).
+     *
+     * [Provenance.DOCUMENTED] means the manufacturer's own command documentation lists the
+     * mechanism for this model -- in the shipped database that is Epson and nobody else.
+     * [Provenance.PROBED] means this driver asked the installed hardware over the installed
+     * interface path and it answered, which is a stronger claim than any datasheet and is
+     * specific to that path. [Provenance.UNVERIFIED] means neither: a default nobody has
+     * confirmed, which is what "ESC/POS compatible" on a datasheet amounts to.
+     *
+     * This is not a confidence level and it changes nothing a job reports. It answers a
+     * different question -- "should I trust this printer's fence before I have printed
+     * anything?" -- and it is the answer that says whether running a probe against a site's
+     * hardware is worth doing.
+     */
+    val completionProvenance: Provenance
+        get() { driver.checkOpen(); return Provenance.fromRaw(NativeBridge.printerCompletionProvenance(handle)) }
+
+    /** The language this printer's profile is driven in. Anything but
+     *  [CommandLanguage.ESC_POS] is refused with [FailureReason.UNSUPPORTED] before a byte
+     *  is written -- a Zebra or Brother profile is recognised precisely so that nothing is
+     *  sent to it. */
+    val language: CommandLanguage
+        get() { driver.checkOpen(); return CommandLanguage.fromRaw(NativeBridge.printerLanguage(handle)) }
+
+    /**
      * Which of docs/compatibility-brief.md §25's five Bluetooth paths this printer is
      * reached over, or `null` when it is not a Bluetooth printer at all.
      *

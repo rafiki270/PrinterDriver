@@ -88,6 +88,17 @@ sealed class JobResult {
   /// The command behind the claim, e.g. `GS(H) fn48`. `none` when nothing was
   /// confirmed: the string a support engineer needs six months later.
   final String method;
+
+  /// The `pd_job_outcome` this result is, for the one place the number is needed:
+  /// asking the core for its own spelling of the outcome
+  /// ([PrinterDriver.abiName]). Dart models the tri-state as sealed types rather than as
+  /// an enum — pattern matching on them is exhaustive, which a wrapper-side enum could
+  /// never be — so this is the only bridge back to `pd_job_outcome_name`.
+  int get nativeOutcome => switch (this) {
+        JobDone() => 0,
+        JobFailed() => 1,
+        JobUnknown() => 2,
+      };
 }
 
 /// The job reached `DoneSoftware` (or `PhysicallyVerified`).

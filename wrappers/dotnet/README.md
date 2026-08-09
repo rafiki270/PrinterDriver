@@ -333,6 +333,13 @@ The test project targets `net8.0`, the same framework the library ships, so the 
 exercises the exact assembly that ships. `<RollForward>Major</RollForward>` is what lets
 those assemblies run on a machine that only has a newer shared runtime installed.
 
+## Parity with the other wrappers
+
+`scripts/check_parity.sh` (docs/api.md §17) asserts that this wrapper references every
+public `pd_*` function in `capi/include/printerdriver/pd.h`, and that anything it covers
+through a higher-level member instead is named in `scripts/parity_allowlist.txt`. **No
+wrapper is a subset**: a `pd_` function added to the ABI without a binding here fails CI.
+
 ## Continuous integration
 
 [`.github/workflows/windows.yml`](../../.github/workflows/windows.yml) builds the core with

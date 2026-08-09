@@ -206,6 +206,13 @@ The suite finds the built libraries under `build-dart/` on its own; set
 `PRINTERDRIVER_LIB_PATH` to point it somewhere else. Without them it skips rather than
 fails.
 
+## Parity with the other wrappers
+
+`scripts/check_parity.sh` (docs/api.md §17) asserts that this wrapper references every
+public `pd_*` function in `capi/include/printerdriver/pd.h`, and that anything it covers
+through a higher-level member instead is named in `scripts/parity_allowlist.txt`. **No
+wrapper is a subset**: a `pd_` function added to the ABI without a binding here fails CI.
+
 ## Threading
 
 Callbacks come off the core's own threads and are marshalled onto the isolate that

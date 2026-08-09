@@ -460,6 +460,19 @@ their ids), ids are namespaced strings (`"acme.x-idle"`), and anything a registr
 claims (grade, authority) is attributed to it by id in results and `pdctl verify`
 output, so a custom method's claims are auditable like the built-ins.
 
+**Callbacks and the wrapper that cannot serve them.** Every callback above is invoked on a
+core thread and must answer there and then — a fence before the payload is flushed, a
+matcher before the next chunk arrives. Swift, Kotlin and .NET can do that (a `@convention(c)`
+thunk, a JNI upcall on an attached thread, a rooted delegate), and their registration APIs
+take ordinary closures. `dart:ffi` cannot, for the same reason the custom-transport vtable
+is native there: `NativeCallable.isolateLocal` may only be invoked on its own isolate's
+mutator thread, `.listener` supports `void` returns only, and `.isolateGroupBound` runs with
+no isolate entered. A matcher whose return value came from whatever the trampoline left in
+the register would be a completion claim made by accident. So the Dart surface takes native
+function pointers (`CustomCompletionMethod.fromLibrary(...)` and its four siblings) — the
+shape a vendor plugin already has — and that asymmetry is a property of the runtime, not a
+gap in the wrapper.
+
 ## 17. Wrapper parity contract
 
 **Every capability of the C++ core is available in every wrapper, through an idiomatic
@@ -479,5 +492,74 @@ Enforced, not trusted: a parity check (`scripts/check_parity.sh`) enumerates the
 the enum-bridge tests already enforce enum parity. A `pd_` function added to the ABI
 without a binding in all four wrappers fails the check. Idiomatic wrappers may satisfy a
 function through a property or a higher-level method; those cases are listed explicitly
-in the check's allowlist with the member that covers them, so the mapping stays visible
-rather than silently absent.
+in the check's allowlist (`scripts/parity_allowlist.txt`) with the member that covers
+them, so the mapping stays visible rather than silently absent.
+
+The check searches each wrapper's SOURCE tree only — `wrappers/swift/Sources`,
+`wrappers/dart/lib`, `wrappers/dotnet/PrinterDriver`, `wrappers/android/src/main` — never
+its tests, which can bind the ABI directly and would satisfy every line of the contract
+while the public surface stayed empty. Two further properties keep it honest: when a built
+C ABI library is present, every `pd_` symbol it exports must appear in the list parsed out
+of the header, so a declaration the parser misses cannot quietly excuse itself; and
+`scripts/check_parity.sh --self-test` runs three negative controls (a function nobody has
+bound must fail all four wrappers, one binding hidden from one wrapper must fail that
+wrapper alone, and the plain run must be green), because a check nobody has watched go red
+proves nothing. CI runs the self-test before the check itself.
+
+Two consequences are worth stating, because they are what the contract costs. First,
+"every wrapper" includes the one whose tests cannot run on the build machine: the Android
+wrapper is held to the same list, verified through the JNI glue's types and its
+external-symbol check rather than through a JVM (`wrappers/android/README.md`). Second, a
+wrapper is allowed to be shaped by its runtime — §16's Dart registration surface is the
+standing example — but never to be smaller.
+
+### 17.1 What the C ABI does not reach yet
+
+Obligation 2 above is now enforced. Obligation 1 — *every core capability is exposed in
+the C ABI* — is not, and the difference is a list rather than a feeling. A reverse audit of
+the public C++ headers against `pd.h` found the following stranded, in rough order of what
+it costs a wrapper. Nothing here is a wrapper's fault and no wrapper can fix it; each item
+is an ABI addition, and adding one means binding it in four wrappers, which is why they are
+written down instead of rushed.
+
+- **The receipt DSL and the template layer** (`dsl/include/**`). `pd.h`'s document tier is a
+  flat `pd_op` array with five kinds; `dsl::render`, `parseDocument`, `bind`,
+  `applyFormatter`, the barcode encoder, the UTF-8 column-width helpers and `dsl::Json` have
+  no `pd_*` entry point. The renderer is reachable from C only from inside `pd_self_test`,
+  which lays out one fixed diagnostic ticket. **This has a consequence for §16**: a wrapper
+  can register a formatter or a block handler, and the core stores it, but the only code
+  that consults those records is the DSL render path — so from a wrapper today they are
+  registrations with no reachable call site. The three that do fire end to end are the
+  completion method, the probe step and the drawer kick. A `pd_render_document` /
+  `pd_bind_template` pair is the missing piece, and until it exists that asymmetry belongs
+  in this document rather than in a surprised integrator's afternoon.
+- **`CapabilityProfile` is opaque in C.** Only flattened facets come back (width,
+  completion, provenance, language, the drawer facet, `pd_detection_summary`). The
+  Bluetooth capability record is not among them, so an iOS wrapper cannot ask the SDK for a
+  model's MFi `ExternalAccessory` protocol string — the one fact it needs to open an
+  `EASession` — although the database records it and records whether it is vendor-gated.
+  `devices::byName` is likewise unreachable: all the shipped profiles are selectable by id
+  and inspectable by nobody.
+- **The reasoning behind a probe or an identification.** `pd_detection_summary` carries the
+  verdict; `IdentityAssessment::signals` (the ordered human-readable reasons `pdctl probe`
+  prints), the per-step `CapabilityFindings`, the findings cache (`FindingsStore`) and
+  `probePath` / `classifyPath` / `explainPath` — which answer "does *this* interface path
+  forward status bytes at all?" — stay in C++. A wrapper can show that a guess is 35%
+  confident but never why. The label a registered probe step's `classify` returns has no way
+  back to C either.
+- **Two of four transports.** `transport.hpp`'s serial factory and `transport_bluez.hpp`'s
+  RFCOMM factory are C++-only; a C wrapper wanting either must reimplement the link behind
+  `pd_transport_vtable`. **Two of three engines**, likewise: `pd_printer_language` refuses
+  anything but ESC/POS, so `star.hpp` and `epos.hpp` are unreachable from C even though the
+  core implements both.
+- **The encoder's richness.** `escpos::Encoder` has underline, text scaling, per-document
+  code-page switches, cut-with-feed, the maintenance and memory-switch queries and
+  `transliterate`; `pd_op` has text, line, align, bold and feed.
+- **Enumeration and history.** `PrinterDriver::printers()`, `PrintJob::history()`,
+  `PrintQueue::waiting()`, `JobStore::all()` and `readJournal` have no C form, so a wrapper
+  can resolve one job by key or token but cannot audit the journal or list a lane.
+- **Smaller, safe, and simply not done yet**: `PrinterConfig`'s `ProbePolicy` /
+  `ProbeOptions` / `IdentityHints` (a wrapper cannot say "always re-probe this bench unit"
+  or "never touch this device"), `Printer::probeNow`, `discovery::probeHost` and the CIDR
+  helpers, `isNonPrintingRequest` / `isValidRegistrationId` as pre-flight validators, and
+  the `to_string` overloads on DSL and parser enums that have no `pd_*_name` twin.

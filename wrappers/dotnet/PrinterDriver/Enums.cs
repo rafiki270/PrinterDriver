@@ -545,3 +545,150 @@ public enum DrawerStatusMethod
     /// <summary>No readable switch.</summary>
     None = 4,
 }
+
+/// <summary>
+/// The core's own spelling of every mirrored enum member, straight from the C ABI.
+/// </summary>
+/// <remarks>
+/// <para>
+/// These are not <c>ToString()</c>. A .NET name is this wrapper's spelling of a member;
+/// an ABI name is the core's, which is what the journal records, what <c>pdctl</c> prints
+/// and what a support engineer reads in a log six months later. Rendering a diagnostic
+/// with the wrapper's spelling and then searching the journal for it is a wasted
+/// afternoon, so the core's spelling is available everywhere the value is.
+/// </para>
+/// <para>
+/// Every string comes from static storage inside the library and is never null.
+/// </para>
+/// </remarks>
+public static class AbiNames
+{
+    /// <summary><c>pd_job_state_name</c>.</summary>
+    /// <param name="value">The state.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this JobState value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_job_state_name((int)value));
+
+    /// <summary><c>pd_confidence_level_name</c>.</summary>
+    /// <param name="value">The level.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this ConfidenceLevel value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_confidence_level_name((int)value));
+
+    /// <summary><c>pd_device_event_name</c>.</summary>
+    /// <param name="value">The event.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this DeviceEvent value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_device_event_name((int)value));
+
+    /// <summary><c>pd_failure_reason_name</c>.</summary>
+    /// <param name="value">The reason.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this FailureReason value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_failure_reason_name((int)value));
+
+    /// <summary><c>pd_job_outcome_name</c>.</summary>
+    /// <param name="value">The outcome.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this JobOutcome value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_job_outcome_name((int)value));
+
+    /// <summary><c>pd_confidence_grade_name</c>.</summary>
+    /// <param name="value">The grade.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this ConfidenceGrade value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_confidence_grade_name((int)value));
+
+    /// <summary>
+    /// <c>pd_confidence_grade_letter</c> — "A+", "A".."E", the letter a report tabulates
+    /// where the member name is too long.
+    /// </summary>
+    /// <param name="value">The grade.</param>
+    /// <returns>The letter.</returns>
+    public static string Letter(this ConfidenceGrade value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_confidence_grade_letter((int)value));
+
+    /// <summary><c>pd_completion_authority_name</c>.</summary>
+    /// <param name="value">The authority.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this CompletionAuthority value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_completion_authority_name((int)value));
+
+    /// <summary><c>pd_provenance_name</c>.</summary>
+    /// <param name="value">The provenance.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this Provenance value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_provenance_name((int)value));
+
+    /// <summary><c>pd_command_language_name</c>.</summary>
+    /// <param name="value">The language.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this CommandLanguage value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_command_language_name((int)value));
+
+    /// <summary><c>pd_payload_kind_name</c>.</summary>
+    /// <param name="value">The tier.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this PayloadKind value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_payload_kind_name((int)value));
+
+    /// <summary><c>pd_completion_mechanism_name</c>.</summary>
+    /// <param name="value">The mechanism.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this CompletionMechanism value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_completion_mechanism_name((int)value));
+
+    /// <summary><c>pd_cut_variant_name</c>.</summary>
+    /// <param name="value">The variant.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this CutVariant value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_cut_variant_name((int)value));
+
+    /// <summary><c>pd_drawer_state_name</c>.</summary>
+    /// <param name="value">The state.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this DrawerState value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_drawer_state_name((int)value));
+
+    /// <summary><c>pd_drawer_port_standard_name</c>.</summary>
+    /// <param name="value">The port standard.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this DrawerPortStandard value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_drawer_port_standard_name((int)value));
+
+    /// <summary><c>pd_drawer_kick_method_name</c>.</summary>
+    /// <param name="value">The kick method.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this DrawerKickMethod value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_drawer_kick_method_name((int)value));
+
+    /// <summary><c>pd_drawer_status_method_name</c>.</summary>
+    /// <param name="value">The status method.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this DrawerStatusMethod value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_drawer_status_method_name((int)value));
+
+    /// <summary><c>pd_profile_selection_name</c>.</summary>
+    /// <param name="value">How the profile was arrived at.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this ProfileSelection value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_profile_selection_name((int)value));
+
+    /// <summary><c>pd_detection_status_name</c>.</summary>
+    /// <param name="value">What detection established.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this DetectionStatus value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_detection_status_name((int)value));
+
+    /// <summary><c>pd_drain_order_name</c>.</summary>
+    /// <param name="value">The drain order.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this DrainOrder value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_drain_order_name((int)value));
+
+    /// <summary><c>pd_match_kind_name</c>.</summary>
+    /// <param name="value">A custom matcher's verdict.</param>
+    /// <returns>The core's spelling.</returns>
+    public static string AbiName(this CompletionMatchKind value) =>
+        NativeMethods.ReadUtf8(NativeMethods.pd_match_kind_name((int)value));
+}

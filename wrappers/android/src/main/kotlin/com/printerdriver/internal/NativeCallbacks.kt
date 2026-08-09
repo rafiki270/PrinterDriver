@@ -75,3 +75,78 @@ internal interface NativeTransportCallback {
      *  it again must be harmless. */
     fun close()
 }
+
+// --- M16: custom method registration (docs/api.md section 16) -------------------------
+//
+// The same naming and visibility rules as the interfaces above: each method is found by
+// an explicit GetMethodID(name, signature) at registration time, so the names and
+// signatures in the KDoc are load-bearing and R8 must not rename them
+// (consumer-rules.pro). All of them are invoked BY THE CORE, on a printer's worker
+// thread, on the transport reader path, or on whatever thread renders a document. None of
+// them may block or call back into the driver.
+
+/**
+ * The embedder half of `pd_completion_method`: a vendor idle/ack scheme as a first-class
+ * graded completion path.
+ */
+internal interface NativeCompletionMethodCallback {
+    /** JNI signature "(Ljava/lang/String;)[B". The fence bytes for this job's
+     *  four-character verification token. A fence the core cannot fit fails that job
+     *  Unknown rather than going out truncated. */
+    fun fenceBytes(jobToken: String): ByteArray
+
+    /**
+     * JNI signature "([B)Ljava/lang/String;". The verdict on the bytes accumulated since
+     * the last one, encoded so that a matcher answers in a SINGLE call and nothing has to
+     * be remembered between two (two concurrent renders would race):
+     *
+     *  - `null` — NotMine: not this mechanism's bytes; the core drops its buffer.
+     *  - `""` — NeedMore: an answer may be forming; keep buffering.
+     *  - anything else — Matched, and the string is the correlation token.
+     */
+    fun match(data: ByteArray): String?
+}
+
+/** The embedder half of `pd_probe_step`. */
+internal fun interface NativeProbeStepCallback {
+    /** JNI signature "([B)Ljava/lang/String;". `null` means the device did not answer
+     *  this step at all; any string means it did, and is the finding's label. */
+    fun classify(response: ByteArray): String?
+}
+
+/** The embedder half of `pd_block_handler`. */
+internal fun interface NativeBlockHandlerCallback {
+    /**
+     * JNI signature "(Ljava/lang/String;Ljava/lang/String;)[B". One tagged answer, for the
+     * same single-call reason as [NativeCompletionMethodCallback.match]:
+     *
+     *  - first byte `1` — the rest is raw ESC/POS ops;
+     *  - first byte `0` — the rest is a UTF-8 degradation reason, reported exactly like a
+     *    built-in block's;
+     *  - `null` or empty — a degradation with no reason given.
+     */
+    fun render(blockJson: String, profileJson: String): ByteArray?
+}
+
+/** The embedder half of `pd_formatter`. */
+internal fun interface NativeFormatterCallback {
+    /** JNI signature
+     *  "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".
+     *  `null` declines, and the built-in formatter table answers instead. */
+    fun format(value: String, args: String, locale: String): String?
+}
+
+/** The embedder half of `pd_drawer_kick_reg`. */
+internal interface NativeDrawerKickCallback {
+    /** JNI signature "(II)[B". The pulse bytes for (channel, pulse milliseconds). */
+    fun kickBytes(channel: Int, pulseMs: Int): ByteArray
+
+    /** JNI signature "()[B". The bytes that ask for the switch state. Only called when the
+     *  registration declared a readable switch. */
+    fun statusRequest(): ByteArray
+
+    /** JNI signature "([B)I". The pin level: -1 unknown, 0 low, 1 high — pd.h's
+     *  PD_UNKNOWN / PD_FALSE / PD_TRUE. A level nobody could read is unknown, never
+     *  "closed". */
+    fun statusParse(response: ByteArray): Int
+}

@@ -148,6 +148,21 @@ C++17, CMake 3.16+, no dependencies. `ctest` runs the C++ suites; `swift test`,
 one-line setup). The Android module and the Windows build are CI-ready but need their
 respective toolchains.
 
+Two source-level checks need no toolchain and run on every push:
+
+```
+scripts/check_parity.sh              # every pd_ function is bound in every wrapper
+scripts/check_parity.sh --self-test  # …and the check itself still goes red when it should
+scripts/check_kotlin_syntax.sh       # the JNI glue's types, and every external fun's symbol
+```
+
+**No wrapper is a subset** (docs/api.md §17). `check_parity.sh` enumerates the public
+`pd_*` functions in `capi/include/printerdriver/pd.h` and asserts that Swift, Dart, .NET
+and Kotlin each reference every one; a function a wrapper satisfies through a property or
+a higher-level member is listed in `scripts/parity_allowlist.txt` with the member that
+covers it, so the mapping stays visible rather than silently absent. Adding a `pd_`
+function without binding it everywhere fails the build.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

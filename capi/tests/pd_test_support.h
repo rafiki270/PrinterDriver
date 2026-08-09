@@ -127,6 +127,23 @@ size_t pd_test_listener_print_data_bytes(pd_test_listener* listener);
 void pd_test_listener_stop(pd_test_listener* listener);
 void pd_test_listener_destroy(pd_test_listener* listener);
 
+/* --- M16: the "acme.x-idle" reference completion method as C function pointers ------
+ *
+ * The made-up vendor idle scheme test_capi.c defines inline, exported so a WRAPPER test
+ * can register it too: the host sends ESC 'x' + the job's four-character verification
+ * token behind the payload, and an idle device (the "vendor-idle" script above) echoes
+ * ESC 'y' + the same token.
+ *
+ * It lives here because pd_completion_method's callbacks are invoked on a core thread and
+ * must answer there and then, and not every FFI runtime can serve such a callback from
+ * its own code -- `dart:ffi` cannot, which is why the Dart wrapper's registration API
+ * takes native function pointers (wrappers/dart/lib/src/custom_methods.dart). Without
+ * these two symbols that wrapper's §16 surface could only be checked for refusals, never
+ * driven end to end against a real fence.
+ */
+size_t pd_test_acme_fence_bytes(void* ctx, const char* job_token, uint8_t* out, size_t cap);
+pd_match_result pd_test_acme_matcher(void* ctx, const uint8_t* data, size_t size);
+
 /* --- Enum bridge ------------------------------------------------------------------ */
 
 typedef enum pd_test_enum {

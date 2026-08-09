@@ -223,15 +223,53 @@ internal static class NativeMethods
                                                  [MarshalAs(UnmanagedType.LPUTF8Str)] string key,
                                                  in PdJobOptions options);
 
+    /// <summary>
+    /// <c>pd_force_reprint</c> with control over the banner. pd.h defines
+    /// <c>pd_force_reprint</c> as exactly this call with an all-zeroes
+    /// <c>pd_reprint_options</c>, i.e. with the banner on.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_force_reprint_opts(nint driver, nint printer,
+                                                      [MarshalAs(UnmanagedType.LPUTF8Str)] string key,
+                                                      in PdReprintOptions options);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nint pd_find_job(nint driver,
                                             [MarshalAs(UnmanagedType.LPUTF8Str)] string key);
+
+    /// <summary>
+    /// Paper to job (docs/api.md §14): resolves either of a job's four-character
+    /// verification identifiers, most-recent-first, including jobs reloaded from the
+    /// journal.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_job_by_token(nint driver,
+                                                [MarshalAs(UnmanagedType.LPUTF8Str)] string token);
+
+    /// <summary>
+    /// The two characters every token this driver issues starts with. Persisted, so it
+    /// survives a restart.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_instance_nonce(nint driver);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nint pd_job_id(nint job);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nint pd_job_key(nint job);
+
+    /// <summary>
+    /// The identifier the ticket printed as <c>V:</c>. Empty on a printer whose completion
+    /// mechanism is not <c>GS ( H</c> — there is no wire token to promote — and until the
+    /// job reaches a worker.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_job_print_token(nint job);
+
+    /// <summary>The identifier the job's cut fence carried. Same rules.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_job_cut_token(nint job);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern uint pd_job_attempt(nint job);
@@ -296,6 +334,12 @@ internal static class NativeMethods
     internal static extern nint pd_cut_variant_name(int value);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_drain_order_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_match_kind_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int pd_code_page_at(int index);
 
     // --- M15: self-test, auto-detection and LAN discovery (docs/api.md §15) ----------
@@ -333,6 +377,71 @@ internal static class NativeMethods
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nint pd_detection_status_name(int value);
+
+    // --- M16: custom method registration (docs/api.md §16) ----------------------------
+    //
+    // Five extension points, all per-driver, all data-plus-callbacks. Every callback here
+    // is invoked on a CORE thread and must answer there and then -- a fence's bytes, a
+    // matcher's verdict, a formatter's text. .NET can serve that: a rooted delegate is
+    // callable from any thread and returns a value, which is why these are managed
+    // callbacks and not (as in the Dart wrapper) native function pointers the application
+    // has to supply. The rooting is not optional; see CallbackRoots.
+
+    /// <summary>
+    /// Writes the fence bytes for a job's four-character token into <c>output</c> and
+    /// returns the count. A fence longer than <c>capacity</c> must return more than the
+    /// capacity rather than truncate: the core then fails that job Unknown instead of
+    /// sending half a fence.
+    /// </summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate nuint FenceBytesCallback(nint context, nint jobToken, nint output,
+                                               nuint capacity);
+
+    /// <summary>Classifies the printer→host bytes accumulated since the last verdict.</summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate PdMatchResult CompletionMatcherCallback(nint context, nint data,
+                                                              nuint size);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate PdProbeFinding ProbeClassifyCallback(nint context, nint response,
+                                                            nuint size);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate nuint BlockHandlerCallback(nint context, nint blockJson, nint profileJson,
+                                                  nint output, nuint capacity, nint ok,
+                                                  nint detail, nuint detailCapacity);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate nuint FormatterCallback(nint context, nint value, nint args, nint locale,
+                                               nint output, nuint capacity, nint handled);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate nuint DrawerKickBytesCallback(nint context, byte channel, ushort pulseMs,
+                                                     nint output, nuint capacity);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate nuint DrawerStatusRequestCallback(nint context, nint output,
+                                                         nuint capacity);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int DrawerStatusParseCallback(nint context, nint response, nuint size);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_register_completion_method(nint driver,
+                                                             in PdCompletionMethod method);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_register_probe_step(nint driver, in PdProbeStep step);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_register_block_handler(nint driver,
+                                                         in PdBlockHandler handler);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_register_formatter(nint driver, in PdFormatter formatter);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_register_drawer_kick(nint driver, in PdDrawerKickReg reg);
 
     // --- Helpers ---------------------------------------------------------------------
 
@@ -678,4 +787,89 @@ internal struct PdDiscoveredDevice
     public ushort Port;
     public int Port9100Open;
     public nint DleEotHex;
+}
+
+/// <summary>
+/// <c>pd_reprint_options</c>. All-zeroes means the banner prints, which is why
+/// <c>SuppressBanner</c> is spelled as the negative: a duplicate receipt that does not
+/// announce itself is how staff cook an order twice.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdReprintOptions
+{
+    public PdJobOptions Job;
+    public int SuppressBanner;
+}
+
+// --- M16: custom method registration (docs/api.md §16) --------------------------------
+//
+// The function-pointer fields are raw nint for the same reason PdTransportVtable's are:
+// it keeps the struct blittable and makes the delegate lifetime explicit at the call site.
+// The core copies each struct before the registration call returns, but not what the
+// pointers name, so every delegate is rooted until pd_destroy.
+
+/// <summary><c>pd_match_result</c> — a matcher's verdict plus the token it matched.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct PdMatchResult
+{
+    public int Kind;
+
+    /// <summary>NUL-terminated; the core copies it out before the matcher returns.</summary>
+    public fixed byte Token[8];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdCompletionMethod
+{
+    public nint Id;
+    public nint FenceBytes;
+    public nint Matcher;
+    public nint Context;
+    public int Grade;
+    public int Authority;
+    public nint MethodName;
+}
+
+/// <summary><c>pd_probe_finding</c> — what one custom probe step concluded.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct PdProbeFinding
+{
+    public int Answered;
+    public fixed byte Label[64];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdProbeStep
+{
+    public nint Id;
+    public nint RequestBytes;
+    public nuint RequestSize;
+    public nint Classify;
+    public nint Context;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdBlockHandler
+{
+    public nint Kind;
+    public nint Handler;
+    public nint Context;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdFormatter
+{
+    public nint Name;
+    public nint Formatter;
+    public nint Context;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdDrawerKickReg
+{
+    public nint Id;
+    public nint KickBytes;
+    public nint StatusRequest;
+    public nint StatusParse;
+    public nint Context;
 }

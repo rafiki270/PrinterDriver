@@ -1,0 +1,109 @@
+# The checks that run on every push: the C++ core and its suites, the four wrapper test
+# suites, and the two source-level checks that need no toolchain of their own.
+#
+# The Windows job is deliberately NOT here — see .github/workflows/windows.yml for why it
+# is manual-dispatch only.
+
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # First, because it needs nothing built and fails in seconds: docs/api.md §17's wrapper
+  # parity contract. Every public pd_ function in capi/include/printerdriver/pd.h must be
+  # bound in all four wrappers, or listed in scripts/parity_allowlist.txt with the member
+  # that covers it idiomatically. --self-test runs the negative controls first, so a check
+  # that could no longer go red fails here rather than passing quietly forever.
+  parity:
+    name: Wrapper parity (docs/api.md §17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: scripts/check_parity.sh --self-test
+        run: scripts/check_parity.sh --self-test
+      - name: scripts/check_parity.sh
+        run: scripts/check_parity.sh
+
+  native:
+    name: Core + C ABI (ctest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        # The shared testing library is what the Dart and .NET suites bind.
+        run: cmake -S . -B build -DPD_BUILD_SHARED_CAPI=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build -j 4
+      - name: ctest
+        working-directory: build
+        run: ctest --output-on-failure
+      # Cheap here, and it re-runs the parity check WITH a built library present, which
+      # turns on the cross-check that every exported pd_ symbol was parsed out of pd.h.
+      - name: Wrapper parity, against the built ABI
+        run: scripts/check_parity.sh
+      - name: Upload the testing library
+        uses: actions/upload-artifact@v4
+        with:
+          name: capi-testing-linux
+          path: build/libprinterdriver_capi_testing.so
+          if-no-files-found: error
+
+  dotnet:
+    name: .NET wrapper
+    runs-on: ubuntu-latest
+    needs: native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/download-artifact@v4
+        with:
+          name: capi-testing-linux
+          path: native
+      - name: dotnet test
+        env:
+          PRINTERDRIVER_LIB_PATH: ${{ github.workspace }}/native/libprinterdriver_capi_testing.so
+        run: dotnet test wrappers/dotnet/PrinterDriver.Tests
+
+  dart:
+    name: Dart wrapper
+    runs-on: ubuntu-latest
+    needs: native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: capi-testing-linux
+          path: native
+      - name: dart pub get
+        working-directory: wrappers/dart
+        run: dart pub get
+      - name: dart analyze
+        working-directory: wrappers/dart
+        run: dart analyze
+      - name: dart test
+        working-directory: wrappers/dart
+        env:
+          PRINTERDRIVER_LIB_PATH: ${{ github.workspace }}/native/libprinterdriver_capi_testing.so
+        run: dart test
+
+  # No JVM check: there is no kotlinc, Gradle or Android SDK in this workflow either, and
+  # wrappers/android/README.md is blunt about what that means. What CAN be checked is
+  # checked — the JNI glue's C++ types against the header stub, and that every `external
+  # fun` has a native definition, which is the mismatch that becomes an
+  # UnsatisfiedLinkError at a till.
+  android-glue:
+    name: Android JNI glue
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: scripts/check_kotlin_syntax.sh
+        run: scripts/check_kotlin_syntax.sh

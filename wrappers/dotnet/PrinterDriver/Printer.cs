@@ -229,6 +229,47 @@ public sealed partial class Printer
     }
 
     /// <summary>
+    /// The same reprint, with control over the banner (<c>pd_force_reprint_opts</c>).
+    /// </summary>
+    /// <remarks>
+    /// Suppressing the banner is a per-call, deliberate act for a receipt where it is
+    /// inappropriate. A kitchen ticket should never suppress it: the banner is what lets
+    /// staff bin the duplicate instead of cooking it twice.
+    /// </remarks>
+    /// <param name="key">The original idempotency key.</param>
+    /// <param name="printBanner">False prints the duplicate with no banner.</param>
+    /// <param name="options">Options for the reprint; null takes the defaults.</param>
+    /// <returns>The new attempt.</returns>
+    /// <exception cref="PrinterDriverException">
+    /// The key is unknown, or its job was reconstructed from the journal.
+    /// </exception>
+    public PrintJob ForceReprint(string key, bool printBanner, JobOptions? options = null)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        options ??= new JobOptions();
+        var keyPointer = Marshal.StringToCoTaskMemUTF8(options.Key ?? string.Empty);
+        try
+        {
+            var native = new PdReprintOptions
+            {
+                Job = NativeOptions(options, keyPointer),
+                SuppressBanner = printBanner ? 0 : 1,
+            };
+            var job = NativeMethods.pd_force_reprint_opts(
+                _driver.Handle, _handle, key, in native);
+            if (job == 0)
+            {
+                throw new PrinterDriverException(_driver.LastError());
+            }
+            return _driver.InternJob(job);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(keyPointer);
+        }
+    }
+
+    /// <summary>
     /// Submits a job and awaits its terminal answer.
     /// </summary>
     /// <param name="payload">What to print.</param>
