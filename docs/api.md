@@ -391,3 +391,41 @@ correlation to a **receipt verification identifier (RVI)**:
 The idempotency key remains the fleet-wide business identity; the RVI is the
 per-print physical-evidence identity. Key ↔ UUID ↔ RVI resolve in both directions
 through the journal.
+
+## 15. Self-test and auto-detection
+
+Two composition APIs over existing machinery (discovery, identify, probe, DSL, fences):
+
+**`driver.autoDetect(subnet?, options?)`** → the one-call path from "I know nothing" to
+configured printers: LAN discovery (non-printing DLE EOT sweep) → multi-signal identify
+per candidate → non-destructive capability probe (respecting the stored-findings cache)
+→ returns `[DetectedPrinter{printer, identity{vendor, model, trusted, confidence%},
+profileId, provenance summary, completionMechanism, grade ceiling}]`. Nothing prints;
+nothing fires. Wrappers surface it as an async stream (candidates arrive as found).
+`pdctl autodetect [cidr]` prints the table.
+
+**`printer.selfTest(options?)`** → prints ONE diagnostic ticket through the full fenced
+engine — the paper is the detection report:
+
+```
+PRINTERDRIVER SELF-TEST
+sdk <version> · <date time>
+────────────────────────────
+IDENTITY   vendor/model (GS I, trusted YES/NO, NN%)
+PROFILE    <id> — selected by DOCUMENTED|PROBED|DEFAULT
+MEDIA      <dots> dots · <chars> cols · <dpi> dpi
+COMPLETION <mechanism> — grade ceiling <A+..E>, provenance
+CHARSET    příliš žluťoučký kůň / árvíztűrő / zażółć
+BARCODE    [Code128 sample]   QR [V-token]
+DRAWER     <port standard> · <voltage> — <provenance>
+FENCE      this ticket's own GS(H)/fence round-trip: the
+           terminal result below proves the mechanism live
+ORDER: selftest-<ts>   V:<token>
+```
+
+Ends with the ordinary tri-state result — a `Done(grade A)` self-test IS the proof the
+stack works end-to-end on this unit; blocks the profile can't do appear as declared
+degradations on the ticket itself (e.g. "BARCODE: not supported on this path"). The
+printer's own built-in self-test (`GS ( A`, `DC2 T`) remains separately reachable as
+`pdctl test-print` — vendor firmware's view vs. this, the SDK's view. Agent endpoints:
+`POST /printers/<id>/self-test`, `POST /autodetect`.
