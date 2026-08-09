@@ -473,8 +473,21 @@ class PrinterRuntime {
     if (stopped_.exchange(true)) {
       return;
     }
-    stopping_.store(true);
+    // stopping_ is read inside both condition predicates, so it has to be published
+    // under the mutex each of those waits holds. Stored outside, it can land between a
+    // waiter's predicate check and the wait that enrolls it, and the notify below then
+    // reaches a thread that is not listening yet. queue_cv_'s wait carries no timeout,
+    // so losing that one wedges the join below for good rather than merely delaying it.
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      stopping_.store(true);
+    }
     queue_cv_.notify_all();
+    {
+      // Taken only as a barrier: every io_cv_ predicate reads the store above, and a
+      // waiter that read it too early must be enrolled before the notify that follows.
+      std::lock_guard<std::mutex> lock(io_mutex_);
+    }
     io_cv_.notify_all();
     if (worker_.joinable()) {
       worker_.join();

@@ -123,8 +123,13 @@ class HttpServer {
   HttpServerConfig config_;
   HttpHandler handler_;
 
-  std::uintptr_t listen_socket_ = 0;
-  bool listening_ = false;
+  // Atomic because stop() retires the listening socket while acceptLoop() is still
+  // polling on it. A stale read here is not a benign torn integer: it is a descriptor
+  // number, and the moment stop() closes it the OS may reissue it to another thread's
+  // socket — so the accept loop would poll, and accept on, something that is not this
+  // server. stop() also holds the close back until the accept thread is joined.
+  std::atomic<std::uintptr_t> listen_socket_{0};
+  std::atomic<bool> listening_{false};
   std::atomic<uint16_t> port_{0};
   std::atomic<bool> running_{false};
 

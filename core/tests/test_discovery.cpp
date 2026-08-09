@@ -60,27 +60,32 @@ class Listener {
 
   void stop() {
     running_.store(false);
-    if (pd::net::valid(socket_)) {
-      pd::net::shutdownBoth(socket_);
-      pd::net::closeSocket(socket_);
-      socket_ = pd::net::invalidSocket();
+    // Shut down to wake a blocked accept(), but close only after the join: serve() is
+    // still polling on this descriptor, and a closed number can be reissued under it.
+    if (pd::net::valid(socket_.load())) {
+      pd::net::shutdownBoth(socket_.load());
     }
     if (thread_.joinable()) {
       thread_.join();
+    }
+    const pd::net::Socket listener = socket_.exchange(pd::net::invalidSocket());
+    if (pd::net::valid(listener)) {
+      pd::net::closeSocket(listener);
     }
   }
 
  private:
   void serve() {
     while (running_.load()) {
+      const pd::net::Socket listener = socket_.load();
       pd::net::PollFd waiter;
-      waiter.socket = socket_;
+      waiter.socket = listener;
       waiter.events = pd::net::kPollIn;
-      if (!pd::net::valid(socket_) || pd::net::poll(&waiter, 1, 50) <= 0) {
+      if (!pd::net::valid(listener) || pd::net::poll(&waiter, 1, 50) <= 0) {
         continue;
       }
       const pd::net::Socket client =
-          static_cast<pd::net::Socket>(::accept(socket_, nullptr, nullptr));
+          static_cast<pd::net::Socket>(::accept(listener, nullptr, nullptr));
       if (!pd::net::valid(client)) {
         continue;
       }
@@ -110,7 +115,8 @@ class Listener {
 
   bool answer_ = true;
   uint8_t reply_ = 0x16;
-  pd::net::Socket socket_ = pd::net::invalidSocket();
+  // Atomic: stop() retires it while serve() is still polling on it.
+  std::atomic<pd::net::Socket> socket_{pd::net::invalidSocket()};
   uint16_t port_ = 0;
   std::atomic<bool> running_{true};
   std::thread thread_;

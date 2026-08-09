@@ -76,13 +76,17 @@ class FakeEposServer {
 
   void stop() {
     running_.store(false);
-    if (net::valid(listen_socket_)) {
-      net::shutdownBoth(listen_socket_);
-      net::closeSocket(listen_socket_);
-      listen_socket_ = net::invalidSocket();
+    // Shut down to wake a blocked accept(), but close only after the join: serve() is
+    // still polling on this descriptor, and a closed number can be reissued under it.
+    if (net::valid(listen_socket_.load())) {
+      net::shutdownBoth(listen_socket_.load());
     }
     if (thread_.joinable()) {
       thread_.join();
+    }
+    const net::Socket listener = listen_socket_.exchange(net::invalidSocket());
+    if (net::valid(listener)) {
+      net::closeSocket(listener);
     }
   }
 
@@ -110,14 +114,15 @@ class FakeEposServer {
 
   void serve() {
     while (running_.load()) {
+      const net::Socket listener = listen_socket_.load();
       net::PollFd waiter;
-      waiter.socket = listen_socket_;
+      waiter.socket = listener;
       waiter.events = net::kPollIn;
-      if (!net::valid(listen_socket_) || net::poll(&waiter, 1, 50) <= 0) {
+      if (!net::valid(listener) || net::poll(&waiter, 1, 50) <= 0) {
         continue;
       }
       const net::Socket client =
-          static_cast<net::Socket>(::accept(listen_socket_, nullptr, nullptr));
+          static_cast<net::Socket>(::accept(listener, nullptr, nullptr));
       if (!net::valid(client)) {
         continue;
       }
@@ -182,7 +187,8 @@ class FakeEposServer {
   std::vector<std::string> bodies_;
   std::vector<std::string> requests_;
   size_t served_ = 0;
-  net::Socket listen_socket_ = net::invalidSocket();
+  // Atomic: stop() retires it while serve() is still polling on it.
+  std::atomic<net::Socket> listen_socket_{net::invalidSocket()};
   uint16_t port_ = 0;
   std::atomic<int> http_status_{200};
   std::atomic<bool> running_{true};

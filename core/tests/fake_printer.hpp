@@ -653,10 +653,11 @@ class FakePrinterServer {
 
   void stop() {
     running_.store(false);
-    if (pd::net::valid(listen_socket_)) {
-      pd::net::shutdownBoth(listen_socket_);
-      pd::net::closeSocket(listen_socket_);
-      listen_socket_ = pd::net::invalidSocket();
+    // Shut both sockets down to wake anything blocked on them, but do not close the
+    // listener yet: serve() is still polling on that descriptor, and closing it here
+    // frees the number for the OS to reissue mid-poll. It closes after the join.
+    if (pd::net::valid(listen_socket_.load())) {
+      pd::net::shutdownBoth(listen_socket_.load());
     }
     if (pd::net::valid(client_socket_.load())) {
       pd::net::shutdownBoth(client_socket_.load());
@@ -664,19 +665,24 @@ class FakePrinterServer {
     if (thread_.joinable()) {
       thread_.join();
     }
+    const pd::net::Socket listener = listen_socket_.exchange(pd::net::invalidSocket());
+    if (pd::net::valid(listener)) {
+      pd::net::closeSocket(listener);
+    }
   }
 
  private:
   void serve() {
     while (running_.load()) {
+      const pd::net::Socket listener = listen_socket_.load();
       pd::net::PollFd waiter;
-      waiter.socket = listen_socket_;
+      waiter.socket = listener;
       waiter.events = pd::net::kPollIn;
-      if (!pd::net::valid(listen_socket_) || pd::net::poll(&waiter, 1, 100) <= 0) {
+      if (!pd::net::valid(listener) || pd::net::poll(&waiter, 1, 100) <= 0) {
         continue;
       }
       const pd::net::Socket client =
-          static_cast<pd::net::Socket>(::accept(listen_socket_, nullptr, nullptr));
+          static_cast<pd::net::Socket>(::accept(listener, nullptr, nullptr));
       if (!pd::net::valid(client)) {
         continue;
       }
@@ -709,7 +715,10 @@ class FakePrinterServer {
   }
 
   std::shared_ptr<FakePrinter> device_;
-  pd::net::Socket listen_socket_ = pd::net::invalidSocket();
+  // Atomic for the same reason HttpServer's is: stop() retires it while serve() is
+  // still polling on it. start() writes it before the thread exists, so the plain
+  // conversions up there are single-threaded.
+  std::atomic<pd::net::Socket> listen_socket_{pd::net::invalidSocket()};
   std::atomic<pd::net::Socket> client_socket_{pd::net::invalidSocket()};
   uint16_t port_ = 0;
   std::atomic<bool> running_{true};

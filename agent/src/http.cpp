@@ -242,7 +242,7 @@ std::string HttpRequest::queryValue(std::string_view name, bool* found) const {
 // --- Server ---------------------------------------------------------------------------
 
 HttpServer::HttpServer(HttpServerConfig config) : config_(std::move(config)) {
-  listen_socket_ = asHandle(net::invalidSocket());
+  listen_socket_.store(asHandle(net::invalidSocket()));
 }
 
 HttpServer::~HttpServer() { stop(); }
@@ -252,10 +252,10 @@ bool HttpServer::start(HttpHandler handler, std::string* error) {
     if (error != nullptr) {
       *error = message;
     }
-    if (listening_) {
-      net::closeSocket(asSocket(listen_socket_));
-      listen_socket_ = asHandle(net::invalidSocket());
-      listening_ = false;
+    if (listening_.load()) {
+      net::closeSocket(asSocket(listen_socket_.load()));
+      listen_socket_.store(asHandle(net::invalidSocket()));
+      listening_.store(false);
     }
     return false;
   };
@@ -274,8 +274,8 @@ bool HttpServer::start(HttpHandler handler, std::string* error) {
   if (!net::valid(socket)) {
     return fail("socket: " + net::errorText(net::lastError()));
   }
-  listen_socket_ = asHandle(socket);
-  listening_ = true;
+  listen_socket_.store(asHandle(socket));
+  listening_.store(true);
 #if !PD_PLATFORM_WINDOWS
   // POSIX-only on purpose: Winsock's SO_REUSEADDR lets a second socket steal a bound
   // address outright rather than reusing a TIME_WAIT one.
@@ -330,16 +330,28 @@ void HttpServer::stop() {
   if (!running_.exchange(false)) {
     return;
   }
-  if (listening_) {
-    net::shutdownBoth(asSocket(listen_socket_));
-    net::closeSocket(asSocket(listen_socket_));
-    listen_socket_ = asHandle(net::invalidSocket());
-    listening_ = false;
+  // Shut down before joining, close only after. shutdown() is what unblocks an accept()
+  // that a poll-then-RST left waiting, on the platforms that honour it on a listening
+  // socket; close() is not, and closing here would hand the descriptor number back to
+  // the OS while the accept thread is still polling on it. The loop needs neither to
+  // exit — it notices running_ within one 100 ms poll — so the close simply waits.
+  if (listening_.load()) {
+    net::shutdownBoth(asSocket(listen_socket_.load()));
   }
   if (acceptor_.joinable()) {
     acceptor_.join();
   }
-  ready_.notify_all();
+  if (listening_.exchange(false)) {
+    const std::uintptr_t listener =
+        listen_socket_.exchange(asHandle(net::invalidSocket()));
+    net::closeSocket(asSocket(listener));
+  }
+  {
+    // Under the lock: running_ was cleared outside it, so an unlocked notify here can
+    // slip between a worker's predicate check and its wait, and that worker never wakes.
+    std::lock_guard<std::mutex> lock(mutex_);
+    ready_.notify_all();
+  }
   for (std::thread& worker : workers_) {
     if (worker.joinable()) {
       worker.join();
@@ -355,14 +367,17 @@ void HttpServer::stop() {
 
 void HttpServer::acceptLoop() {
   while (running_.load()) {
+    // One load, used for both the wait and the accept: re-reading between them could
+    // poll one descriptor and accept on another.
+    const net::Socket listener = asSocket(listen_socket_.load());
     net::PollFd waiter;
-    waiter.socket = asSocket(listen_socket_);
+    waiter.socket = listener;
     waiter.events = net::kPollIn;
-    if (!listening_ || net::poll(&waiter, 1, 100) <= 0) {
+    if (!listening_.load() || net::poll(&waiter, 1, 100) <= 0) {
       continue;
     }
-    const net::Socket client = static_cast<net::Socket>(
-        ::accept(asSocket(listen_socket_), nullptr, nullptr));
+    const net::Socket client =
+        static_cast<net::Socket>(::accept(listener, nullptr, nullptr));
     if (!net::valid(client)) {
       continue;
     }
