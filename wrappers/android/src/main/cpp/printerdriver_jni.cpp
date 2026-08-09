@@ -2246,4 +2246,129 @@ Java_com_printerdriver_internal_NativeBridge_registerDrawerKick(
   return pd_register_drawer_kick(handle->driver, &reg) == 1 ? JNI_TRUE : JNI_FALSE;
 }
 
+// --- M19: the receipt DSL through the ABI (docs/receipt-dsl.md) -----------------------
+//
+// The same numbers-and-strings split the detection block above uses: the caller supplies
+// an IntArray the glue fills, and the variable-length half comes back as the return value.
+// The render report is read by index rather than through a callback, which is what
+// pd_render_report_at exists for -- a JNI upcall per degradation would attach a thread to
+// tell the caller about a missing barcode.
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_printerdriver_internal_NativeBridge_renderDslDocument(
+    JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jstring documentJson,
+    jstring modelJson, jint widthDots, jint cutClearanceDots, jint maxRowsPerBand,
+    jstring locale, jstring currency, jstring timeZone, jintArray values) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr || documentJson == nullptr) {
+    return env->NewByteArray(0);
+  }
+
+  const std::string document_text = JStringToStd(env, documentJson);
+  const std::string model_text = JStringToStd(env, modelJson);
+  const std::string locale_text = JStringToStd(env, locale);
+  const std::string currency_text = JStringToStd(env, currency);
+  const std::string tz_text = JStringToStd(env, timeZone);
+
+  pd_render_options options{};
+  options.width_dots = widthDots > 0 ? static_cast<uint32_t>(widthDots) : 0u;
+  options.cut_clearance_dots =
+      cutClearanceDots > 0 ? static_cast<uint16_t>(cutClearanceDots) : 0u;
+  options.max_rows_per_band = maxRowsPerBand > 0 ? static_cast<uint32_t>(maxRowsPerBand) : 0u;
+  options.locale = locale != nullptr ? locale_text.c_str() : nullptr;
+  options.currency = currency != nullptr ? currency_text.c_str() : nullptr;
+  options.tz = timeZone != nullptr ? tz_text.c_str() : nullptr;
+
+  pd_render_result result{};
+  const int32_t ok = pd_render_document(handle->driver, printer, document_text.c_str(),
+                                        modelJson != nullptr ? model_text.c_str() : nullptr,
+                                        &options, &result);
+
+  // Written on both paths: a refusal still carries a report, and the Kotlin side reads it
+  // through the same reader it would use for a degradation.
+  std::vector<jint> ints;
+  ints.push_back(static_cast<jint>(ok));
+  ints.push_back(static_cast<jint>(result.code_page));
+  ints.push_back(static_cast<jint>(result.has_cut));
+  ints.push_back(static_cast<jint>(result.cut));
+  ints.push_back(static_cast<jint>(result.top_feed_dots));
+  ints.push_back(static_cast<jint>(result.bottom_feed_dots));
+  ints.push_back(static_cast<jint>(result.report_count));
+  WriteInts(env, values, ints);
+
+  const jsize size = static_cast<jsize>(result.size);
+  jbyteArray bytes = env->NewByteArray(size);
+  if (bytes != nullptr && size > 0 && result.bytes != nullptr) {
+    env->SetByteArrayRegion(bytes, 0, size,
+                            reinterpret_cast<const jbyte*>(result.bytes));
+  }
+  return bytes;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_printerdriver_internal_NativeBridge_renderReportCount(JNIEnv*, jclass,
+                                                               jlong driverHandle) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  return handle == nullptr ? 0 : static_cast<jint>(pd_render_report_count(handle->driver));
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_com_printerdriver_internal_NativeBridge_renderReportAt(JNIEnv* env, jclass,
+                                                            jlong driverHandle, jint index,
+                                                            jintArray values) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_report_entry entry{};
+  if (handle == nullptr || pd_render_report_at(handle->driver, index, &entry) == 0) {
+    return EmptyStringArray(env);
+  }
+
+  std::vector<jint> ints;
+  ints.push_back(static_cast<jint>(entry.kind));
+  ints.push_back(static_cast<jint>(entry.path));
+  WriteInts(env, values, ints);
+
+  JStringList strings(env);
+  strings.add(entry.block);
+  strings.add(entry.requested);
+  strings.add(entry.delivered);
+  strings.add(entry.note);
+  return strings.release();
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_printerdriver_internal_NativeBridge_printDslDocument(
+    JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jstring documentJson,
+    jstring modelJson, jstring key, jint cut, jboolean openDrawer, jint preflight,
+    jint timeoutMs, jint topFeedDots, jint bottomFeedDots, jboolean suppressVerificationId) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (handle == nullptr || printer == nullptr || documentJson == nullptr) {
+    return 0;
+  }
+
+  const std::string document_text = JStringToStd(env, documentJson);
+  const std::string model_text = JStringToStd(env, modelJson);
+
+  std::string keyStorage;
+  pd_job_options options{};
+  BuildJobOptions(env, key, cut, openDrawer, preflight, timeoutMs, topFeedDots,
+                  bottomFeedDots, suppressVerificationId, &keyStorage, &options);
+
+  pd_job* job = pd_print_document_json(handle->driver, printer, document_text.c_str(),
+                                       modelJson != nullptr ? model_text.c_str() : nullptr,
+                                       &options, nullptr);
+  return job != nullptr ? reinterpret_cast<jlong>(job) : 0;
+}
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_reportKindName(
+    JNIEnv* env, jclass, jint value) {
+  return StdToJString(env, pd_report_kind_name(static_cast<pd_report_kind>(value)));
+}
+
+JNIEXPORT jstring JNICALL Java_com_printerdriver_internal_NativeBridge_renderPathName(
+    JNIEnv* env, jclass, jint value) {
+  return StdToJString(env, pd_render_path_name(static_cast<pd_render_path>(value)));
+}
+
 } // extern "C"

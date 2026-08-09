@@ -1379,15 +1379,14 @@ const char* pd_detection_status_name(pd_detection_status value);
  *   pd_register_formatter — backs {{ v | name:args }}, checked before the built-in table.
  *   pd_register_drawer_kick — fills PD_DRAWER_KICK_VENDOR for a profile.
  *
- * -- Which of the five fire through THIS header (docs/api.md §17.1) -------------------
- * The completion method, the probe step and the drawer kick are driven by the engine every
- * pd_print goes through, so a registration made here is called here. The block handler and
- * the formatter are consulted by the receipt-DSL render path, and that path has no entry
- * point in this ABI yet: the document tier below is a flat pd_op array, and the only C call
- * that renders a DSL document is pd_self_test, which lays out one fixed ticket. Both are
- * accepted and stored — they are how the C++ embedder, the agent and pdctl extend rendering
- * — but a caller reaching the core only through pd.h should expect them not to be invoked
- * until a pd_render_document entry point exists. Said here rather than discovered there.
+ * -- Which of the five fire through THIS header ---------------------------------------
+ * All five. The completion method, the probe step and the drawer kick are driven by the
+ * engine every pd_print goes through. The block handler and the formatter are consulted by
+ * the receipt-DSL render path, which M19 gave an entry point of its own: pd_render_document
+ * and pd_print_document_json at the end of this header parse, bind and render a DSL
+ * document with this driver's registries wired into all three stages, so a formatter
+ * registered here backs {{ v | name }} on a template printed here. Before M19 those two
+ * were accepted and stored but reachable only from C++, and this comment said so.
  *
  * -- Callback threads --------------------------------------------------------------
  * Every callback below is invoked on a CORE thread, never the caller's — the same
@@ -1547,6 +1546,191 @@ int32_t pd_register_drawer_kick(pd_driver* driver, const pd_drawer_kick_reg* reg
 const char* pd_match_kind_name(pd_match_kind value);
 
 /* ============================== end M16 ========================================== */
+
+/* =================================================================================
+ * M19 — THE RECEIPT DSL THROUGH THIS ABI (docs/receipt-dsl.md, docs/api.md §3)
+ * =================================================================================
+ *
+ * The document tier above is a flat pd_op array with five kinds. The receipt DSL — JSON
+ * documents, named styles, columns, barcodes, `each` loops, `{{placeholders}}` bound to a
+ * parameter model — is what the core actually renders receipts with, and until this block
+ * it had no entry point here: only C++ callers (pdctl, the agent) could reach it, and
+ * pd_register_formatter / pd_register_block_handler were registrations with no reachable
+ * call site from any wrapper. These two functions close that.
+ *
+ *   pd_render_document       bind + render + report, and NOTHING IS PRINTED. For a
+ *                            preview, for a designer, and for a caller that wants to see
+ *                            the declared degradations before committing paper.
+ *   pd_print_document_json   the same render, submitted through the ordinary fenced
+ *                            engine. Same worker, same preflight, same fences, same
+ *                            confidence grading, same pd_job — a template job proves
+ *                            exactly what a pd_print job proves, because it IS one.
+ *
+ * -- Degradations are declared, never silent ----------------------------------------
+ *
+ * A missing model path, an unknown formatter, a barcode on a profile whose render facets
+ * have no barcode path: all of these RENDER, and each one becomes an entry in the render
+ * report. That is the contract of docs/receipt-dsl.md and the same honesty rule as the
+ * job outcome — a declared degradation is not a failure, but it is never invisible.
+ *
+ * Only three things stop bytes being produced, and each returns 0/NULL with
+ * pd_last_error set AND a report entry explaining itself: JSON that is not JSON, a
+ * structure that is not a document, and a template submitted with no model. Nothing here
+ * ever prints a receipt full of unsubstituted `{{order.total}}`.
+ *
+ * -- Ownership ------------------------------------------------------------------------
+ *
+ * pd_render_result::bytes and every string reachable through pd_render_report_at are
+ * owned by the DRIVER and stay valid until the next pd_render_document or
+ * pd_print_document_json call on that same driver. Copy what you need before the next
+ * one, exactly as with pd_detected_at / pd_discovered_at.
+ */
+
+/* pd::dsl::ReportKind — what kind of departure from the document was declared. */
+typedef enum pd_report_kind {
+  PD_REPORT_MISSING_PATH = 0,         /* {{order.note}} with no such path in the model */
+  PD_REPORT_UNKNOWN_FORMATTER = 1,    /* {{v|frobnicate}} */
+  PD_REPORT_UNFORMATTABLE_VALUE = 2,  /* {{v|number:2}} where v is an object */
+  PD_REPORT_MALFORMED_TEMPLATE = 3,   /* an unterminated {{, an empty path — and the
+                                       * three hard failures listed above */
+  PD_REPORT_UNKNOWN_STYLE = 4,
+  PD_REPORT_STYLE_CYCLE = 5,          /* an `extends` chain that loops */
+  PD_REPORT_UNSUPPORTED_STYLE = 6,    /* italic, rotate90, a raster font on hardware */
+  PD_REPORT_UNSUPPORTED_BLOCK = 7,    /* a symbology this build cannot draw, or a block
+                                       * the profile has no hardware path for */
+  PD_REPORT_MISSING_IMAGE = 8,
+  PD_REPORT_TRUNCATED = 9,            /* content clipped to the media width */
+  PD_REPORT_EMPTY_ITERATION = 10,     /* `each` over a missing or non-array path */
+  PD_REPORT_UNSUPPORTED_TIMEZONE = 11,/* an IANA zone name: there is no tz database here */
+  PD_REPORT_RAW_FRAMING_RISK = 12,    /* a raw block carrying a cut or a status command */
+  PD_REPORT_NOTE = 13,                /* everything else worth telling the operator */
+  PD_REPORT_KIND_COUNT = 14
+} pd_report_kind;
+
+/* pd::dsl::RenderPath — how the entry's content reached the paper, if it did. */
+typedef enum pd_render_path {
+  PD_RENDER_PATH_HARDWARE = 0,     /* produced by ESC/POS commands */
+  PD_RENDER_PATH_RASTER = 1,       /* produced as an image */
+  PD_RENDER_PATH_NOT_RENDERED = 2, /* requested, deliberately absent from the output */
+  PD_RENDER_PATH_COUNT = 3
+} pd_render_path;
+
+/*
+ * One declared degradation. `block` is WHERE it happened, as a path into the document —
+ * "blocks[3].cells[1]", "meta.tz", or "document" for one that belongs to no block.
+ * `requested` and `delivered` are what the document asked for and what the paper got, in
+ * the words they are printed in; `note` is the reason, and is "" when the pair says it
+ * all. No string here is ever NULL.
+ */
+typedef struct pd_report_entry {
+  pd_report_kind kind;
+  const char* block;
+  const char* requested;
+  const char* delivered;
+  pd_render_path path;
+  const char* note;
+} pd_report_entry;
+
+/*
+ * All-zeroes is the useful call: the printer's own media, the document's own locale.
+ */
+typedef struct pd_render_options {
+  /* 0 -> this printer's printable width. Anything else lays the document out for a
+   * different media width, which is what a preview on a phone wants. */
+  uint32_t width_dots;
+  /* Extra whitespace before a MID-DOCUMENT cut block, in the same relationship to the
+   * profile as pd_job_options::bottom_feed_dots has to the trailing one: the renderer
+   * feeds max(profile blade clearance, this). More is always granted, less never. */
+  uint16_t cut_clearance_dots;
+  uint32_t max_rows_per_band; /* 0 -> 1024, for image blocks */
+  /* Non-empty values win over the document's own `meta`. NULL or "" defers to it. */
+  const char* locale;   /* "cs-CZ" */
+  const char* currency; /* "CZK" */
+  const char* tz;       /* a fixed offset, e.g. "+02:00" */
+} pd_render_options;
+
+/*
+ * The rendered receipt, plus what the document's `meta` asks the engine for.
+ *
+ * `cut`, `top_feed_dots` and `bottom_feed_dots` are REPORTED here and APPLIED by
+ * pd_print_document_json, under the precedence of docs/receipt-dsl.md: what the caller
+ * put in pd_job_options wins, the document's meta fills in what the caller left alone,
+ * and the profile answers what neither said. `has_cut` is 0 when the document asked for
+ * no particular cut.
+ */
+typedef struct pd_render_result {
+  const uint8_t* bytes; /* owned by the driver; see "Ownership" above */
+  size_t size;
+  pd_code_page code_page;
+
+  int32_t has_cut;
+  pd_cut cut;
+  uint32_t top_feed_dots;
+  uint32_t bottom_feed_dots;
+
+  /* Read them with pd_render_report_at. 0 means every block rendered as written. */
+  size_t report_count;
+} pd_render_result;
+
+/*
+ * Renders `document_json` against this printer's capability profile and returns the bytes
+ * and the report. NOTHING IS PRINTED and no job exists.
+ *
+ * `model_json` is the parameter model bound into a template ({{path.to.value}}, `each`,
+ * `if`), or NULL for a document that carries its own content. A document whose `template`
+ * flag is set and that is handed no model is refused rather than printed.
+ *
+ * `options` may be NULL. Returns 1 and fills `out_result`; on failure returns 0, sets
+ * pd_last_error, and still fills `out_result` — with no bytes and a report_count of at
+ * least one, so the caller can show the same list it would show for a degradation.
+ *
+ * Registered formatters and block handlers (pd_register_formatter,
+ * pd_register_block_handler) are consulted here: this is the call site those two
+ * registration points were always waiting for.
+ */
+int32_t pd_render_document(pd_driver* driver, pd_printer* printer,
+                           const char* document_json, const char* model_json,
+                           const pd_render_options* options, pd_render_result* out_result);
+
+/*
+ * The last render's report, by index — the same indexed-reader shape pd_detected_at uses,
+ * and for the same reason: a callback per entry would be unusable from an FFI runtime
+ * blocked inside the call that fires it.
+ *
+ * Returns 1 and fills `out`, or 0 when the index is out of range. Every string in `out`
+ * is owned by the driver and valid until the next pd_render_document or
+ * pd_print_document_json on it.
+ */
+int32_t pd_render_report_at(pd_driver* driver, int32_t index, pd_report_entry* out);
+
+/* How many entries pd_render_report_at will answer for. Same number as the last
+ * pd_render_result::report_count, readable without having kept the struct. */
+size_t pd_render_report_count(pd_driver* driver);
+
+/*
+ * Renders exactly as pd_render_document does, then submits the bytes through the ordinary
+ * engine and returns the pd_job — the same handle, the same event stream, the same
+ * tri-state result, the same idempotency-key dedupe as pd_print. There is no second
+ * engine and no bypass.
+ *
+ * The document's `meta` reaches the job through pd_job_options, under the precedence
+ * described on pd_render_result: an all-zeroes pd_job_options lets the document decide its
+ * own cut and margins, and any field the caller set explicitly wins over it.
+ *
+ * `out_result` may be NULL when the caller does not want the report; when it is not, it is
+ * filled on both the success and the failure path. NULL return means nothing was submitted
+ * — see pd_last_error and the report. A malformed document never becomes a blank receipt.
+ */
+pd_job* pd_print_document_json(pd_driver* driver, pd_printer* printer,
+                               const char* document_json, const char* model_json,
+                               const pd_job_options* job_options,
+                               pd_render_result* out_result);
+
+/* Static storage, never NULL, matching the core's own spelling one-for-one. */
+const char* pd_report_kind_name(pd_report_kind value);
+const char* pd_render_path_name(pd_render_path value);
+
+/* ============================== end M19 ========================================== */
 
 #ifdef __cplusplus
 }  /* extern "C" */

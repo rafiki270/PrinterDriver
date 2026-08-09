@@ -994,3 +994,148 @@ final class SelfTestResult {
   /// The ticket exactly as it was laid out, one entry per line.
   final List<String> ticketLines;
 }
+
+// --- M19: the receipt DSL (docs/receipt-dsl.md) --------------------------------------
+
+/// One declared degradation — `pd_report_entry`.
+///
+/// A missing model path, an unknown formatter and a barcode the profile cannot draw all
+/// land here, and the receipt still prints. A declared degradation is not a failure, but
+/// it is never silent.
+final class ReportEntry {
+  const ReportEntry({
+    required this.kind,
+    required this.block,
+    required this.requested,
+    required this.delivered,
+    required this.path,
+    required this.note,
+  });
+
+  /// Reads one entry the ABI's index reader filled. The strings are copied here: pd.h
+  /// owns them only until the next render on the same driver.
+  factory ReportEntry.fromNative(PdReportEntry entry) => ReportEntry(
+        kind: ReportKind.fromNative(entry.kind),
+        block: readNativeString(entry.block),
+        requested: readNativeString(entry.requested),
+        delivered: readNativeString(entry.delivered),
+        path: RenderPath.fromNative(entry.path),
+        note: readNativeString(entry.note),
+      );
+
+  final ReportKind kind;
+
+  /// Where it happened, as a path into the document — `blocks[3].cells[1]`, `meta.tz`,
+  /// or `document` for one that belongs to no block.
+  final String block;
+
+  /// What the document asked for, in the words it is printed in.
+  final String requested;
+
+  /// What the paper got. Often `omitted`.
+  final String delivered;
+
+  final RenderPath path;
+
+  /// Why, when the pair above does not say it all. Empty when it does.
+  final String note;
+
+  @override
+  String toString() {
+    final because = note.isEmpty ? '' : ' - $note';
+    return '$block  ${kind.name}: requested "$requested", delivered '
+        '"$delivered" [${path.name}]$because';
+  }
+}
+
+/// What a document asks the engine for, read back from its `meta` (docs/receipt-dsl.md
+/// "Cut control" and "Margins").
+///
+/// Reported by [RenderedDocument] and applied by `Printer.printDocument` under that
+/// document's precedence: what the caller put in [JobOptions] wins, this fills in what
+/// the caller left alone, and the printer's profile answers what neither said.
+final class DocumentMeta {
+  const DocumentMeta({
+    required this.cut,
+    required this.topFeedDots,
+    required this.bottomFeedDots,
+  });
+
+  /// Null when the document asked for no particular cut.
+  final CutSetting? cut;
+
+  /// Blank paper before the first content line. 0 when the document said nothing.
+  final int topFeedDots;
+
+  /// The *total* whitespace between the last content and the cut. The engine feeds
+  /// `max(the profile's blade clearance, this)`, so no document can clip its own trailer.
+  final int bottomFeedDots;
+}
+
+/// A rendered receipt-DSL document: the bytes a printer would receive, and everything
+/// that was declared along the way.
+final class RenderedDocument {
+  const RenderedDocument({
+    required this.bytes,
+    required this.codePage,
+    required this.meta,
+    required this.report,
+  });
+
+  /// The ESC/POS the renderer produced. Never the whole job: the engine adds its own
+  /// initialise, trailing feed, cut and completion fence around this.
+  final Uint8List bytes;
+
+  final CodePage codePage;
+
+  final DocumentMeta meta;
+
+  /// Empty when every block rendered exactly as written.
+  final List<ReportEntry> report;
+}
+
+/// Options for `Printer.renderDocument`. Every default defers to the printer and to the
+/// document.
+final class RenderDocumentOptions {
+  const RenderDocumentOptions({
+    this.widthDots = 0,
+    this.cutClearanceDots = 0,
+    this.maxRowsPerBand = 0,
+    this.locale,
+    this.currency,
+    this.timeZone,
+  });
+
+  /// 0 lays the document out for this printer's own configured width, which is what the
+  /// engine rasterizes to. Anything else previews a different media width.
+  final int widthDots;
+
+  /// Extra whitespace before a **mid-document** `cut` block. The renderer feeds
+  /// `max(the profile's blade clearance, this)`: more is always granted, less never.
+  final int cutClearanceDots;
+
+  /// 0 means 1024 — the Epson tall-image split, applied to `image` blocks.
+  final int maxRowsPerBand;
+
+  /// Overrides the document's own `meta.locale`. Null defers to it.
+  final String? locale;
+
+  /// Overrides `meta.currency`.
+  final String? currency;
+
+  /// Overrides `meta.tz`. A fixed offset such as `+02:00`; an IANA name is reported as a
+  /// [ReportKind.unsupportedTimezone] degradation, because a core that ships no
+  /// dependencies ships no timezone database.
+  final String? timeZone;
+
+  /// Writes this into a zeroed `pd_render_options`.
+  void fillNative(Arena arena, Pointer<PdRenderOptions> out) {
+    out.ref
+      ..widthDots = widthDots
+      ..cutClearanceDots = cutClearanceDots
+      ..maxRowsPerBand = maxRowsPerBand
+      ..locale = arena.string(locale)
+      ..currency = arena.string(currency)
+      ..tz = arena.string(timeZone);
+  }
+}

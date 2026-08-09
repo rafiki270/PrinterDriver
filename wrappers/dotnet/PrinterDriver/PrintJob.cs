@@ -16,6 +16,7 @@ public sealed class PrintJob
     private readonly List<Channel<JobEvent>> _channels = [];
     private bool _subscribed;
     private bool _driverDisposed;
+    private IReadOnlyList<ReportEntry> _renderReport = [];
 
     internal PrintJob(PrinterDriver driver, nint handle)
     {
@@ -42,6 +43,36 @@ public sealed class PrintJob
 
     /// <summary>True once the job has reached a terminal state.</summary>
     public bool IsTerminal => NativeMethods.pd_job_is_terminal(_handle) != 0;
+
+    /// <summary>
+    /// What the receipt-DSL renderer declared while producing this job's bytes
+    /// (docs/receipt-dsl.md).
+    /// </summary>
+    /// <remarks>
+    /// Empty for a job submitted through <see cref="Printer.Print"/>, whose payload tiers
+    /// have nothing to degrade. Non-empty means the ticket printed and something on it is
+    /// not what the document asked for — a barcode this profile cannot draw, a model path
+    /// that was not there — which is worth reading on the SUCCESS path, because a receipt
+    /// that printed with a dropped barcode is a receipt that printed.
+    /// </remarks>
+    public IReadOnlyList<ReportEntry> RenderReport
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _renderReport;
+            }
+        }
+    }
+
+    internal void SetRenderReport(IReadOnlyList<ReportEntry> report)
+    {
+        lock (_gate)
+        {
+            _renderReport = report;
+        }
+    }
 
     /// <summary>
     /// The verification identifier this job's ticket printed as <c>V:</c> — the wire token

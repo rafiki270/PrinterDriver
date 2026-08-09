@@ -378,6 +378,37 @@ internal static class NativeMethods
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nint pd_detection_status_name(int value);
 
+    // --- M19: the receipt DSL through the ABI (docs/receipt-dsl.md) -------------------
+    //
+    // Two entry points and an index reader. The report crosses as borrowed strings owned
+    // by the driver until the next render on it, so every one of them is copied into a
+    // managed string before this wrapper hands it back.
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_render_document(nint driver, nint printer,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string documentJson,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? modelJson,
+        in PdRenderOptions options, out PdRenderResult result);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_render_report_at(nint driver, int index,
+        out PdReportEntry entry);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nuint pd_render_report_count(nint driver);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_print_document_json(nint driver, nint printer,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string documentJson,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? modelJson,
+        in PdJobOptions jobOptions, nint result);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_report_kind_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_render_path_name(int value);
+
     // --- M16: custom method registration (docs/api.md §16) ----------------------------
     //
     // Five extension points, all per-driver, all data-plus-callbacks. Every callback here
@@ -716,6 +747,50 @@ internal struct PdDetectionSummary
     public nint ProvenanceSummary;
     public nint Degradations;
     public nuint DegradationCount;
+}
+
+/// <summary>
+/// <c>pd_render_options</c>. All-zeroes means this printer's own media and the document's
+/// own locale.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdRenderOptions
+{
+    public uint WidthDots;
+    public ushort CutClearanceDots;
+    public uint MaxRowsPerBand;
+    public nint Locale;
+    public nint Currency;
+    public nint TimeZone;
+}
+
+/// <summary>
+/// <c>pd_render_result</c>. <c>Bytes</c> and every string behind the report are owned by
+/// the driver until the next render on it.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdRenderResult
+{
+    public nint Bytes;
+    public nuint Size;
+    public int CodePage;
+    public int HasCut;
+    public int Cut;
+    public uint TopFeedDots;
+    public uint BottomFeedDots;
+    public nuint ReportCount;
+}
+
+/// <summary><c>pd_report_entry</c> — one declared degradation, read back by index.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdReportEntry
+{
+    public int Kind;
+    public nint Block;
+    public nint Requested;
+    public nint Delivered;
+    public int Path;
+    public nint Note;
 }
 
 [StructLayout(LayoutKind.Sequential)]

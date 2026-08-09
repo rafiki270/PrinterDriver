@@ -73,6 +73,25 @@ struct pd_self_test_storage {
   std::string result_method = "none";
 };
 
+// M19. Backing storage for the last pd_render_document / pd_print_document_json answer.
+// The bytes and every string pd_render_report_at hands out as `const char*` need an owner
+// that outlives the call, and pd.h promises that owner is the driver, valid until the next
+// render on it — the same contract, and the same reusable-slot shape, as the detection
+// readers above.
+struct pd_report_storage {
+  pd_report_kind kind = PD_REPORT_NOTE;
+  pd_render_path path = PD_RENDER_PATH_HARDWARE;
+  std::string block;
+  std::string requested;
+  std::string delivered;
+  std::string note;
+};
+
+struct pd_render_storage {
+  std::vector<uint8_t> bytes;
+  std::vector<pd_report_storage> entries;
+};
+
 struct pd_driver {
   std::unique_ptr<pd::PrinterDriver> driver;
   std::mutex mutex;
@@ -97,6 +116,8 @@ struct pd_driver {
   std::string detected_hex;
   std::string discovered_ip;
   std::string discovered_hex;
+  // M19. The last rendered document, kept for the same reason.
+  pd_render_storage render;
 };
 
 namespace pd {

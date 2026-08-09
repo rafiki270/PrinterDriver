@@ -146,9 +146,8 @@ fun PrinterDriver.registerProbeStep(
  * Registers a renderer for a new DSL block kind. A handler registered for a kind always
  * owns it: unknown kinds otherwise degrade, and this intercepts first.
  *
- * The core stores this and the receipt-DSL render path calls it -- but that path has no
- * entry point in pd.h yet, so a registration made from Kotlin is not reached by
- * [Printer.print] today. See docs/api.md section 17.1.
+ * Reached through [Printer.renderDocument] and [Printer.printDocument] -- the receipt-DSL
+ * entry points -- not through [Printer.print], whose payload tiers have no block kinds.
  *
  * @param kind the block object key that selects this handler.
  * @param render receives the block object as JSON and a small JSON of the render profile
@@ -178,8 +177,8 @@ fun PrinterDriver.registerBlockHandler(
  * Registers a template formatter, backing `{{ v | name:args }}` and checked before the
  * built-in table. Returning null from [format] declines and falls through to the built-ins.
  *
- * Same reachability caveat as [registerBlockHandler]: the template layer is not in pd.h
- * yet (docs/api.md section 17.1).
+ * Consulted wherever a template is bound: [Printer.renderDocument],
+ * [Printer.printDocument] and this driver's self-test tickets.
  *
  * @throws PrinterDriverException on a bad or duplicate name.
  */

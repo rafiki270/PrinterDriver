@@ -1464,6 +1464,348 @@ static void test_other_registration_points_are_wired(void) {
   pd_destroy(driver);
 }
 
+/* --- M19: the receipt DSL through the ABI (docs/receipt-dsl.md) -------------------- */
+
+/* The documents below are written once and used by several cases, because the point of
+ * each case is what the SAME document does on a different profile or through a different
+ * entry point. */
+
+/* A plain (non-template) document: one line of text and one Code 128 symbol. */
+static const char kBarcodeDocument[] =
+    "{\"v\":1,\"blocks\":["
+    "{\"text\":\"WIDGET CO\"},"
+    "{\"barcode\":\"12345670\",\"symbology\":\"code128\"}]}";
+
+/* A template: an `each` loop over a model array, and the built-in `upper` formatter on
+ * two of the placeholders. Nothing here is renderable without a model. */
+static const char kOrderTemplate[] =
+    "{\"v\":1,\"template\":true,"
+    "\"meta\":{\"cut\":\"full\",\"margins\":{\"topDots\":24}},"
+    "\"blocks\":["
+    "{\"text\":\"{{venue.name|upper}}\"},"
+    "{\"each\":\"order.items\",\"block\":{\"text\":\"{{qty}}x {{name|upper}}\"}}]}";
+
+static const char kOrderModel[] =
+    "{\"venue\":{\"name\":\"my restaurant\"},"
+    "\"order\":{\"items\":["
+    "{\"qty\":2,\"name\":\"pilsner\"},"
+    "{\"qty\":1,\"name\":\"goulash\"}]}}";
+
+/* memmem is not C11, so the byte search a render assertion needs lives here. */
+static int bytes_contain(const uint8_t* haystack, size_t size, const char* needle) {
+  const size_t length = strlen(needle);
+  size_t i;
+  if (haystack == NULL || length == 0 || length > size) {
+    return 0;
+  }
+  for (i = 0; i + length <= size; ++i) {
+    if (memcmp(haystack + i, needle, length) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* 1 when the last render reported an entry of this kind, and copies it into `out`. */
+static int find_report_entry(pd_driver* driver, pd_report_kind kind,
+                            pd_report_entry* out) {
+  const size_t count = pd_render_report_count(driver);
+  size_t i;
+  for (i = 0; i < count; ++i) {
+    pd_report_entry entry;
+    memset(&entry, 0, sizeof(entry));
+    if (pd_render_report_at(driver, (int32_t)i, &entry) == 1 && entry.kind == kind) {
+      *out = entry;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* --- m1. A declared degradation crosses the ABI intact ----------------------------
+ *
+ * docs/receipt-dsl.md's degradation contract: a barcode on a profile with no GS k path
+ * is OMITTED AND DECLARED, never emitted as a command the firmware would print as
+ * literal text. The rest of the document still renders, which is what makes the report
+ * the only way to know. And nothing prints: pd_render_document has no job. */
+static void test_render_document_declares_a_barcode_degradation(void) {
+  pd_driver* driver = pd_create(NULL);
+  pd_printer* printer;
+  pd_render_result result;
+  pd_report_entry entry;
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+
+  printer = pd_add_printer_scripted(driver, "capi-render-nobarcode", "no-barcode");
+  CHECK(printer != NULL);
+
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_render_document(driver, printer, kBarcodeDocument, NULL, NULL, &result), 1);
+  CHECK_STREQ(pd_last_error(driver), "");
+  /* The text block still produced bytes: a degradation is not a failure. */
+  CHECK(result.size > 0);
+  CHECK(bytes_contain(result.bytes, result.size, "WIDGET CO"));
+  /* ...and no GS k went out. The digits are not searched for: a Code 128 symbol encodes
+   * them, so their absence would prove nothing about the command. */
+  CHECK(!bytes_contain(result.bytes, result.size, "\x1D\x6B"));
+
+  CHECK_EQ(result.report_count, 1);
+  CHECK_EQ(pd_render_report_count(driver), result.report_count);
+  memset(&entry, 0, sizeof(entry));
+  CHECK_EQ(find_report_entry(driver, PD_REPORT_UNSUPPORTED_BLOCK, &entry), 1);
+  /* Where, what was asked for, what arrived, and by which path — the six facts a
+   * support engineer needs, none of them an opaque string. */
+  CHECK_STREQ(entry.block, "blocks[1]");
+  CHECK(strstr(entry.requested, "code128") != NULL);
+  CHECK_STREQ(entry.delivered, "omitted");
+  CHECK_EQ(entry.path, PD_RENDER_PATH_NOT_RENDERED);
+  CHECK(strlen(entry.note) > 0);
+  CHECK_STREQ(pd_report_kind_name(entry.kind), "unsupportedBlock");
+  CHECK_STREQ(pd_render_path_name(entry.path), "notRendered");
+
+  /* Out of range is 0, not a crash. */
+  CHECK_EQ(pd_render_report_at(driver, (int32_t)result.report_count, &entry), 0);
+  CHECK_EQ(pd_render_report_at(driver, -1, &entry), 0);
+
+  /* Rendering is not printing. */
+  CHECK_EQ(pd_test_print_data_bytes(printer), 0);
+  CHECK_EQ(pd_test_cuts(printer), 0);
+
+  /* The same document on a printer whose profile HAS the barcode path renders it and
+   * reports nothing — so the entry above is the profile speaking, not the parser. */
+  {
+    pd_printer* healthy = pd_add_printer_scripted(driver, "capi-render-ok", "ok");
+    CHECK(healthy != NULL);
+    memset(&result, 0, sizeof(result));
+    CHECK_EQ(pd_render_document(driver, healthy, kBarcodeDocument, NULL, NULL, &result), 1);
+    CHECK_EQ(result.report_count, 0);
+    CHECK_EQ(pd_render_report_count(driver), 0);
+    CHECK(result.size > 0);
+    CHECK(bytes_contain(result.bytes, result.size, "\x1D\x6B"));
+  }
+
+  pd_destroy(driver);
+}
+
+/* --- m2. A template goes through the ordinary engine ------------------------------
+ *
+ * The `each` loop repeats, the `upper` formatter fires, the document's `meta` reaches the
+ * job, and the bytes the loop produced are the bytes the device received. The job is an
+ * ordinary pd_job: same states, same tri-state result, same grading as pd_print. */
+static void test_print_document_json_prints_a_bound_template(void) {
+  pd_driver* driver = pd_create(NULL);
+  pd_printer* printer;
+  pd_job_options options;
+  pd_render_result rendered;
+  pd_job* job;
+  pd_job_result result;
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+
+  printer = pd_add_printer_scripted(driver, "capi-doc-print", "ok");
+  CHECK(printer != NULL);
+
+  memset(&options, 0, sizeof(options));
+  options.key = "capi-doc-1";
+
+  memset(&rendered, 0, sizeof(rendered));
+  job = pd_print_document_json(driver, printer, kOrderTemplate, kOrderModel, &options,
+                               &rendered);
+  CHECK(job != NULL);
+  if (job == NULL) {
+    pd_destroy(driver);
+    return;
+  }
+  /* Everything bound and everything rendered. */
+  CHECK_EQ(rendered.report_count, 0);
+  /* The document's meta came back for the caller to see, and was applied to the job:
+   * an all-zeroes pd_job_options means "the document decides". */
+  CHECK_EQ(rendered.has_cut, 1);
+  CHECK_EQ(rendered.cut, PD_CUT_FULL);
+  CHECK_EQ(rendered.top_feed_dots, 24);
+  CHECK_EQ(rendered.bottom_feed_dots, 0);
+
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_job_await(driver, job, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+  CHECK_EQ(result.confidence, PD_CONFIDENCE_CUT_FAULT_FREE);
+  CHECK_EQ(result.grade, PD_GRADE_A_JOB_LEVEL_CONFIRMATION);
+  CHECK_STREQ(result.method, "GS(H) fn48");
+  CHECK_STREQ(pd_job_key(job), "capi-doc-1");
+
+  /* The wire carries what the template said it would: the formatter ran on the venue
+   * name, and the `each` produced one line per model element, in order. */
+  CHECK(pd_test_received_contains(printer, "MY RESTAURANT"));
+  CHECK(pd_test_received_contains(printer, "2x PILSNER"));
+  CHECK(pd_test_received_contains(printer, "1x GOULASH"));
+  /* Unbound placeholders never reach paper. */
+  CHECK(!pd_test_received_contains(printer, "{{"));
+  CHECK_EQ(pd_test_cuts(printer), 1);
+
+  /* Rule 2 of the idempotency contract holds through this entry point too: the same key
+   * does not print twice, it returns the same handle. */
+  {
+    pd_job* again = pd_print_document_json(driver, printer, kOrderTemplate, kOrderModel,
+                                           &options, NULL);
+    CHECK(again == job);
+    CHECK_EQ(pd_test_cuts(printer), 1);
+  }
+
+  pd_destroy(driver);
+}
+
+/* --- m3. A registered formatter fires through this path ---------------------------
+ *
+ * The call site pd_register_formatter was always waiting for (docs/api.md §16 and §17.1):
+ * before M19 the core stored the registration and no C-reachable code consulted it. The
+ * control is the same template on a driver that never registered it — the placeholder
+ * comes back unformatted with an UnknownFormatter entry. */
+static size_t acme_stars(void* ctx, const char* value, const char* args,
+                        const char* locale, char* out, size_t cap, int32_t* handled) {
+  size_t length;
+  (void)args;
+  (void)locale;
+  *(int*)ctx += 1; /* the counter proves the core called us, not that we could be called */
+  length = strlen(value) + 6;
+  if (length >= cap) {
+    return cap + 1; /* over cap is the registration's error, never a silent truncation */
+  }
+  strcpy(out, "***");
+  strcat(out, value);
+  strcat(out, "***");
+  *handled = 1;
+  return length;
+}
+
+static void test_registered_formatter_fires_through_the_render_path(void) {
+  static const char kStarTemplate[] =
+      "{\"v\":1,\"template\":true,\"blocks\":[{\"text\":\"{{item|acme.stars}}\"}]}";
+  static const char kStarModel[] = "{\"item\":\"tip\"}";
+
+  pd_driver* driver;
+  pd_printer* printer;
+  pd_formatter formatter;
+  pd_render_result result;
+  pd_report_entry entry;
+  int calls = 0;
+
+  /* The control first: no registration, so the name is unknown. */
+  driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+  printer = pd_add_printer_scripted(driver, "capi-fmt-control", "ok");
+  CHECK(printer != NULL);
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_render_document(driver, printer, kStarTemplate, kStarModel, NULL, &result), 1);
+  CHECK_EQ(find_report_entry(driver, PD_REPORT_UNKNOWN_FORMATTER, &entry), 1);
+  CHECK(!bytes_contain(result.bytes, result.size, "***tip***"));
+  pd_destroy(driver);
+
+  /* Now with the registration in place, on the same template. */
+  driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+  memset(&formatter, 0, sizeof(formatter));
+  formatter.name = "acme.stars";
+  formatter.formatter = acme_stars;
+  formatter.ctx = &calls;
+  CHECK_EQ(pd_register_formatter(driver, &formatter), 1);
+
+  printer = pd_add_printer_scripted(driver, "capi-fmt", "ok");
+  CHECK(printer != NULL);
+
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_render_document(driver, printer, kStarTemplate, kStarModel, NULL, &result), 1);
+  CHECK_EQ(result.report_count, 0);
+  CHECK(calls > 0);
+  CHECK(bytes_contain(result.bytes, result.size, "***tip***"));
+
+  /* And through the printing path, so the registration is not a preview-only effect. */
+  {
+    pd_job* job = pd_print_document_json(driver, printer, kStarTemplate, kStarModel, NULL,
+                                         NULL);
+    pd_job_result outcome;
+    CHECK(job != NULL);
+    memset(&outcome, 0, sizeof(outcome));
+    CHECK_EQ(pd_job_await(driver, job, 5000, &outcome), 1);
+    CHECK_EQ(outcome.outcome, PD_OUTCOME_DONE);
+    CHECK(pd_test_received_contains(printer, "***tip***"));
+  }
+
+  pd_destroy(driver);
+}
+
+/* --- m4. Failures are explained, and never printed --------------------------------
+ *
+ * Three things stop bytes being produced, and each of them has to arrive as a clear
+ * error PLUS a report entry — never a crash, and never a blank receipt, which on a
+ * counter looks like a printer fault and sends somebody to check the paper. */
+static void test_malformed_documents_are_refused_with_a_report(void) {
+  pd_driver* driver = pd_create(NULL);
+  pd_printer* printer;
+  pd_render_result result;
+  pd_report_entry entry;
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+  printer = pd_add_printer_scripted(driver, "capi-doc-bad", "ok");
+  CHECK(printer != NULL);
+
+  /* (a) not JSON at all. */
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_render_document(driver, printer, "this is not json", NULL, NULL, &result), 0);
+  CHECK(strlen(pd_last_error(driver)) > 0);
+  CHECK_EQ(result.size, 0);
+  CHECK(result.bytes == NULL);
+  CHECK(result.report_count >= 1);
+  CHECK_EQ(find_report_entry(driver, PD_REPORT_MALFORMED_TEMPLATE, &entry), 1);
+  CHECK_EQ(entry.path, PD_RENDER_PATH_NOT_RENDERED);
+
+  /* (b) JSON, but not a document: a block with no recognised key. */
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_render_document(driver, printer, "{\"v\":1,\"blocks\":[{\"nope\":1}]}", NULL,
+                              NULL, &result),
+           0);
+  CHECK(result.report_count >= 1);
+
+  /* (c) a template with no model. Printing the placeholders would be worse than printing
+   * nothing, because it looks like a receipt. */
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_render_document(driver, printer, kOrderTemplate, NULL, NULL, &result), 0);
+  CHECK(strstr(pd_last_error(driver), "model") != NULL);
+  CHECK_EQ(find_report_entry(driver, PD_REPORT_MALFORMED_TEMPLATE, &entry), 1);
+
+  /* (d) a model that is not JSON. */
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_render_document(driver, printer, kOrderTemplate, "{oops", NULL, &result), 0);
+  CHECK(result.report_count >= 1);
+
+  /* None of the four submitted anything, and neither does the printing entry point. */
+  memset(&result, 0, sizeof(result));
+  CHECK(pd_print_document_json(driver, printer, "this is not json", NULL, NULL, &result) ==
+        NULL);
+  CHECK(strlen(pd_last_error(driver)) > 0);
+  CHECK(result.report_count >= 1);
+  CHECK_EQ(pd_test_print_data_bytes(printer), 0);
+  CHECK_EQ(pd_test_cuts(printer), 0);
+
+  /* A null document is refused rather than dereferenced, and so is a null out. */
+  CHECK_EQ(pd_render_document(driver, printer, NULL, NULL, NULL, &result), 0);
+  CHECK_EQ(pd_render_document(driver, printer, kBarcodeDocument, NULL, NULL, NULL), 0);
+  CHECK(pd_print_document_json(driver, printer, NULL, NULL, NULL, NULL) == NULL);
+
+  pd_destroy(driver);
+}
+
 int main(void) {
   test_submit_reaches_terminal_done();
   test_verification_identifier_round_trip();
@@ -1487,6 +1829,10 @@ int main(void) {
   test_custom_completion_method_earns_the_registered_grade();
   test_unregistered_vendor_idle_is_unsupported();
   test_other_registration_points_are_wired();
+  test_render_document_declares_a_barcode_degradation();
+  test_print_document_json_prints_a_bound_template();
+  test_registered_formatter_fires_through_the_render_path();
+  test_malformed_documents_are_refused_with_a_report();
 
   if (g_failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", g_failures);

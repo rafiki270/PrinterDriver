@@ -850,3 +850,100 @@ enum DetectionStatus {
     return unrecognized;
   }
 }
+
+// --- M19: the receipt DSL's render report (docs/receipt-dsl.md) ---------------------
+
+/// What kind of departure from the document was declared — `pd_report_kind`.
+///
+/// Every one of these RENDERS: the receipt still prints and the entry says what it lost.
+/// That is the degradation contract of docs/receipt-dsl.md — a declared degradation is
+/// not a failure, but it is never silent either.
+enum ReportKind {
+  /// `{{order.note}}` with no such path in the model.
+  missingPath(0),
+
+  /// `{{v|frobnicate}}`.
+  unknownFormatter(1),
+
+  /// `{{v|number:2}}` where `v` is an object.
+  unformattableValue(2),
+
+  /// An unterminated `{{`, an empty path — and the three hard failures that stop bytes
+  /// being produced at all: JSON that is not JSON, a structure that is not a document,
+  /// and a template submitted with no model.
+  malformedTemplate(3),
+
+  unknownStyle(4),
+
+  /// An `extends` chain that loops.
+  styleCycle(5),
+
+  /// Italic, `rotate90`, a raster font on the hardware path.
+  unsupportedStyle(6),
+
+  /// A symbology this build cannot draw, or a block this profile has no hardware for.
+  unsupportedBlock(7),
+
+  missingImage(8),
+
+  /// Content clipped to fit the media width.
+  truncated(9),
+
+  /// `each` over a missing or non-array path.
+  emptyIteration(10),
+
+  /// An IANA zone name: this core ships no timezone database.
+  unsupportedTimezone(11),
+
+  /// A `raw` block carrying a cut or a status command — the core owns job termination.
+  rawFramingRisk(12),
+
+  /// Everything else worth telling the operator.
+  note(13),
+
+  /// A `pd_report_kind` this build does not know.
+  unrecognized(-1);
+
+  const ReportKind(this.nativeValue);
+
+  final int nativeValue;
+
+  /// Mirrors `PD_REPORT_KIND_COUNT`.
+  static const int nativeCount = 14;
+
+  static ReportKind fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
+}
+
+/// How an entry's content reached the paper, if it did — `pd_render_path`.
+enum RenderPath {
+  /// Produced by ESC/POS commands.
+  hardware(0),
+
+  /// Produced as an image.
+  raster(1),
+
+  /// Requested, and deliberately absent from the output.
+  notRendered(2),
+
+  /// A `pd_render_path` this build does not know.
+  unrecognized(-1);
+
+  const RenderPath(this.nativeValue);
+
+  final int nativeValue;
+
+  /// Mirrors `PD_RENDER_PATH_COUNT`.
+  static const int nativeCount = 3;
+
+  static RenderPath fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
+}
