@@ -468,8 +468,7 @@ final class PrinterDriverBindings {
                 Pointer<PdTransportVtable>, Pointer<Void>, Pointer<Char>, int)>(
           'pd_add_printer_custom',
         ),
-        transportFeedBytes = library.lookupFunction<
-            _PdTransportFeedBytesNative,
+        transportFeedBytes = library.lookupFunction<_PdTransportFeedBytesNative,
             int Function(Pointer<PdPrinter>, Pointer<Uint8>, int)>(
           'pd_transport_feed_bytes',
         ),
@@ -485,8 +484,9 @@ final class PrinterDriverBindings {
         printerCompletion = library.lookupFunction<_PdPrinterCompletionNative,
             int Function(Pointer<PdPrinter>)>('pd_printer_completion'),
         printerCompletionProvenance = library.lookupFunction<
-                _PdPrinterProvenanceNative, int Function(Pointer<PdPrinter>)>(
-            'pd_printer_completion_provenance'),
+            _PdPrinterProvenanceNative,
+            int Function(
+                Pointer<PdPrinter>)>('pd_printer_completion_provenance'),
         printerLanguage = library.lookupFunction<_PdPrinterLanguageNative,
             int Function(Pointer<PdPrinter>)>('pd_printer_language'),
         printerStatus = library.lookupFunction<_PdPrinterStatusNative,
@@ -605,9 +605,14 @@ final class PrinterDriverBindings {
   // --- Printers ---
   final Pointer<PdPrinter> Function(Pointer<PdDriver>, Pointer<PdTcpConfig>)
       addPrinterTcp;
-  final Pointer<PdPrinter> Function(Pointer<PdDriver>, Pointer<PdTransportVtable>,
-      Pointer<Void>, Pointer<Char>, int) addPrinterCustom;
-  final int Function(Pointer<PdPrinter>, Pointer<Uint8>, int) transportFeedBytes;
+  final Pointer<PdPrinter> Function(
+      Pointer<PdDriver>,
+      Pointer<PdTransportVtable>,
+      Pointer<Void>,
+      Pointer<Char>,
+      int) addPrinterCustom;
+  final int Function(Pointer<PdPrinter>, Pointer<Uint8>, int)
+      transportFeedBytes;
   final int Function(Pointer<PdPrinter>, Pointer<Char>) transportLinkDropped;
   final Pointer<Char> Function(Pointer<PdPrinter>) printerId;
   final int Function(Pointer<PdPrinter>) printerWidthDots;

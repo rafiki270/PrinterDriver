@@ -91,18 +91,58 @@ banner and the attempt counter.
 printer to ask whether it is still there.
 
 `PrintJob.events` is the job's recorded history: every `JobEvent` the core wrote, in
-order, ending with a terminal one. **It is delivered when the job settles rather than
-transition by transition**, and that is a limitation of the current C ABI rather than a
-choice: `pd_subscribe_job` hands its callback a `const pd_job_event*` that points at a
-temporary of the emitting worker thread's stack frame, and a Dart
-`NativeCallable.listener` — the only callback kind a foreign thread may invoke — runs
-after that call has returned, so it cannot read through that pointer. This package
-therefore uses the listener purely as a wake-up and takes the event data from the
-synchronous replay `pd_subscribe_job` performs on the calling thread once the job is
-terminal, where the pointer is alive. Nothing is lost, reordered or invented;
-`PrintJob.currentState` is a live read for a progress indicator that needs one. An ABI
-that handed out an event outliving its callback — by value, or with storage the driver
-owns — would make the stream live, and nothing else here would change.
+order, ending with a terminal one. It is **live** — each transition arrives as the core
+records it, not as a batch once the job settles — because `pd_subscribe_job` hands its
+callback the event *by value*. That is what a Dart `NativeCallable.listener`, the only
+callback kind a foreign thread may invoke, needs: the listener runs after the native
+call has already returned, so anything reached through a pointer into the emitting
+worker's stack frame would be gone by then, and a copy has no such lifetime.
+
+Subscribing late loses nothing: a new subscription replays what has happened so far
+before following the rest, and the stream closes after the terminal event. Ordering is
+the core's guarantee rather than this wrapper's.
+
+## Bluetooth, and other links you own
+
+Bluetooth is not in the core and should not be: on Apple it is CoreBluetooth or MFi, on
+Android a `BluetoothSocket` over RFCOMM, on Linux a BlueZ socket — three platform
+frameworks with their own permissions models, pairing UI and threading. So the split is
+**the platform owns the socket, the core owns the protocol**: you supply three
+operations, and the ordered fence, preflight, journal and confidence grading stay where
+they are. A printer reached this way reports the same grade, authority and method a TCP
+printer reports; `test/custom_transport_test.dart` asserts exactly that.
+
+```dart
+final transport = CustomTransport.fromLibrary(
+  myPlugin,                       // your own .so/.framework
+  connect: 'my_bt_connect',
+  write: 'my_bt_write',
+  close: 'my_bt_close',
+  ctx: session,
+  description: 'bt-spp:00:11:22:33:44:55',   // the printer id derives from this
+);
+final printer = driver.addCustomPrinter(transport, profileId: 'epson_tm_p20ii');
+
+// The receive direction is ordinary Dart, from any isolate, at any time:
+socket.listen(printer.feedBytes, onDone: () => printer.reportLinkDropped('closed'));
+```
+
+`connect` and `write` are **native function pointers, not Dart closures**, and that is
+forced rather than preferred. The core calls them on its own worker thread and needs an
+answer there and then — did the link open, how many bytes actually went out — and no
+`dart:ffi` callback can do that: `NativeCallable.isolateLocal` aborts the process when
+invoked off its isolate's thread, `NativeCallable.listener` is the one form a foreign
+thread may invoke but supports `void` returns only (behind `write` the core would read
+an uninitialised register as the byte count), and `NativeCallable.isolateGroupBound` is
+experimental and runs with no isolate entered, so the callback crashes the moment it
+touches Dart state. A wrapper that guessed at "did the bytes go out" would be the one
+lie this SDK exists to remove, so it does not guess. `CustomTransport.withDartClose`
+does take a Dart function, because close returns nothing and the core waits for no
+answer.
+
+The one rule to respect: pd.h forbids feeding bytes from inside `connect`/`write`/
+`close`, since those run on the thread that would have to deliver them. Through this API
+that is unreachable — no Dart code runs inside `connect` or `write` at all.
 
 ## Shipping the native library
 

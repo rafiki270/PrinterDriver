@@ -283,7 +283,8 @@ void main() {
       final firstSendStarted = Completer<void>();
       final subscription = job.events.listen((event) {
         seen.add(event.state);
-        if (event.state == JobState.sendStarted && !firstSendStarted.isCompleted) {
+        if (event.state == JobState.sendStarted &&
+            !firstSendStarted.isCompleted) {
           firstSendStarted.complete();
         }
       });
@@ -458,6 +459,42 @@ void main() {
       expect(printer.completion, CompletionMechanism.gsParenH);
       expect(driver.profileIds, contains('generic'));
       expect(driver.lastError, isEmpty);
+    });
+
+    test('a profile says where its completion claim comes from', () {
+      // docs/compatibility-brief.md §28. Provenance is not a confidence level and
+      // changes nothing about what a job reports: it answers the earlier question of
+      // whether a fence can be trusted on the strength of a profile alone. Epson is the
+      // only family whose shipped defaults say Documented — everyone else's "ESC/POS
+      // compatible" is a datasheet claim nobody has checked, which is exactly the
+      // reading that makes probing a site's hardware worth the trip.
+      const expected = <String, (Provenance, CommandLanguage)>{
+        'epson_tm_t88vi': (Provenance.documented, CommandLanguage.escPos),
+        'epson_tm_p20ii': (Provenance.documented, CommandLanguage.escPos),
+        'xp-s260m': (Provenance.probed, CommandLanguage.escPos),
+        'xprinter_s_series': (Provenance.unverified, CommandLanguage.escPos),
+        'rongta_rp80': (Provenance.unverified, CommandLanguage.escPos),
+        'partner_rp110': (Provenance.unverified, CommandLanguage.escPos),
+        'generic_unknown': (Provenance.unverified, CommandLanguage.escPos),
+        // Not ESC/POS at any level, and the profile says so before a job is submitted
+        // rather than after a roll has been spooled with the wrong language.
+        'zebra_zq600_plus': (Provenance.unverified, CommandLanguage.zpl),
+        'brother_rj4000': (
+          Provenance.unverified,
+          CommandLanguage.brotherRaster
+        ),
+      };
+
+      expected.forEach((profileId, answer) {
+        final (provenance, language) = answer;
+        // Nothing is dialled until a job needs the link, so this reads profile data
+        // without touching the network.
+        final printer =
+            driver.addTcpPrinter(host: '127.0.0.1', profileId: profileId);
+        expect(printer.completionProvenance, provenance,
+            reason: '$profileId provenance');
+        expect(printer.language, language, reason: '$profileId language');
+      });
     });
 
     test(

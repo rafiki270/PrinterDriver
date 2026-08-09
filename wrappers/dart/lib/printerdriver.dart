@@ -225,8 +225,12 @@ final class PrinterDriver {
     });
     if (handle == nullptr) {
       // Nothing took ownership, so the close hook would otherwise outlive its only
-      // possible caller.
-      transport.release();
+      // possible caller — unless this same transport is already driving a printer, in
+      // which case releasing it here would pull the trampoline out from under a link
+      // the core is still using.
+      if (!_transports.contains(transport)) {
+        transport.release();
+      }
       throw PrinterDriverException(lastError);
     }
     _transports.add(transport);
