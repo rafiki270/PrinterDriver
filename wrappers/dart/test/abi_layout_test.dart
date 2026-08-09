@@ -30,6 +30,8 @@ void main() {
       expect(sizeOf<PdTcpConfig>(), 40);
       expect(sizeOf<PdJobOptions>(), 40);
       expect(sizeOf<PdReprintOptions>(), 48);
+      // Three function pointers and the description.
+      expect(sizeOf<PdTransportVtable>(), 32);
     });
 
     test('the payload union is one storage area shared by the three tiers', () {

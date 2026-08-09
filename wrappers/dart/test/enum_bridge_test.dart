@@ -77,8 +77,8 @@ void main() {
           CodePage.values.where((v) => v != CodePage.unrecognized);
       final binarizations =
           Binarization.values.where((v) => v != Binarization.unrecognized);
-      final grades =
-          ConfidenceGrade.values.where((v) => v != ConfidenceGrade.unrecognized);
+      final grades = ConfidenceGrade.values
+          .where((v) => v != ConfidenceGrade.unrecognized);
       final authorities = CompletionAuthority.values
           .where((v) => v != CompletionAuthority.unrecognized);
 
@@ -120,8 +120,8 @@ void main() {
             codePages.map((v) => v.nativeValue).toList()),
         _Mirror(PdTestEnum.binarization, Binarization.nativeCount,
             binarizations.map((v) => v.nativeValue).toList()),
-        // The core spells these A_JobLevelConfirmation..E_TransportOnly, which the
-        // Dart member names carry as aJobLevelConfirmation..eTransportOnly.
+        // The core spells these APlus_DurableQueryableJob..E_TransportOnly, which the
+        // Dart member names carry as aPlusDurableQueryableJob..eTransportOnly.
         _Mirror(PdTestEnum.confidenceGrade, ConfidenceGrade.nativeCount,
             grades.map((v) => v.nativeValue).toList(),
             expectedNames: const <String>[
@@ -254,8 +254,12 @@ void main() {
       expect(ConfidenceGrade.fromNative(ConfidenceGrade.nativeCount),
           ConfidenceGrade.unrecognized);
       expect(ConfidenceGrade.unrecognized.letter, '?');
-      expect(CompletionAuthority.fromNative(-1),
-          CompletionAuthority.unrecognized);
+      expect(
+          CompletionAuthority.fromNative(-1), CompletionAuthority.unrecognized);
+      expect(Provenance.fromNative(Provenance.nativeCount),
+          Provenance.unrecognized);
+      expect(CommandLanguage.fromNative(CommandLanguage.nativeCount),
+          CommandLanguage.unrecognized);
 
       // And it cannot be handed back to the ABI as if it were a real member.
       final arena = Arena();
@@ -265,6 +269,89 @@ void main() {
         () => const JobOptions(cut: CutSetting.unrecognized)
             .fillNative(arena, options),
         throwsArgumentError,
+      );
+    });
+
+    test('the grade hierarchy is strongest-first, A+ included', () {
+      // docs/compatibility-brief.md §24. A+ took value 0 and pushed A..E up by one, so
+      // the enum still reads strongest-first and two grades compare numerically. A
+      // mirror that kept the old numbering would report every grade one rung too strong
+      // — the single most damaging way this table could be wrong.
+      expect(ConfidenceGrade.aPlusDurableQueryableJob.nativeValue, 0);
+      expect(ConfidenceGrade.aJobLevelConfirmation.nativeValue, 1);
+      expect(ConfidenceGrade.eTransportOnly.nativeValue, 5);
+      expect(ConfidenceGrade.nativeCount, 6);
+
+      final grades = ConfidenceGrade.values
+          .where((v) => v != ConfidenceGrade.unrecognized);
+      expect(
+          grades.map((v) => v.letter), <String>['A+', 'A', 'B', 'C', 'D', 'E']);
+      for (final grade in grades) {
+        expect(
+          readNativeString(bindings.confidenceGradeLetter(grade.nativeValue)),
+          grade.letter,
+          reason: 'pd_confidence_grade_letter disagrees for ${grade.name}',
+        );
+      }
+      // Out of range is not a member: the ABI answers "" where Dart answers "?", and
+      // neither invents a letter.
+      expect(
+        readNativeString(
+            bindings.confidenceGradeLetter(ConfidenceGrade.nativeCount)),
+        isEmpty,
+      );
+    });
+
+    test('nothing in this build can produce the A+ grade', () {
+      // The ePOS transport does not exist in this core, so no pd_job_result can carry
+      // A+. It is mirrored anyway because these enums are closed and four wrappers
+      // mirror them: adding the member later would renumber every mirror a second time.
+      // A profile that reports an ePOS JobID is describing hardware, not making a
+      // claim, and grades A — which is why eposJobId is a completion *mechanism* here
+      // and never a grade.
+      expect(CompletionMechanism.eposJobId.nativeValue, 3);
+      expect(ConfidenceGrade.aPlusDurableQueryableJob.letter, 'A+');
+    });
+
+    test('provenance and command language mirror their pd_*_name spellings',
+        () {
+      // Neither has an id in pd_test_support.h's enum bridge, so the comparison is
+      // against the ABI's own naming functions rather than against the C++ core
+      // directly. That still catches the failure that matters here — a member added,
+      // reordered or renamed on the C side — because pd.h and the core are already
+      // static_asserted against each other.
+      final provenances =
+          Provenance.values.where((v) => v != Provenance.unrecognized);
+      expect(provenances.map((v) => v.nativeValue), <int>[0, 1, 2]);
+      expect(provenances, hasLength(Provenance.nativeCount));
+
+      final expectedProvenance = _coreSpelling(provenances.map((v) => v.name));
+      for (var index = 0; index < Provenance.nativeCount; index++) {
+        expect(readNativeString(bindings.provenanceName(index)),
+            expectedProvenance[index]);
+      }
+      expect(readNativeString(bindings.provenanceName(Provenance.nativeCount)),
+          isEmpty);
+
+      final languages = CommandLanguage.values
+          .where((v) => v != CommandLanguage.unrecognized);
+      expect(
+          languages.map((v) => v.nativeValue), <int>[0, 1, 2, 3, 4, 5, 6, 7]);
+      expect(languages, hasLength(CommandLanguage.nativeCount));
+
+      final expectedLanguage = _coreSpelling(languages.map((v) => v.name));
+      for (var index = 0; index < CommandLanguage.nativeCount; index++) {
+        expect(readNativeString(bindings.commandLanguageName(index)),
+            expectedLanguage[index]);
+      }
+      // The two that are one letter apart in Dart and a whole ecosystem apart on paper:
+      // Epson ESC/POS is the only implemented language, Brother ESC/P is refused.
+      expect(readNativeString(bindings.commandLanguageName(0)), 'EscPos');
+      expect(readNativeString(bindings.commandLanguageName(7)), 'EscP');
+      expect(
+        readNativeString(
+            bindings.commandLanguageName(CommandLanguage.nativeCount)),
+        isEmpty,
       );
     });
   }, skip: skip);

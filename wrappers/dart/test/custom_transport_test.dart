@@ -163,7 +163,8 @@ void main() {
       expect(events, contains(DeviceEvent.connectionLost));
     });
 
-    test('the Dart close hook is a listener, and runs on the isolate', () async {
+    test('the Dart close hook is a listener, and runs on the isolate',
+        () async {
       final driver = openTestDriver();
       final link = driver.scriptedLinkForTesting(script: 'ok');
       addTearDown(link.destroy);
@@ -175,8 +176,8 @@ void main() {
       // see CustomTransport.
       final closed = Completer<void>();
       final transport = CustomTransport.withDartClose(
-        connect: testingLibrary
-            .lookup<NativeFunction<PdTransportConnectNative>>(
+        connect:
+            testingLibrary.lookup<NativeFunction<PdTransportConnectNative>>(
                 ScriptedLink.connectSymbol),
         write: testingLibrary.lookup<NativeFunction<PdTransportWriteNative>>(
             ScriptedLink.writeSymbol),
