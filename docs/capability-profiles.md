@@ -15,7 +15,7 @@ built on.
 | **Epson TM-T88VI** | **`GS ( H` fn=48 confirmed** | DLE EOT, GS r, ASB + extended ASB | Bluetooth config read/write, thermal-head control, graphics drawing, maintenance counters, settings introspection | **Officially confirmed** |
 | **TM-T88VII / newer Epson TM** | `GS ( H`; newer models add job/batch primitives | Excellent | batch printing, end-job commands on some models, extended realtime status | **Officially confirmed per model** |
 | **Epson TM-i/ePOS** | **Proper JobID + queryable print result** | Rich error codes/status | spooler, print forwarding, persistent result log until power-off | **Strongest software API** |
-| **Rongta RP80-family** | **`GS ( H` fn=48 is in Rongta's own command manual** | DLE EOT, DLE ENQ, GS r, ASB | fake Epson IDs, cutter error, recovery/restart, macros, test page, barcode positioning | **Documented family-level; probe exact model** |
+| **Rongta RP80-family** | ~~`GS ( H` fn=48 is in Rongta's own command manual~~ — **withdrawn, see §5 and [compatibility-brief.md](compatibility-brief.md) §13**; `GS ( H` is `UNVERIFIED / PROBE` | DLE EOT, DLE ENQ, GS r, ASB | fake Epson IDs, cutter error, recovery/restart, macros, test page, barcode positioning | **Probe per unit; ESC/POS + OPOS documented, the extension is not** |
 | **Partner RP-110** | Likely Epson-like ESC/POS status set | paper/cover sensors known | OEM-related to **Sewoo SLK-TS200** | **Needs hardware probe** |
 | **Xprinter XP-S260M** | **`GS ( H` proven on our hardware** | status + errors | Xprinter one-ticket-control / working-state mechanism | **Hardware confirmed** |
 | Generic unknown ESC/POS | `GS r 1` safest initial ordered fence | DLE EOT if available | wildly inconsistent | **Probe only** |
@@ -93,6 +93,19 @@ Decision: implement both `transport: escpos_tcp` and `transport: epson_epos`; pr
 ePOS on known TM-i hardware.
 
 ## 5. Rongta RP80 family — the major surprise
+
+> **CORRECTED, and this section is now wrong.**
+> [compatibility-brief.md](compatibility-brief.md) §13 supersedes it and wins on
+> conflict. The claim below rests on a copy of an RP80 manual that is not hosted by
+> Rongta; **no currently manufacturer-hosted Rongta command reference proving `GS ( H`
+> fn 48 was found.** The device database was changed to match: every Rongta entry now
+> carries `GS ( H` as `Provenance::Unverified` and stays on the queued `GS r 1` fence
+> until a probe promotes it per unit. `ESC/POS` and `OPOS` remain documented; the Epson
+> feedback extension does not, and "ESC/POS compatible" never implied it.
+>
+> The paragraph is kept rather than deleted because the mistake is instructive: an
+> unverified secondary source read as a primary one is exactly the failure mode the
+> provenance system exists to make visible.
 
 Rongta's own RP80 command set includes `GS ( H pL pH fn m d1 d2 d3 d4, fn=48` — the
 manual calls it "Set the process ID response", storing the four-byte process ID for the

@@ -8,6 +8,7 @@
 
 #include "printerdriver/driver.hpp"
 #include "printerdriver/pd.h"
+#include "printerdriver/transport.hpp"
 
 // The C++ side of the handles declared opaque in pd.h. Kept out of the public header
 // on purpose: a wrapper that can see these layouts will eventually depend on one.
@@ -22,6 +23,10 @@ struct pd_printer {
   pd_driver* owner = nullptr;
   std::shared_ptr<pd::Printer> printer;
   std::string id;
+  // Non-null only for a printer added through pd_add_printer_custom. The link, not the
+  // transport instance, is what the embedder feeds: the core creates a fresh transport
+  // after every reconnect, and a caller holding a pd_printer must not have to notice.
+  std::shared_ptr<pd::CustomTransportLink> link;
 };
 
 struct pd_job {

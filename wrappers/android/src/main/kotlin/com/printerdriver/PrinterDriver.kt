@@ -1,7 +1,11 @@
 package com.printerdriver
 
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.content.Context
 import com.printerdriver.internal.NativeBridge
 import com.printerdriver.internal.NativeLogCallback
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +32,11 @@ class PrinterDriver private constructor(internal val handle: Long) : AutoCloseab
     // so one submission's failure/cancellation cannot cancel unrelated ones sharing
     // this scope.
     private val closureScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    // Keyed by printer handle so Printer.bluetoothTransportKind can answer §25's "which
+    // of the five paths" question, and so close() can stop every reader thread before
+    // pd_destroy frees the handles they feed.
+    private val bluetoothTransports = ConcurrentHashMap<Long, BluetoothSppTransport>()
 
     /** Why the last call on this driver returned NULL/failed. Never null; "" when the
      *  last call succeeded (pd_last_error's own contract, unchanged here). Only
@@ -61,6 +70,60 @@ class PrinterDriver private constructor(internal val handle: Long) : AutoCloseab
         }
         return Printer(this, printerHandle)
     }
+
+    /**
+     * A printer reached over Bluetooth Classic SPP (docs/compatibility-brief.md §25),
+     * using an `android.bluetooth.BluetoothSocket` this wrapper owns and drives.
+     *
+     * The device must already be paired -- pairing is an operator action through the
+     * system's Bluetooth settings, and this SDK deliberately cannot perform it. The
+     * calling app is responsible for holding `BLUETOOTH_CONNECT` and `BLUETOOTH_SCAN`
+     * at runtime on API 31+; this library declares them but cannot request them, since
+     * a runtime permission prompt needs an Activity.
+     *
+     * Throws [PrinterDriverException] on failure -- an unknown [BluetoothPrinterConfig.profileId]
+     * or a vtable the core refused, both configuration mistakes. Note what is NOT a
+     * failure here: the printer being out of range or switched off. Registration does not
+     * connect; the core connects when it has something to send, and reports an
+     * unreachable printer through the job's own [JobResult], which is where an operator
+     * can act on it.
+     *
+     * NEVER RUN AGAINST HARDWARE. See the header comment of Bluetooth.kt for exactly what
+     * has and has not been checked.
+     *
+     * @param adapter the system [BluetoothAdapter]; see the [Context] overload for the
+     *   usual way to obtain one.
+     */
+    fun addPrinterBluetooth(adapter: BluetoothAdapter, config: BluetoothPrinterConfig): Printer {
+        checkOpen()
+        val transport = BluetoothSppTransport(adapter, config)
+        val printerHandle = NativeBridge.addPrinterCustom(
+            handle, transport, transport.description, config.profileId, config.widthDots
+        )
+        // Published even on failure: a reader thread the core may already have started
+        // (see BluetoothSppTransport.attachTo) is waiting to be told, and 0L is how it
+        // learns there is nothing to feed.
+        transport.attachTo(handle, printerHandle)
+        if (printerHandle == 0L) {
+            throw PrinterDriverException("pd_add_printer_custom failed: $lastError")
+        }
+        bluetoothTransports[printerHandle] = transport
+        return Printer(this, printerHandle)
+    }
+
+    /** [addPrinterBluetooth] with the adapter taken from the system service, which is
+     *  the supported way to get one on the [minSdk][android.os.Build.VERSION_CODES.O]
+     *  this library targets. Throws [PrinterDriverException] on a device with no
+     *  Bluetooth hardware. */
+    fun addPrinterBluetooth(context: Context, config: BluetoothPrinterConfig): Printer {
+        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = manager?.adapter
+            ?: throw PrinterDriverException("this device has no Bluetooth adapter")
+        return addPrinterBluetooth(adapter, config)
+    }
+
+    internal fun bluetoothTransportFor(printerHandle: Long): BluetoothSppTransport? =
+        bluetoothTransports[printerHandle]
 
     /** Looks up any job this driver knows about, including ones reloaded from the
      *  journal after a restart (docs/api.md §2). `null` when [key] is unknown -- a
@@ -109,10 +172,19 @@ class PrinterDriver private constructor(internal val handle: Long) : AutoCloseab
      * though the scope has been asked to cancel. Callers that need a hard guarantee
      * that no callback fires after [close] returns should await outstanding results
      * first.
+     *
+     * Custom transports are torn down BEFORE pd_destroy, not after: pd_destroy frees
+     * every pd_printer handle, and a Bluetooth reader thread still feeding one would be
+     * writing through a dangling pointer. See [BluetoothSppTransport.shutdown] for what
+     * that costs an in-flight job.
      */
     override fun close() {
         if (closedFlag.compareAndSet(false, true)) {
             closureScope.cancel()
+            for (transport in bluetoothTransports.values) {
+                transport.shutdown()
+            }
+            bluetoothTransports.clear()
             NativeBridge.driverDestroy(handle)
         }
     }

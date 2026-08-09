@@ -135,6 +135,72 @@ public sealed class PrinterDriver : IDisposable
     }
 
     /// <summary>
+    /// Attaches a printer reached over a link the caller owns — Bluetooth Classic SPP, BLE,
+    /// MFi, a vendor SDK channel, a USB bulk pipe, a test double.
+    /// </summary>
+    /// <remarks>
+    /// docs/compatibility-brief.md §25. Read the thread contract on
+    /// <see cref="IPrinterTransport"/> before implementing one: the core calls
+    /// <see cref="IPrinterTransport.Connect"/>, <see cref="IPrinterTransport.Write"/> and
+    /// <see cref="IPrinterTransport.Close"/> from its own worker thread for this printer,
+    /// and received bytes come back in through
+    /// <see cref="CustomTransportPrinter.FeedBytes(ReadOnlySpan{byte})"/> from a different
+    /// one.
+    /// </remarks>
+    /// <param name="transport">The link. Kept alive by this driver until it is disposed.</param>
+    /// <param name="config">Description, profile and width; null takes the defaults.</param>
+    /// <returns>The printer, together with the two calls that feed the link's traffic in.</returns>
+    /// <exception cref="PrinterDriverException">The ABI refused the registration.</exception>
+    public CustomTransportPrinter AddPrinterCustom(IPrinterTransport transport,
+                                                   CustomPrinterConfig? config = null)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+        config ??= new CustomPrinterConfig();
+        var handle = Handle;
+
+        // Rooted before the function pointers are taken and never released until
+        // pd_destroy: the stub Marshal.GetFunctionPointerForDelegate hands out lives
+        // exactly as long as the delegate it came from, and the core keeps calling through
+        // it for the whole life of the printer -- across reconnects, and from a thread no
+        // managed reference reaches. This is the same defence as the subscription
+        // callbacks, applied to the one place where a collected delegate would be called
+        // while a receipt is half-written.
+        var binding = _roots.Root(new TransportBinding(transport));
+        var connect = new NativeMethods.TransportConnectCallback(
+            TransportBinding.ConnectTrampoline);
+        var write = new NativeMethods.TransportWriteCallback(TransportBinding.WriteTrampoline);
+        var close = new NativeMethods.TransportCloseCallback(TransportBinding.CloseTrampoline);
+        _roots.Root(connect);
+        _roots.Root(write);
+        _roots.Root(close);
+
+        var description = Marshal.StringToCoTaskMemUTF8(config.Description ?? string.Empty);
+        var profile = Marshal.StringToCoTaskMemUTF8(config.ProfileId ?? string.Empty);
+        try
+        {
+            var vtable = new PdTransportVtable
+            {
+                Connect = Marshal.GetFunctionPointerForDelegate(connect),
+                Write = Marshal.GetFunctionPointerForDelegate(write),
+                Close = Marshal.GetFunctionPointerForDelegate(close),
+                Description = description,
+            };
+            var printer = NativeMethods.pd_add_printer_custom(
+                handle, in vtable, GCHandle.ToIntPtr(binding), profile, config.WidthDots);
+            if (printer == 0)
+            {
+                throw new PrinterDriverException(LastError());
+            }
+            return new CustomTransportPrinter(this, Intern(printer));
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(description);
+            Marshal.FreeCoTaskMem(profile);
+        }
+    }
+
+    /// <summary>
     /// Any job this driver knows about, including ones reloaded from the journal after a
     /// restart.
     /// </summary>

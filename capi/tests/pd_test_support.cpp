@@ -1,12 +1,16 @@
 #include "pd_test_support.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "fake_printer.hpp"
 #include "pd_internal.hpp"
@@ -115,6 +119,141 @@ extern "C" int pd_test_received_contains(pd_printer* printer, const char* needle
   }
   const std::shared_ptr<pdfake::FakePrinter> device = lookupDevice(printer);
   return device && device->receivedContains(needle) ? 1 : 0;
+}
+
+// --- Scripted link behind a caller-supplied transport vtable -------------------------
+
+struct pd_test_link {
+  std::shared_ptr<pdfake::FakePrinter> device = std::make_shared<pdfake::FakePrinter>();
+  pd_printer* printer = nullptr;
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::vector<uint8_t>> pending;
+  bool stop = false;
+  std::thread reader;
+
+  std::atomic<bool> connect_succeeds{true};
+  std::atomic<size_t> connects{0};
+  std::atomic<size_t> closes{0};
+  std::atomic<size_t> bytes_written{0};
+
+  pd_test_link() {
+    reader = std::thread([this] { readerLoop(); });
+  }
+
+  ~pd_test_link() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stop = true;
+    }
+    cv.notify_one();
+    reader.join();
+  }
+
+  void readerLoop() {
+    for (;;) {
+      std::vector<uint8_t> chunk;
+      pd_printer* target = nullptr;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [this] { return stop || !pending.empty(); });
+        if (stop && pending.empty()) {
+          return;
+        }
+        chunk = std::move(pending.front());
+        pending.erase(pending.begin());
+        target = printer;
+      }
+      // Outside the lock, on this thread and never on the core's worker: exactly the
+      // contract pd.h states for pd_transport_feed_bytes.
+      if (target != nullptr) {
+        pd_transport_feed_bytes(target, chunk.data(), chunk.size());
+      }
+    }
+  }
+};
+
+extern "C" pd_test_link* pd_test_link_create(const char* script_id) {
+  const std::string id(script_id != nullptr ? script_id : "");
+  if (id != "ok" && id != "gsr1") {
+    return nullptr;
+  }
+  auto* link = new pd_test_link();
+  if (id == "gsr1") {
+    pdfake::Script script;
+    script.answer_process_id = false;  // queued fence only
+    link->device->setScript(script);
+  }
+  return link;
+}
+
+extern "C" void pd_test_link_destroy(pd_test_link* link) { delete link; }
+
+extern "C" void pd_test_link_bind(pd_test_link* link, pd_printer* printer) {
+  if (link == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(link->mutex);
+  link->printer = printer;
+}
+
+extern "C" void pd_test_link_refuse_connections(pd_test_link* link) {
+  if (link != nullptr) {
+    link->connect_succeeds.store(false);
+  }
+}
+
+extern "C" int32_t pd_test_link_connect(pd_test_link* link) {
+  if (link == nullptr) {
+    return 0;
+  }
+  ++link->connects;
+  return link->connect_succeeds.load() ? 1 : 0;
+}
+
+extern "C" int64_t pd_test_link_write(pd_test_link* link, const uint8_t* data,
+                                      size_t size) {
+  if (link == nullptr || data == nullptr) {
+    return -1;
+  }
+  link->bytes_written += size;
+  std::vector<uint8_t> response = link->device->receive(data, size);
+  if (!response.empty()) {
+    std::lock_guard<std::mutex> lock(link->mutex);
+    link->pending.push_back(std::move(response));
+    link->cv.notify_one();
+  }
+  return static_cast<int64_t>(size);
+}
+
+extern "C" void pd_test_link_close(pd_test_link* link) {
+  if (link != nullptr) {
+    ++link->closes;
+  }
+}
+
+extern "C" size_t pd_test_link_connects(pd_test_link* link) {
+  return link != nullptr ? link->connects.load() : 0;
+}
+
+extern "C" size_t pd_test_link_closes(pd_test_link* link) {
+  return link != nullptr ? link->closes.load() : 0;
+}
+
+extern "C" size_t pd_test_link_bytes_written(pd_test_link* link) {
+  return link != nullptr ? link->bytes_written.load() : 0;
+}
+
+extern "C" size_t pd_test_link_cuts(pd_test_link* link) {
+  return link != nullptr ? link->device->cuts() : 0;
+}
+
+extern "C" int pd_test_link_received_contains(pd_test_link* link, const char* needle) {
+  if (link == nullptr || needle == nullptr) {
+    return 0;
+  }
+  return link->device->receivedContains(needle) ? 1 : 0;
 }
 
 // --- Enum bridge ---------------------------------------------------------------------

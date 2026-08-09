@@ -78,6 +78,10 @@ const char* to_string(JobOutcome value) noexcept {
 
 const char* to_string(ConfidenceGrade value) noexcept {
   switch (value) {
+    // Journals store this spelling, not the numeric value (core/src/job_store.cpp), so
+    // a record written before A+ existed still parses onto the same member after the
+    // renumbering. Never rename one of these.
+    case ConfidenceGrade::APlus_DurableQueryableJob: return "APlus_DurableQueryableJob";
     case ConfidenceGrade::A_JobLevelConfirmation: return "A_JobLevelConfirmation";
     case ConfidenceGrade::B_OrderedDeviceResponse: return "B_OrderedDeviceResponse";
     case ConfidenceGrade::C_DeviceStatusAround: return "C_DeviceStatusAround";
@@ -89,6 +93,7 @@ const char* to_string(ConfidenceGrade value) noexcept {
 
 const char* gradeLetter(ConfidenceGrade value) noexcept {
   switch (value) {
+    case ConfidenceGrade::APlus_DurableQueryableJob: return "A+";
     case ConfidenceGrade::A_JobLevelConfirmation: return "A";
     case ConfidenceGrade::B_OrderedDeviceResponse: return "B";
     case ConfidenceGrade::C_DeviceStatusAround: return "C";
@@ -107,6 +112,16 @@ const char* to_string(CompletionAuthority value) noexcept {
     case CompletionAuthority::TransportOnly: return "TransportOnly";
   }
   return "TransportOnly";
+}
+
+const char* to_string(Provenance value) noexcept {
+  switch (value) {
+    case Provenance::Documented: return "Documented";
+    case Provenance::Probed: return "Probed";
+    case Provenance::Unverified: return "Unverified";
+  }
+  // The honest default: an unrecognised provenance has established nothing.
+  return "Unverified";
 }
 
 }  // namespace pd

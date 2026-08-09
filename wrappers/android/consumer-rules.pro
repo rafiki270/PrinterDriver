@@ -15,6 +15,13 @@
 -keep,includedescriptorclasses class com.printerdriver.internal.NativeDeviceEventCallback { *; }
 -keep,includedescriptorclasses class com.printerdriver.internal.NativeLogCallback { *; }
 
+# The custom-transport vtable (pd_add_printer_custom). Its three method IDs are resolved
+# ONCE, at registration time, so a renamed connect/write/close is not a callback that
+# silently no-ops -- addPrinterCustom refuses the registration outright and the printer
+# never exists. Louder than the others, and still a keep rule worth having.
+-keep,includedescriptorclasses class com.printerdriver.internal.NativeTransportCallback { *; }
+-keep,includedescriptorclasses class com.printerdriver.BluetoothSppTransport { *; }
+
 # Lambdas/anonymous classes implementing the callback interfaces above (from
 # callbackFlow collectors and Printer.send's onProgress/onResult sugar) get synthetic
 # names under R8; keep their SAM method overrides reachable so GetMethodID still finds
@@ -22,6 +29,7 @@
 -keepclassmembers class * implements com.printerdriver.internal.NativeJobEventCallback { *; }
 -keepclassmembers class * implements com.printerdriver.internal.NativeDeviceEventCallback { *; }
 -keepclassmembers class * implements com.printerdriver.internal.NativeLogCallback { *; }
+-keepclassmembers class * implements com.printerdriver.internal.NativeTransportCallback { *; }
 
 # Note: PrinterDriverException does NOT need a keep rule. Native functions signal
 # failure with a 0L sentinel handle; the corresponding `throw PrinterDriverException(...)`

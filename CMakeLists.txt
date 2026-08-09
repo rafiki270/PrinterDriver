@@ -61,6 +61,16 @@ add_library(printerdriver_core STATIC
   core/src/job_store.cpp
   core/src/discovery.cpp
   core/src/driver.cpp
+  # Platform-independent, unlike the pair selected above: the embedder-owned transport
+  # contains no socket call at all, because the socket belongs to the embedder
+  # (docs/compatibility-brief.md §25). This is how Bluetooth reaches the core on Apple
+  # and Android without either framework entering it.
+  core/src/transport_custom.cpp
+  # BlueZ RFCOMM. The whole file is inside `#ifdef __linux__`, so it is an empty
+  # translation unit everywhere else and is listed unconditionally — which also keeps
+  # SwiftPM, which compiles every file in core/src, honest. Syntax-checked only; see
+  # scripts/check_linux_bluetooth_syntax.sh and the note at the top of the file.
+  core/src/transport_bluez.cpp
   ${printerdriver_platform_sources})
 
 target_include_directories(printerdriver_core PUBLIC

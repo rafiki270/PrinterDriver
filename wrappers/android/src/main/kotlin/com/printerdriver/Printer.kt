@@ -36,6 +36,22 @@ class Printer internal constructor(
     val completionMechanism: CompletionMechanism
         get() { driver.checkOpen(); return CompletionMechanism.fromRaw(NativeBridge.printerCompletionMechanism(handle)) }
 
+    /**
+     * Which of docs/compatibility-brief.md §25's five Bluetooth paths this printer is
+     * reached over, or `null` when it is not a Bluetooth printer at all.
+     *
+     * §25 forbids a single `bluetooth: true`, and this is where that rule lands in this
+     * wrapper: three-valued (`null` / `CLASSIC_SPP` / one of the four kinds nothing here
+     * implements yet) rather than a boolean.
+     *
+     * It reports the transport this wrapper created, NOT what the device supports. The
+     * capability record §27 describes -- which would say that, say, an Epson TM-P20II
+     * documents Classic *and* BLE -- lives on the core's `pd::BluetoothTransport` and has
+     * no accessor in pd.h, so no wrapper can read it today.
+     */
+    val bluetoothTransportKind: BluetoothTransportKind?
+        get() { driver.checkOpen(); return driver.bluetoothTransportFor(handle)?.kind }
+
     /** Snapshot: online, paper, cover, errors. Never blocks (pd_printer_status is a
      *  cached-status read, not a live query). */
     fun status(): DeviceStatus {

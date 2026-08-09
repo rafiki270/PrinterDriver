@@ -38,6 +38,27 @@ internal static class NativeMethods
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void LogCallback(nint message, nint context);
 
+    // The three operations a custom transport implements (docs/compatibility-brief.md
+    // §25). Unlike the subscription callbacks these are not invoked "eventually": the
+    // core's worker thread blocks inside them while a job is being sent, one at a time
+    // and never concurrently with each other. `data` points into the core's own send
+    // buffer and is valid only for the duration of the call.
+
+    /// <summary>Non-zero for success. Returning 0 fails the job with a transport reason.</summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int TransportConnectCallback(nint context);
+
+    /// <summary>
+    /// Bytes actually transferred, or negative for a hard failure. A short write must be
+    /// reported honestly rather than rounded up: zero bytes out is a known failure and one
+    /// byte out is Unknown (docs/api.md §4), and that is what decides a reprint.
+    /// </summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate long TransportWriteCallback(nint context, nint data, nuint size);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void TransportCloseCallback(nint context);
+
     // --- Driver ----------------------------------------------------------------------
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -58,6 +79,24 @@ internal static class NativeMethods
     internal static extern nint pd_add_printer_tcp(nint driver, in PdTcpConfig config);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_add_printer_custom(nint driver, in PdTransportVtable vtable,
+                                                      nint context, nint profileId,
+                                                      uint widthDots);
+
+    /// <summary>
+    /// Delivers bytes the link received. Safe from any thread — including while a write is
+    /// in flight, which is the normal case — but never from inside connect/write/close:
+    /// those run on the thread that would have to service the delivery. Returns 0 when
+    /// nothing was listening, which is information rather than an error.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_transport_feed_bytes(nint printer, nint data, nuint size);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_transport_link_dropped(
+        nint printer, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nint pd_printer_id(nint printer);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -65,6 +104,12 @@ internal static class NativeMethods
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int pd_printer_completion(nint printer);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_printer_completion_provenance(nint printer);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_printer_language(nint printer);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern PdDeviceStatus pd_printer_status(nint driver, nint printer);
@@ -142,6 +187,22 @@ internal static class NativeMethods
     internal static extern nint pd_job_outcome_name(int value);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_confidence_grade_name(int value);
+
+    /// <summary>"A+", "A".."E" — the letter a report tabulates.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_confidence_grade_letter(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_completion_authority_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_provenance_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_command_language_name(int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nint pd_payload_kind_name(int value);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -183,6 +244,27 @@ internal struct PdTcpConfig
     public uint WidthDots;
     public nint ProfileId;
     public uint ConnectTimeoutMs;
+}
+
+/// <summary>
+/// <c>pd_transport_vtable</c>: the three operations a caller-owned link implements, plus
+/// the string its printer id derives from.
+/// </summary>
+/// <remarks>
+/// The function pointers are held as raw <see cref="nint"/> rather than as delegate-typed
+/// fields, which keeps the struct blittable and makes the delegate lifetime explicit at
+/// the call site: <see cref="Marshal.GetFunctionPointerForDelegate{TDelegate}"/> hands out
+/// a stub that lives exactly as long as the delegate it came from, and the ABI keeps
+/// calling through it until <c>pd_destroy</c>. Rooting is therefore not optional — see
+/// CallbackRoots.
+/// </remarks>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdTransportVtable
+{
+    public nint Connect;
+    public nint Write;
+    public nint Close;
+    public nint Description;
 }
 
 [StructLayout(LayoutKind.Sequential)]

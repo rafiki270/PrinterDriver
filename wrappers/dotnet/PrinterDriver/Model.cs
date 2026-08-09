@@ -102,6 +102,24 @@ public sealed record TcpPrinterConfig(
     string? ProfileId = null,
     uint ConnectTimeoutMs = 0);
 
+/// <summary>A printer reached over a link the caller owns — see <see cref="IPrinterTransport"/>.</summary>
+/// <param name="Description">
+/// What the printer id and the diagnostics derive from, e.g.
+/// <c>"bt-spp:00:11:22:33:44:55"</c>. Null or empty becomes <c>"custom"</c>, which is fine
+/// for one printer and ambiguous for two.
+/// </param>
+/// <param name="ProfileId">
+/// A capability profile from <see cref="PrinterDriver.ProfileIds"/>; null means "generic".
+/// An unknown id is refused rather than silently downgraded: a caller that asked for a
+/// TM-T88VI and got the unknown-device profile would be told a weaker completion story
+/// than it asked for, with nothing in the result explaining why.
+/// </param>
+/// <param name="WidthDots">Print width in dots; 0 means 576.</param>
+public sealed record CustomPrinterConfig(
+    string? Description = null,
+    string? ProfileId = null,
+    uint WidthDots = 0);
+
 /// <summary>Per-job options.</summary>
 /// <param name="Key">
 /// The idempotency key. Null or empty gets a generated one and therefore no dedupe

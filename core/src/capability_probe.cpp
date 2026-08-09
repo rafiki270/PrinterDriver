@@ -141,11 +141,24 @@ CapabilityProfile promote(const CapabilityProfile& defaults,
   }
   profile.probed = true;
 
+  // docs/compatibility-brief.md §28. Every capability the probe established first-hand
+  // becomes Provenance::Probed — including the ones it established as *absent*, because
+  // "we asked and it said no" is evidence in exactly the way "the datasheet is silent"
+  // is not. An unset finding leaves both the flag and its provenance alone: silence is
+  // never evidence, so a documented capability the probe could not reach stays
+  // Documented rather than being demoted by a failed question.
+  //
+  // This promotion is what turns the Xprinter case into a first-class answer: the
+  // family default says GS ( H is Unverified because Xprinter does not document it,
+  // and a probed XP-S260M then reports Probed — which is a stronger claim than any
+  // datasheet, and visibly a different one from Epson's Documented.
   if (findings.gs_h_process_id.has_value()) {
     profile.completion_caps.process_id_gs_h = *findings.gs_h_process_id;
+    profile.completion_caps.process_id_gs_h_provenance = Provenance::Probed;
   }
   if (findings.gs_r1.has_value()) {
     profile.completion_caps.queued_gs_r = *findings.gs_r1;
+    profile.completion_caps.queued_gs_r_provenance = Provenance::Probed;
   }
   const std::optional<CompletionMechanism> mechanism =
       findings.completion.has_value() ? findings.completion : completionFrom(findings);
@@ -155,12 +168,15 @@ CapabilityProfile promote(const CapabilityProfile& defaults,
 
   if (findings.dle_eot.has_value()) {
     profile.status.dle_eot = *findings.dle_eot;
+    profile.status.dle_eot_provenance = Provenance::Probed;
   }
   if (findings.asb.has_value()) {
     profile.status.asb = *findings.asb;
+    profile.status.asb_provenance = Provenance::Probed;
   }
   if (findings.cutter_error_status.has_value()) {
     profile.status.cutter_error = *findings.cutter_error_status;
+    profile.status.cutter_error_provenance = Provenance::Probed;
   }
 
   if (findings.reported.answered()) {

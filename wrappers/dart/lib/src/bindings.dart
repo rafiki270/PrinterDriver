@@ -29,6 +29,13 @@ final class PdPrinter extends Opaque {}
 /// `pd_job`
 final class PdJob extends Opaque {}
 
+/// `pd_test_link` — the scripted far side of a caller-supplied transport vtable.
+///
+/// From `capi/tests/pd_test_support.h`, so present only in the library built from the
+/// `printerdriver_capi_testing` target. Unlike the handles above it is owned by whoever
+/// created it, not by a driver.
+final class PdTestLink extends Opaque {}
+
 // --- Structs ------------------------------------------------------------------------
 
 /// `pd_job_event` — one step of a job's history.
@@ -218,6 +225,46 @@ final class PdTcpConfig extends Struct {
   external int connectTimeoutMs;
 }
 
+// --- Custom transports --------------------------------------------------------------
+//
+// pd.h: the platform owns the socket, the core owns the protocol. These three are
+// invoked on the core's worker thread for the printer, one at a time, never
+// concurrently with each other — see the thread contract quoted in `transport.dart`,
+// which is also where the reason no Dart function may sit behind connect or write is
+// written down.
+
+/// `pd_transport_connect_fn` — non-zero for success, 0 for failure.
+typedef PdTransportConnectNative = Int32 Function(Pointer<Void> ctx);
+
+/// `pd_transport_write_fn` — bytes actually transferred, or negative for a hard
+/// failure.
+///
+/// A short write is reported honestly rather than rounded up: zero bytes out is a known
+/// failure and one byte out is Unknown (docs/api.md §4).
+typedef PdTransportWriteNative = Int64 Function(
+  Pointer<Void> ctx,
+  Pointer<Uint8> data,
+  Size size,
+);
+
+/// `pd_transport_close_fn` — called once per successful connect; again is harmless.
+typedef PdTransportCloseNative = Void Function(Pointer<Void> ctx);
+
+/// `pd_transport_vtable`
+final class PdTransportVtable extends Struct {
+  external Pointer<NativeFunction<PdTransportConnectNative>> connect;
+
+  external Pointer<NativeFunction<PdTransportWriteNative>> write;
+
+  /// May be null: the core then simply never closes the link itself.
+  external Pointer<NativeFunction<PdTransportCloseNative>> close;
+
+  /// What the printer id and the diagnostics derive from, e.g.
+  /// `bt-spp:00:11:22:33:44:55`. Copied before `pd_add_printer_custom` returns; null or
+  /// "" becomes `custom`.
+  external Pointer<Char> description;
+}
+
 /// `pd_job_options`
 final class PdJobOptions extends Struct {
   /// NULL or "" generates one, which means no dedupe protection.
@@ -297,9 +344,21 @@ typedef _PdProfileIdsNative = Pointer<Pointer<Char>> Function();
 
 typedef _PdAddPrinterTcpNative = Pointer<PdPrinter> Function(
     Pointer<PdDriver>, Pointer<PdTcpConfig>);
+typedef _PdAddPrinterCustomNative = Pointer<PdPrinter> Function(
+    Pointer<PdDriver>,
+    Pointer<PdTransportVtable>,
+    Pointer<Void>,
+    Pointer<Char>,
+    Uint32);
+typedef _PdTransportFeedBytesNative = Int32 Function(
+    Pointer<PdPrinter>, Pointer<Uint8>, Size);
+typedef _PdTransportLinkDroppedNative = Int32 Function(
+    Pointer<PdPrinter>, Pointer<Char>);
 typedef _PdPrinterIdNative = Pointer<Char> Function(Pointer<PdPrinter>);
 typedef _PdPrinterWidthDotsNative = Uint32 Function(Pointer<PdPrinter>);
 typedef _PdPrinterCompletionNative = Int32 Function(Pointer<PdPrinter>);
+typedef _PdPrinterProvenanceNative = Int32 Function(Pointer<PdPrinter>);
+typedef _PdPrinterLanguageNative = Int32 Function(Pointer<PdPrinter>);
 typedef _PdPrinterStatusNative = PdDeviceStatus Function(
     Pointer<PdDriver>, Pointer<PdPrinter>);
 typedef _PdPrinterRefreshStatusNative = PdDeviceStatus Function(
@@ -347,6 +406,13 @@ typedef _PdTestPrintDataBytesNative = Size Function(Pointer<PdPrinter>);
 typedef _PdTestCutsNative = Size Function(Pointer<PdPrinter>);
 typedef _PdTestReceivedContainsNative = Int Function(
     Pointer<PdPrinter>, Pointer<Char>);
+typedef _PdTestLinkCreateNative = Pointer<PdTestLink> Function(Pointer<Char>);
+typedef _PdTestLinkVoidNative = Void Function(Pointer<PdTestLink>);
+typedef _PdTestLinkBindNative = Void Function(
+    Pointer<PdTestLink>, Pointer<PdPrinter>);
+typedef _PdTestLinkCountNative = Size Function(Pointer<PdTestLink>);
+typedef _PdTestLinkContainsNative = Int Function(
+    Pointer<PdTestLink>, Pointer<Char>);
 typedef _PdTestCppEnumCountNative = Int Function(Int32);
 typedef _PdTestCppEnumNameNative = Pointer<Char> Function(Int32, Int);
 typedef _PdTestCppEnumValueNative = Int Function(Int32, Int);
@@ -396,12 +462,33 @@ final class PrinterDriverBindings {
                 Pointer<PdDriver>, Pointer<PdTcpConfig>)>(
           'pd_add_printer_tcp',
         ),
+        addPrinterCustom = library.lookupFunction<
+            _PdAddPrinterCustomNative,
+            Pointer<PdPrinter> Function(Pointer<PdDriver>,
+                Pointer<PdTransportVtable>, Pointer<Void>, Pointer<Char>, int)>(
+          'pd_add_printer_custom',
+        ),
+        transportFeedBytes = library.lookupFunction<
+            _PdTransportFeedBytesNative,
+            int Function(Pointer<PdPrinter>, Pointer<Uint8>, int)>(
+          'pd_transport_feed_bytes',
+        ),
+        transportLinkDropped = library.lookupFunction<
+            _PdTransportLinkDroppedNative,
+            int Function(Pointer<PdPrinter>, Pointer<Char>)>(
+          'pd_transport_link_dropped',
+        ),
         printerId = library.lookupFunction<_PdPrinterIdNative,
             Pointer<Char> Function(Pointer<PdPrinter>)>('pd_printer_id'),
         printerWidthDots = library.lookupFunction<_PdPrinterWidthDotsNative,
             int Function(Pointer<PdPrinter>)>('pd_printer_width_dots'),
         printerCompletion = library.lookupFunction<_PdPrinterCompletionNative,
             int Function(Pointer<PdPrinter>)>('pd_printer_completion'),
+        printerCompletionProvenance = library.lookupFunction<
+                _PdPrinterProvenanceNative, int Function(Pointer<PdPrinter>)>(
+            'pd_printer_completion_provenance'),
+        printerLanguage = library.lookupFunction<_PdPrinterLanguageNative,
+            int Function(Pointer<PdPrinter>)>('pd_printer_language'),
         printerStatus = library.lookupFunction<_PdPrinterStatusNative,
             PdDeviceStatus Function(Pointer<PdDriver>, Pointer<PdPrinter>)>(
           'pd_printer_status',
@@ -493,6 +580,10 @@ final class PrinterDriverBindings {
             Pointer<Char> Function(int)>('pd_confidence_grade_name'),
         completionAuthorityName = library.lookupFunction<_PdEnumNameNative,
             Pointer<Char> Function(int)>('pd_completion_authority_name'),
+        provenanceName = library.lookupFunction<_PdEnumNameNative,
+            Pointer<Char> Function(int)>('pd_provenance_name'),
+        commandLanguageName = library.lookupFunction<_PdEnumNameNative,
+            Pointer<Char> Function(int)>('pd_command_language_name'),
         confidenceGradeLetter = library.lookupFunction<_PdEnumNameNative,
             Pointer<Char> Function(int)>('pd_confidence_grade_letter'),
         completionMechanismName = library.lookupFunction<_PdEnumNameNative,
@@ -514,9 +605,15 @@ final class PrinterDriverBindings {
   // --- Printers ---
   final Pointer<PdPrinter> Function(Pointer<PdDriver>, Pointer<PdTcpConfig>)
       addPrinterTcp;
+  final Pointer<PdPrinter> Function(Pointer<PdDriver>, Pointer<PdTransportVtable>,
+      Pointer<Void>, Pointer<Char>, int) addPrinterCustom;
+  final int Function(Pointer<PdPrinter>, Pointer<Uint8>, int) transportFeedBytes;
+  final int Function(Pointer<PdPrinter>, Pointer<Char>) transportLinkDropped;
   final Pointer<Char> Function(Pointer<PdPrinter>) printerId;
   final int Function(Pointer<PdPrinter>) printerWidthDots;
   final int Function(Pointer<PdPrinter>) printerCompletion;
+  final int Function(Pointer<PdPrinter>) printerCompletionProvenance;
+  final int Function(Pointer<PdPrinter>) printerLanguage;
   final PdDeviceStatus Function(Pointer<PdDriver>, Pointer<PdPrinter>)
       printerStatus;
   final PdDeviceStatus Function(Pointer<PdDriver>, Pointer<PdPrinter>, int)
@@ -561,6 +658,8 @@ final class PrinterDriverBindings {
   final Pointer<Char> Function(int) payloadKindName;
   final Pointer<Char> Function(int) confidenceGradeName;
   final Pointer<Char> Function(int) completionAuthorityName;
+  final Pointer<Char> Function(int) provenanceName;
+  final Pointer<Char> Function(int) commandLanguageName;
   final Pointer<Char> Function(int) confidenceGradeLetter;
   final Pointer<Char> Function(int) completionMechanismName;
   final Pointer<Char> Function(int) cutVariantName;
@@ -603,6 +702,62 @@ final class PrinterDriverBindings {
           _PdTestReceivedContainsNative,
           int Function(
               Pointer<PdPrinter>, Pointer<Char>)>('pd_test_received_contains');
+
+  /// `pd_test_link_create` — script ids `ok` and `gsr1`; null for an unknown one.
+  ///
+  /// The link owns the thread that answers, which is the whole reason it exists: pd.h
+  /// forbids feeding bytes from inside `write`, so a far side that responds has to
+  /// deliver them from somewhere else, exactly as a CoreBluetooth delegate queue or an
+  /// Android reader thread does.
+  late final Pointer<PdTestLink> Function(Pointer<Char>) testLinkCreate =
+      _library.lookupFunction<_PdTestLinkCreateNative,
+          Pointer<PdTestLink> Function(Pointer<Char>)>('pd_test_link_create');
+
+  /// `pd_test_link_destroy` — after `pd_destroy`, never before.
+  late final void Function(Pointer<PdTestLink>) testLinkDestroy =
+      _library.lookupFunction<_PdTestLinkVoidNative,
+          void Function(Pointer<PdTestLink>)>('pd_test_link_destroy');
+
+  /// `pd_test_link_bind` — tells the reader thread which printer to feed.
+  late final void Function(Pointer<PdTestLink>, Pointer<PdPrinter>)
+      testLinkBind = _library.lookupFunction<_PdTestLinkBindNative,
+          void Function(Pointer<PdTestLink>, Pointer<PdPrinter>)>(
+    'pd_test_link_bind',
+  );
+
+  /// `pd_test_link_refuse_connections`
+  late final void Function(Pointer<PdTestLink>) testLinkRefuseConnections =
+      _library.lookupFunction<_PdTestLinkVoidNative,
+          void Function(Pointer<PdTestLink>)>(
+    'pd_test_link_refuse_connections',
+  );
+
+  /// `pd_test_link_connects`
+  late final int Function(Pointer<PdTestLink>) testLinkConnects =
+      _library.lookupFunction<_PdTestLinkCountNative,
+          int Function(Pointer<PdTestLink>)>('pd_test_link_connects');
+
+  /// `pd_test_link_closes`
+  late final int Function(Pointer<PdTestLink>) testLinkCloses =
+      _library.lookupFunction<_PdTestLinkCountNative,
+          int Function(Pointer<PdTestLink>)>('pd_test_link_closes');
+
+  /// `pd_test_link_bytes_written`
+  late final int Function(Pointer<PdTestLink>) testLinkBytesWritten =
+      _library.lookupFunction<_PdTestLinkCountNative,
+          int Function(Pointer<PdTestLink>)>('pd_test_link_bytes_written');
+
+  /// `pd_test_link_cuts`
+  late final int Function(Pointer<PdTestLink>) testLinkCuts =
+      _library.lookupFunction<_PdTestLinkCountNative,
+          int Function(Pointer<PdTestLink>)>('pd_test_link_cuts');
+
+  /// `pd_test_link_received_contains`
+  late final int Function(Pointer<PdTestLink>, Pointer<Char>)
+      testLinkReceivedContains = _library.lookupFunction<
+          _PdTestLinkContainsNative,
+          int Function(Pointer<PdTestLink>,
+              Pointer<Char>)>('pd_test_link_received_contains');
 
   /// `pd_test_cpp_enum_count` — how many members the C++ enum has.
   late final int Function(int) testCppEnumCount =

@@ -39,6 +39,29 @@ public sealed class Printer
         (CompletionMechanism)NativeMethods.pd_printer_completion(_handle);
 
     /// <summary>
+    /// What the fence <see cref="Completion"/> names is actually worth
+    /// (docs/compatibility-brief.md §28).
+    /// </summary>
+    /// <remarks>
+    /// Not a confidence level, and it changes nothing about what a job reports. It answers
+    /// a different question, before anything has been printed: should this printer's fence
+    /// be trusted on the strength of its profile alone? Epson is the only family whose
+    /// shipped defaults say <see cref="Provenance.Documented"/>, and
+    /// <see cref="Provenance.Probed"/> means this driver asked the installed hardware over
+    /// the installed interface path — which is what makes probing a site's machines worth
+    /// the trip.
+    /// </remarks>
+    public Provenance CompletionProvenance =>
+        (Provenance)NativeMethods.pd_printer_completion_provenance(_handle);
+
+    /// <summary>
+    /// The language this printer's profile is driven in. Anything but
+    /// <see cref="CommandLanguage.EscPos"/> is refused with
+    /// <see cref="FailureReason.Unsupported"/> before a byte is written.
+    /// </summary>
+    public CommandLanguage Language => (CommandLanguage)NativeMethods.pd_printer_language(_handle);
+
+    /// <summary>
     /// Last known device state. Never a live query, so it cannot block behind a print.
     /// </summary>
     public DeviceStatus Status =>

@@ -454,6 +454,310 @@ static void test_enum_bridge_matches_pd_h(void) {
   }
 }
 
+
+/* --- g. Custom transport: the platform owns the link, the core owns the protocol ----
+ *
+ * docs/compatibility-brief.md §25. The vtable below is the thing under test: it is
+ * written in C, exactly as a Bluetooth wrapper would write it, and forwards to a
+ * scripted printer supplied by pd_test_support (which also owns the reader thread,
+ * because a C11 test cannot portably spawn one and pd.h forbids feeding bytes from
+ * inside write()).
+ *
+ * What this has to prove is not that bytes move. It is that a printer reached over a
+ * link the core knows nothing about still gets the full ordered fence and still reports
+ * the same grade a TCP printer would -- because the moment a transport could weaken the
+ * completion story, every wrapper would become part of it. */
+
+static int32_t scripted_connect(void* ctx) {
+  return pd_test_link_connect((pd_test_link*)ctx);
+}
+
+static int64_t scripted_write(void* ctx, const uint8_t* data, size_t size) {
+  return pd_test_link_write((pd_test_link*)ctx, data, size);
+}
+
+static void scripted_close(void* ctx) { pd_test_link_close((pd_test_link*)ctx); }
+
+static void test_custom_transport_drives_a_whole_job(void) {
+  pd_test_link* link = pd_test_link_create("ok");
+  CHECK(link != NULL);
+  if (link == NULL) {
+    return;
+  }
+  pd_driver* driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    pd_test_link_destroy(link);
+    return;
+  }
+
+  pd_transport_vtable vtable;
+  memset(&vtable, 0, sizeof(vtable));
+  vtable.connect = scripted_connect;
+  vtable.write = scripted_write;
+  vtable.close = scripted_close;
+  vtable.description = "bt-spp:00:11:22:33:44:55";
+
+  pd_printer* printer =
+      pd_add_printer_custom(driver, &vtable, link, "xp-s260m", 576);
+  CHECK(printer != NULL);
+  if (printer == NULL) {
+    fprintf(stderr, "pd_add_printer_custom: %s\n", pd_last_error(driver));
+    pd_destroy(driver);
+    pd_test_link_destroy(link);
+    return;
+  }
+  /* The id is derived from the vtable's description, so two Bluetooth printers are
+   * distinguishable without the caller inventing names. */
+  CHECK(strstr(pd_printer_id(printer), "bt-spp") != NULL);
+  pd_test_link_bind(link, printer);
+
+  const char* text = "BLUETOOTH TICKET";
+  pd_raw raw;
+  raw.bytes = (const uint8_t*)text;
+  raw.size = strlen(text);
+  pd_payload payload;
+  memset(&payload, 0, sizeof(payload));
+  payload.kind = PD_PAYLOAD_RAW;
+  payload.as.raw = raw;
+
+  pd_job_options options;
+  memset(&options, 0, sizeof(options));
+  options.key = "bt-job-1";
+
+  pd_job* job = pd_print(driver, printer, &payload, &options);
+  CHECK(job != NULL);
+  if (job != NULL) {
+    pd_job_result result;
+    memset(&result, 0, sizeof(result));
+    CHECK_EQ(pd_job_await(driver, job, 15000, &result), 1);
+    CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+    /* The same claim a TCP-attached GS ( H printer makes. Not weaker for being
+     * Bluetooth, and not stronger either. */
+    CHECK_EQ(result.confidence, PD_CONFIDENCE_CUT_FAULT_FREE);
+    CHECK_EQ(result.grade, PD_GRADE_A_JOB_LEVEL_CONFIRMATION);
+    CHECK_EQ(result.authority, PD_AUTHORITY_PHYSICAL_PRINTER);
+    CHECK_STREQ(result.method, "GS(H) fn48");
+  }
+
+  CHECK(pd_test_link_connects(link) >= 1);
+  CHECK(pd_test_link_bytes_written(link) > 0);
+  CHECK_EQ(pd_test_link_cuts(link), 1);
+  CHECK_EQ(pd_test_link_received_contains(link, "BLUETOOTH TICKET"), 1);
+
+  pd_destroy(driver);
+  /* Closing the driver closes the link. On the Epson portables that matters twice over:
+   * the radio stays paired and the single allowed connection slot is freed. */
+  CHECK(pd_test_link_closes(link) >= 1);
+  pd_test_link_destroy(link);
+}
+
+static void test_custom_transport_rejects_a_broken_registration(void) {
+  pd_driver* driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+  pd_transport_vtable empty;
+  memset(&empty, 0, sizeof(empty));
+  CHECK(pd_add_printer_custom(driver, &empty, NULL, NULL, 0) == NULL);
+  CHECK(strlen(pd_last_error(driver)) > 0);
+
+  pd_transport_vtable vtable;
+  memset(&vtable, 0, sizeof(vtable));
+  vtable.connect = scripted_connect;
+  vtable.write = scripted_write;
+  /* An unknown profile id is an error, never a silent downgrade to generic: a caller
+   * that asked for a TM-T88VI and got an unknown-device profile would be told a weaker
+   * completion story than it asked for, with nothing in the result explaining why. */
+  CHECK(pd_add_printer_custom(driver, &vtable, NULL, "epson_tm_t99", 0) == NULL);
+  CHECK(strlen(pd_last_error(driver)) > 0);
+
+  /* Feeding a printer that does not exist, or one that is not a custom transport, is
+   * answered rather than fatal. */
+  CHECK_EQ(pd_transport_feed_bytes(NULL, (const uint8_t*)"x", 1), 0);
+  CHECK_EQ(pd_transport_link_dropped(NULL, "gone"), 0);
+  pd_printer* scripted = pd_add_printer_scripted(driver, "tcp-ish", "ok");
+  CHECK(scripted != NULL);
+  CHECK_EQ(pd_transport_feed_bytes(scripted, (const uint8_t*)"x", 1), 0);
+
+  pd_destroy(driver);
+}
+
+static void test_zebra_and_brother_are_refused_without_writing_a_byte(void) {
+  /* docs/compatibility-brief.md §16, §17. ZPL, CPCL and Brother Raster are not ESC/POS
+   * at any level. The refusal must happen before the link is opened -- a refusal that
+   * still wasted a roll would be worse than the bug it replaced. */
+  const char* const refused[] = {"zebra_zq300_plus", "zebra_zq500", "zebra_zq600_plus",
+                                 "brother_rj2000",   "brother_rj3000",
+                                 "brother_rj4000"};
+  for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); ++i) {
+    pd_test_link* link = pd_test_link_create("ok");
+    pd_driver* driver = pd_create(NULL);
+    CHECK(link != NULL);
+    CHECK(driver != NULL);
+    if (link == NULL || driver == NULL) {
+      if (driver != NULL) pd_destroy(driver);
+      if (link != NULL) pd_test_link_destroy(link);
+      continue;
+    }
+    pd_transport_vtable vtable;
+    memset(&vtable, 0, sizeof(vtable));
+    vtable.connect = scripted_connect;
+    vtable.write = scripted_write;
+    vtable.close = scripted_close;
+    vtable.description = refused[i];
+
+    pd_printer* printer = pd_add_printer_custom(driver, &vtable, link, refused[i], 576);
+    CHECK(printer != NULL);
+    if (printer != NULL) {
+      pd_test_link_bind(link, printer);
+      const char* text = "LABEL";
+      pd_payload payload;
+      memset(&payload, 0, sizeof(payload));
+      payload.kind = PD_PAYLOAD_RAW;
+      payload.as.raw.bytes = (const uint8_t*)text;
+      payload.as.raw.size = strlen(text);
+
+      pd_job* job = pd_print(driver, printer, &payload, NULL);
+      CHECK(job != NULL);
+      if (job != NULL) {
+        pd_job_result result;
+        memset(&result, 0, sizeof(result));
+        CHECK_EQ(pd_job_await(driver, job, 15000, &result), 1);
+        CHECK_EQ(result.outcome, PD_OUTCOME_FAILED);
+        CHECK_EQ(result.reason, PD_REASON_UNSUPPORTED);
+        CHECK_EQ(result.grade, PD_GRADE_E_TRANSPORT_ONLY);
+        CHECK_EQ(result.authority, PD_AUTHORITY_TRANSPORT_ONLY);
+        CHECK_STREQ(result.method, "none");
+      }
+    }
+    /* Zero bytes, zero connections, zero cuts, zero paper. */
+    CHECK_EQ(pd_test_link_bytes_written(link), 0);
+    CHECK_EQ(pd_test_link_connects(link), 0);
+    CHECK_EQ(pd_test_link_cuts(link), 0);
+
+    pd_destroy(driver);
+    pd_test_link_destroy(link);
+  }
+}
+
+/* --- h. A+ and the provenance/language enums ---------------------------------------- */
+
+static void test_grade_hierarchy_gained_a_plus(void) {
+  /* docs/compatibility-brief.md §24. A+ is value 0 and A..E shifted by one, so the
+   * enum's own ordering still reads strongest-first and a caller can compare grades
+   * numerically. */
+  CHECK_EQ(PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB, 0);
+  CHECK_EQ(PD_GRADE_A_JOB_LEVEL_CONFIRMATION, 1);
+  CHECK_EQ(PD_GRADE_E_TRANSPORT_ONLY, 5);
+  CHECK_EQ(PD_GRADE_COUNT, 6);
+  CHECK_STREQ(pd_confidence_grade_letter(PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB), "A+");
+  CHECK_STREQ(pd_confidence_grade_letter(PD_GRADE_A_JOB_LEVEL_CONFIRMATION), "A");
+  CHECK_STREQ(pd_confidence_grade_letter(PD_GRADE_B_ORDERED_DEVICE_RESPONSE), "B");
+  CHECK_STREQ(pd_confidence_grade_letter(PD_GRADE_E_TRANSPORT_ONLY), "E");
+  CHECK_STREQ(pd_confidence_grade_name(PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB),
+              "APlus_DurableQueryableJob");
+
+  /* docs/compatibility-brief.md §28 and §1. */
+  CHECK_EQ(PD_PROVENANCE_COUNT, 3);
+  CHECK_STREQ(pd_provenance_name(PD_PROVENANCE_DOCUMENTED), "Documented");
+  CHECK_STREQ(pd_provenance_name(PD_PROVENANCE_PROBED), "Probed");
+  CHECK_STREQ(pd_provenance_name(PD_PROVENANCE_UNVERIFIED), "Unverified");
+  CHECK_EQ(PD_LANGUAGE_COUNT, 8);
+  CHECK_STREQ(pd_command_language_name(PD_LANGUAGE_ESC_POS), "EscPos");
+  CHECK_STREQ(pd_command_language_name(PD_LANGUAGE_ZPL), "Zpl");
+  CHECK_STREQ(pd_command_language_name(PD_LANGUAGE_CPCL), "Cpcl");
+  CHECK_STREQ(pd_command_language_name(PD_LANGUAGE_BROTHER_RASTER), "BrotherRaster");
+  CHECK_STREQ(pd_command_language_name(PD_LANGUAGE_ESC_P), "EscP");
+}
+
+static void test_provenance_is_readable_per_printer(void) {
+  /* docs/compatibility-brief.md §28 through the ABI. The point of the distinction is
+   * that it is visible BEFORE anything is printed: an integrator can tell an Epson whose
+   * fence is manufacturer-documented from a clone whose fence is a hopeful default, and
+   * decide whether running a probe against the site's hardware is worth the trip. */
+  pd_driver* driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+  pd_transport_vtable vtable;
+  memset(&vtable, 0, sizeof(vtable));
+  vtable.connect = scripted_connect;
+  vtable.write = scripted_write;
+  vtable.close = scripted_close;
+
+  struct {
+    const char* profile;
+    pd_provenance provenance;
+    pd_completion_mechanism completion;
+    pd_command_language language;
+  } cases[] = {
+      /* Epson: GS ( H fn 48 is in Epson's own model command table. */
+      {"epson_tm_t88vi", PD_PROVENANCE_DOCUMENTED, PD_COMPLETION_GS_PAREN_H,
+       PD_LANGUAGE_ESC_POS},
+      {"epson_tm_p20ii", PD_PROVENANCE_DOCUMENTED, PD_COMPLETION_GS_PAREN_H,
+       PD_LANGUAGE_ESC_POS},
+      /* Xprinter, Rongta, Partner: advertised, never documented. §13, §14, §15. */
+      {"xprinter_s_series", PD_PROVENANCE_UNVERIFIED, PD_COMPLETION_GS_R1,
+       PD_LANGUAGE_ESC_POS},
+      {"rongta_rp80", PD_PROVENANCE_UNVERIFIED, PD_COMPLETION_GS_R1, PD_LANGUAGE_ESC_POS},
+      {"partner_rp110", PD_PROVENANCE_UNVERIFIED, PD_COMPLETION_GS_R1,
+       PD_LANGUAGE_ESC_POS},
+      /* The one interrogated unit: probed, which beats the datasheet either way. */
+      {"xp-s260m", PD_PROVENANCE_PROBED, PD_COMPLETION_GS_PAREN_H, PD_LANGUAGE_ESC_POS},
+      /* No fence at all, so nothing to have documented. */
+      {"generic_unknown", PD_PROVENANCE_UNVERIFIED, PD_COMPLETION_NONE,
+       PD_LANGUAGE_ESC_POS},
+      /* Not ESC/POS at any level, and the language says so before anything is sent. */
+      {"zebra_zq600_plus", PD_PROVENANCE_UNVERIFIED, PD_COMPLETION_NONE, PD_LANGUAGE_ZPL},
+      {"brother_rj4000", PD_PROVENANCE_UNVERIFIED, PD_COMPLETION_NONE,
+       PD_LANGUAGE_BROTHER_RASTER},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    vtable.description = cases[i].profile;
+    pd_printer* printer =
+        pd_add_printer_custom(driver, &vtable, NULL, cases[i].profile, 576);
+    CHECK(printer != NULL);
+    if (printer == NULL) {
+      fprintf(stderr, "%s: %s\n", cases[i].profile, pd_last_error(driver));
+      continue;
+    }
+    CHECK_EQ(pd_printer_completion(printer), cases[i].completion);
+    CHECK_EQ(pd_printer_completion_provenance(printer), cases[i].provenance);
+    CHECK_EQ(pd_printer_language(printer), cases[i].language);
+  }
+
+  /* A null handle claims the least rather than crashing. */
+  CHECK_EQ(pd_printer_completion_provenance(NULL), PD_PROVENANCE_UNVERIFIED);
+  pd_destroy(driver);
+}
+
+static void test_profile_ids_expose_the_whole_catalogue(void) {
+  /* docs/compatibility-brief.md §26. A wrapper enumerates this instead of hardcoding
+   * names, so an id missing here is a printer nobody can select. */
+  const char* const* ids = pd_profile_ids();
+  CHECK(ids != NULL);
+  size_t count = 0;
+  int saw_generic = 0, saw_epson = 0, saw_zebra = 0, saw_unknown = 0, saw_p20ii = 0;
+  for (size_t i = 0; ids != NULL && ids[i] != NULL; ++i) {
+    ++count;
+    if (strcmp(ids[i], "generic") == 0) saw_generic = 1;
+    if (strcmp(ids[i], "epson_tm_t88vi") == 0) saw_epson = 1;
+    if (strcmp(ids[i], "zebra_zq600_plus") == 0) saw_zebra = 1;
+    if (strcmp(ids[i], "generic_unknown") == 0) saw_unknown = 1;
+    if (strcmp(ids[i], "epson_tm_p20ii") == 0) saw_p20ii = 1;
+  }
+  CHECK(count >= 80);
+  CHECK_EQ(saw_generic, 1);
+  CHECK_EQ(saw_epson, 1);
+  CHECK_EQ(saw_zebra, 1);
+  CHECK_EQ(saw_unknown, 1);
+  CHECK_EQ(saw_p20ii, 1);
+}
+
 int main(void) {
   test_submit_reaches_terminal_done();
   test_verification_identifier_round_trip();
@@ -461,6 +765,12 @@ int main(void) {
   test_same_key_dedupe_returns_same_job();
   test_event_callback_receives_ordered_progression();
   test_enum_bridge_matches_pd_h();
+  test_custom_transport_drives_a_whole_job();
+  test_custom_transport_rejects_a_broken_registration();
+  test_zebra_and_brother_are_refused_without_writing_a_byte();
+  test_grade_hierarchy_gained_a_plus();
+  test_provenance_is_readable_per_printer();
+  test_profile_ids_expose_the_whole_catalogue();
 
   if (g_failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", g_failures);

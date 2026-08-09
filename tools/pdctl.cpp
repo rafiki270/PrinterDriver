@@ -337,6 +337,11 @@ struct Discovery {
   std::string mac;
   pd::CapabilityFindings findings;
   pd::IdentityAssessment assessment;
+  // Both sides of docs/compatibility-brief.md §28: what the shipped database claimed
+  // before anything was asked, and what the device turned out to do. Keeping the
+  // defaults is the whole point — a report that only showed the promoted profile could
+  // not tell "the manual says so" apart from "we measured it".
+  pd::CapabilityProfile defaults;
   pd::CapabilityProfile profile;
   bool port_9100 = false;
   bool port_631 = false;
@@ -376,8 +381,8 @@ bool interrogate(const Endpoint& endpoint, const DiscoveryArgs& args, Discovery*
   out->assessment = pd::identify(out->findings.reported,
                                  pd::IdentityHints{args.mac, args.vendor_hint},
                                  out->findings.behaviour());
-  out->profile = pd::promote(pd::devices::byName(out->assessment.profile_guess),
-                             out->findings);
+  out->defaults = pd::devices::byName(out->assessment.profile_guess);
+  out->profile = pd::promote(out->defaults, out->findings);
 
   out->port_9100 = pd::tcpPortOpen(endpoint.host, 9100, 700);
   out->port_631 = pd::tcpPortOpen(endpoint.host, 631, 700);
@@ -458,6 +463,45 @@ int runProbe(const Endpoint& endpoint, const DiscoveryArgs& args) {
     row("unclassified bytes", hex(findings.unclassified));
   }
 
+  // docs/compatibility-brief.md §28. Three distinct things per capability, side by
+  // side, because collapsing them is the classic ESC/POS mistake: assuming that
+  // recognising the print commands implies the Epson feedback extensions.
+  //
+  //   manufacturer doc — the shipped database default said Documented, i.e. the
+  //                      vendor's own command documentation lists it for this model.
+  //                      Epson is the only family here where that is ever YES.
+  //   device probe     — this interrogation asked the installed hardware over the
+  //                      installed interface path. NOT ASKED is a third answer and is
+  //                      never rendered as NO.
+  //   result           — what the promoted profile now claims, and on what basis.
+  section("Capability provenance (brief §28)");
+  std::cout << "  " << std::left << std::setw(kLabelWidth) << ""
+            << std::setw(20) << "manufacturer doc" << std::setw(14) << "device probe"
+            << "result\n";
+  const auto provenanceRow = [](const char* label, pd::Provenance documented_default,
+                                const std::optional<bool>& probed,
+                                pd::Provenance result) {
+    std::cout << "  " << std::left << std::setw(kLabelWidth) << label << std::setw(20)
+              << (documented_default == pd::Provenance::Documented ? "YES" : "NO")
+              << std::setw(14)
+              << (probed.has_value() ? (*probed ? "YES" : "NO") : "NOT ASKED")
+              << pd::to_string(result) << "\n";
+  };
+  provenanceRow("GS ( H fn 48", discovery.defaults.completion_caps.process_id_gs_h_provenance,
+                findings.gs_h_process_id,
+                profile.completion_caps.process_id_gs_h_provenance);
+  provenanceRow("GS r 1", discovery.defaults.completion_caps.queued_gs_r_provenance,
+                findings.gs_r1, profile.completion_caps.queued_gs_r_provenance);
+  provenanceRow("DLE EOT", discovery.defaults.status.dle_eot_provenance, findings.dle_eot,
+                profile.status.dle_eot_provenance);
+  provenanceRow("GS a ASB", discovery.defaults.status.asb_provenance, findings.asb,
+                profile.status.asb_provenance);
+  provenanceRow("cutter error status", discovery.defaults.status.cutter_error_provenance,
+                findings.cutter_error_status, profile.status.cutter_error_provenance);
+  std::cout << "\n  documentation and probe answer different questions: documentation\n"
+               "  says what the model supports, the probe says what this unit does over\n"
+               "  this interface path. Either can be YES while the other is NO.\n";
+
   section("Completion");
   const pd::JobEvidence evidence = profile.evidence();
   row("mechanism", to_string(profile.completion));
@@ -493,6 +537,19 @@ int runProbe(const Endpoint& endpoint, const DiscoveryArgs& args) {
   section("Profile");
   row("selected", profile.name);
   row("language", pd::to_string(profile.language));
+  if (profile.languages.count() > 1) {
+    // A Citizen CMP publishes ESC/POS, CPCL and ZPL2 command references for one
+    // printer (§11-§12); which one this core drives is a separate fact from which
+    // ones exist.
+    std::string all;
+    for (const pd::CommandLanguage language : pd::kAllCommandLanguages) {
+      if (profile.languages.has(language)) {
+        all += (all.empty() ? "" : ", ");
+        all += pd::to_string(language);
+      }
+    }
+    row("documented languages", all);
+  }
   row("promoted by probe", yesNo(profile.probed));
   row("unreliable identity", yesNo(profile.quirks.unreliable_identity));
   row("code page", std::to_string(static_cast<int>(profile.code_page)));

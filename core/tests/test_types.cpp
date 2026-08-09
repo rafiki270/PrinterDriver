@@ -1,6 +1,7 @@
 #include <set>
 #include <string>
 
+#include "printerdriver/capability_profile.hpp"
 #include "printerdriver/types.hpp"
 #include "test_harness.hpp"
 
@@ -55,7 +56,41 @@ PD_TEST(confidence_grade_and_authority_names_are_unique_and_complete) {
   for (const ConfidenceGrade grade : kAllConfidenceGrades) {
     CHECK(letters.insert(gradeLetter(grade)).second);
   }
-  CHECK_EQ(letters.size(), static_cast<size_t>(5));
+  CHECK_EQ(letters.size(), static_cast<size_t>(6));
+
+  // docs/compatibility-brief.md §24: A+ sits above A and is a distinct letter, because
+  // a report that collapsed the two would erase the difference between "the printer
+  // confirmed this receipt" and "the printer holds a durable job record I can still
+  // query after a crash".
+  CHECK_EQ(std::string(gradeLetter(ConfidenceGrade::APlus_DurableQueryableJob)),
+           std::string("A+"));
+  CHECK_EQ(std::string(gradeLetter(ConfidenceGrade::A_JobLevelConfirmation)),
+           std::string("A"));
+  CHECK_EQ(std::string(to_string(ConfidenceGrade::APlus_DurableQueryableJob)),
+           std::string("APlus_DurableQueryableJob"));
+
+  // The hierarchy is ordered strongest-first, and A+ is value 0: the enum's own
+  // ordering is what lets a caller compare grades with `<`.
+  CHECK(ConfidenceGrade::APlus_DurableQueryableJob < ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK(ConfidenceGrade::A_JobLevelConfirmation < ConfidenceGrade::B_OrderedDeviceResponse);
+  CHECK(ConfidenceGrade::D_SpoolerCompleted < ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(static_cast<int>(ConfidenceGrade::APlus_DurableQueryableJob), 0);
+  CHECK_EQ(static_cast<int>(ConfidenceGrade::E_TransportOnly), 5);
+
+  // Nothing this core can do produces A+ yet: the ePOS transport that would retrieve a
+  // JobID result does not exist, so no mechanism maps onto it. Asserting the absence
+  // keeps the claim honest until the transport lands and this line has to change.
+  for (const CompletionMechanism mechanism :
+       {CompletionMechanism::GsParenH, CompletionMechanism::GsR1,
+        CompletionMechanism::VendorIdle, CompletionMechanism::EposJobId,
+        CompletionMechanism::StarCheckedBlock, CompletionMechanism::None}) {
+    CHECK(evidenceFor(mechanism).grade != ConfidenceGrade::APlus_DurableQueryableJob);
+  }
+
+  checkNamesUniqueAndNonEmpty(kAllProvenances);
+  CHECK_EQ(std::string(to_string(Provenance::Documented)), std::string("Documented"));
+  CHECK_EQ(std::string(to_string(Provenance::Probed)), std::string("Probed"));
+  CHECK_EQ(std::string(to_string(Provenance::Unverified)), std::string("Unverified"));
 }
 
 PD_TEST(job_result_carries_grade_authority_and_method) {

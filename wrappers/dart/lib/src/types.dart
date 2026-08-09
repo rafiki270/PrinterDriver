@@ -59,29 +59,27 @@ final class JobEvent {
 /// }
 /// ```
 sealed class JobResult {
-  const JobResult({required this.confidence});
+  const JobResult({
+    required this.confidence,
+    required this.grade,
+    required this.authority,
+    required this.method,
+  });
 
   /// How far up the evidence ladder the job got.
   ///
   /// Carried on all three outcomes, not only on [JobDone]: on a failure or an unknown
   /// it is what an operator needs in order to decide about a reprint.
   final ConfidenceLevel confidence;
-}
 
-/// The job reached `DoneSoftware` (or `PhysicallyVerified`).
-final class JobDone extends JobResult {
-  const JobDone({
-    required super.confidence,
-    required this.grade,
-    required this.authority,
-    required this.method,
-  });
-
-  /// The class of evidence behind the claim (docs/api.md §13).
+  /// The class of evidence behind the claim (docs/api.md §13,
+  /// docs/compatibility-brief.md §24).
   ///
-  /// The core's own answer, carried by `pd_job_result`. Orthogonal to [confidence]:
-  /// the level says how far up the ladder the job climbed, the grade says what the
-  /// claim is made of.
+  /// The core's own answer, carried by `pd_job_result` on every outcome for the same
+  /// reason [confidence] is. Orthogonal to the level: the level says how far up the
+  /// ladder the job climbed, the grade says what the claim is made of. A refusal grades
+  /// [ConfidenceGrade.eTransportOnly], which is the honest reading of a job that never
+  /// reached a device.
   final ConfidenceGrade grade;
 
   /// Who is making the claim — the printer itself, a spooler, or nobody.
@@ -90,6 +88,16 @@ final class JobDone extends JobResult {
   /// The command behind the claim, e.g. `GS(H) fn48`. `none` when nothing was
   /// confirmed: the string a support engineer needs six months later.
   final String method;
+}
+
+/// The job reached `DoneSoftware` (or `PhysicallyVerified`).
+final class JobDone extends JobResult {
+  const JobDone({
+    required super.confidence,
+    required super.grade,
+    required super.authority,
+    required super.method,
+  });
 
   @override
   String toString() =>
@@ -99,7 +107,13 @@ final class JobDone extends JobResult {
 /// The job failed and the failure is confirmed: nothing printed, or the failure itself
 /// was reported.
 final class JobFailed extends JobResult {
-  const JobFailed({required super.confidence, required this.reason});
+  const JobFailed({
+    required super.confidence,
+    required super.grade,
+    required super.authority,
+    required super.method,
+    required this.reason,
+  });
 
   final FailureReason reason;
 
@@ -112,7 +126,13 @@ final class JobFailed extends JobResult {
 /// Not a success and not a failure. Surface it to an operator; resolve it with
 /// `forceReprint` or with a manual confirmation.
 final class JobUnknown extends JobResult {
-  const JobUnknown({required super.confidence, required this.reason});
+  const JobUnknown({
+    required super.confidence,
+    required super.grade,
+    required super.authority,
+    required super.method,
+    required this.reason,
+  });
 
   /// Usually [FailureReason.unknown]; [FailureReason.timeoutAwaitingCompletion] when
   /// the completion wait ran out, which is the case worth telling an operator about.
@@ -130,17 +150,32 @@ final class JobUnknown extends JobResult {
 JobResult jobResultFromNative(PdJobResult result) {
   final confidence = ConfidenceLevel.fromNative(result.confidence);
   final reason = FailureReason.fromNative(result.reason);
+  final grade = ConfidenceGrade.fromNative(result.grade);
+  final authority = CompletionAuthority.fromNative(result.authority);
+  // Copied out here: the ABI owns the buffer, and it lives as long as the driver rather
+  // than as long as this struct.
+  final method = readNativeString(result.method);
   return switch (result.outcome) {
     0 => JobDone(
         confidence: confidence,
-        grade: ConfidenceGrade.fromNative(result.grade),
-        authority: CompletionAuthority.fromNative(result.authority),
-        // Copied out here: the ABI owns the buffer, and it lives as long as the driver
-        // rather than as long as this struct.
-        method: readNativeString(result.method),
+        grade: grade,
+        authority: authority,
+        method: method,
       ),
-    1 => JobFailed(confidence: confidence, reason: reason),
-    2 => JobUnknown(confidence: confidence, reason: reason),
+    1 => JobFailed(
+        confidence: confidence,
+        grade: grade,
+        authority: authority,
+        method: method,
+        reason: reason,
+      ),
+    2 => JobUnknown(
+        confidence: confidence,
+        grade: grade,
+        authority: authority,
+        method: method,
+        reason: reason,
+      ),
     _ => throw UnrecognizedNativeValue('pd_job_outcome', result.outcome),
   };
 }

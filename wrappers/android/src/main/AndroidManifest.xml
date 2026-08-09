@@ -1,10 +1,41 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Every printer transport this wrapper currently exposes (pd_add_printer_tcp,
-         docs/api.md §2) is a raw TCP socket. Declared here so the manifest merger
-         propagates it into any app that depends on this library; nothing else in this
-         module needs a permission. -->
+    <!-- pd_add_printer_tcp (docs/api.md §2) is a raw TCP socket. Declared here so the
+         manifest merger propagates it into any app that depends on this library. -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Bluetooth Classic SPP (docs/compatibility-brief.md §25), used by
+         PrinterDriver.addPrinterBluetooth. Split across the API 30/31 boundary because
+         Android 12 replaced the old blanket permissions with per-purpose ones:
+
+         - BLUETOOTH / BLUETOOTH_ADMIN are install-time and cover API <= 30 only, hence
+           maxSdkVersion. BLUETOOTH_ADMIN is what cancelDiscovery() needed there.
+         - BLUETOOTH_CONNECT is the API 31+ runtime permission for talking to an already
+           paired device: getRemoteDevice + createRfcommSocketToServiceRecord + connect.
+         - BLUETOOTH_SCAN is the API 31+ runtime permission cancelDiscovery() falls
+           under. neverForLocation is asserted because this library never derives
+           location from a scan result -- it does not scan at all, it only cancels a
+           discovery somebody else may have started -- and without that flag every
+           consuming app would inherit a location-permission requirement it has no use
+           for.
+
+         This library declares them; it cannot request them. A runtime permission prompt
+         needs an Activity, and a library that pops one has taken a decision belonging to
+         the host app. -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
+
+    <!-- required="false": a fixed-install POS terminal that only ever prints over TCP is
+         a supported configuration, and marking the feature required would hide this
+         library's consumers from those devices on Google Play. -->
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
 
 </manifest>

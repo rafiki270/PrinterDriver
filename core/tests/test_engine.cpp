@@ -1499,3 +1499,249 @@ PD_TEST(transport_tcp_factory_describes_its_endpoint) {
   CHECK(!result.ok);
   CHECK_EQ(result.error, TransportError::NotConnected);
 }
+
+// --- Custom transports: the embedder owns the link (brief §25) ----------------------
+
+namespace {
+
+// A stand-in for a Bluetooth stack. It exists to prove the boundary works, and it is
+// shaped like the real thing rather than like a convenience: responses come back on a
+// SEPARATE thread, because that is what a CoreBluetooth delegate queue, an Android
+// BluetoothSocket reader or a BlueZ recv loop actually does, and because pd.h forbids
+// feeding bytes from inside write(). A test double that answered inline would prove the
+// core works under a threading model no real link has.
+class ScriptedLink {
+ public:
+  explicit ScriptedLink(std::shared_ptr<pdfake::FakePrinter> device)
+      : device_(std::move(device)) {
+    CustomTransportLink::Callbacks callbacks;
+    callbacks.description = "scripted-bt:00:11:22:33:44:55";
+    callbacks.connect = [this] {
+      ++connects_;
+      return connect_succeeds_.load();
+    };
+    callbacks.write = [this](const uint8_t* data, size_t size) -> int64_t {
+      ++writes_;
+      if (short_write_after_ != 0 && bytes_written_ >= short_write_after_) {
+        return -1;
+      }
+      bytes_written_ += size;
+      std::vector<uint8_t> response = device_->receive(data, size);
+      if (!response.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.push_back(std::move(response));
+        cv_.notify_one();
+      }
+      return static_cast<int64_t>(size);
+    };
+    callbacks.close = [this] { ++closes_; };
+    link_ = std::make_shared<CustomTransportLink>(std::move(callbacks));
+    reader_ = std::thread([this] { readerLoop(); });
+  }
+
+  ~ScriptedLink() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_one();
+    reader_.join();
+  }
+
+  TransportFactory factory() { return customTransport(link_); }
+  const std::shared_ptr<CustomTransportLink>& link() const { return link_; }
+
+  void refuseConnections() { connect_succeeds_ = false; }
+  void failWritesAfter(size_t bytes) { short_write_after_ = bytes; }
+
+  size_t connects() const { return connects_.load(); }
+  size_t closes() const { return closes_.load(); }
+  size_t writes() const { return writes_.load(); }
+  size_t bytesWritten() const { return bytes_written_.load(); }
+
+ private:
+  void readerLoop() {
+    for (;;) {
+      std::vector<uint8_t> chunk;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stop_ || !pending_.empty(); });
+        if (stop_ && pending_.empty()) {
+          return;
+        }
+        chunk = std::move(pending_.front());
+        pending_.erase(pending_.begin());
+      }
+      link_->feedBytes(chunk.data(), chunk.size());
+    }
+  }
+
+  std::shared_ptr<pdfake::FakePrinter> device_;
+  std::shared_ptr<CustomTransportLink> link_;
+  std::thread reader_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::vector<std::vector<uint8_t>> pending_;
+  bool stop_ = false;
+  std::atomic<bool> connect_succeeds_{true};
+  std::atomic<size_t> short_write_after_{0};
+  std::atomic<size_t> connects_{0};
+  std::atomic<size_t> closes_{0};
+  std::atomic<size_t> writes_{0};
+  std::atomic<size_t> bytes_written_{0};
+};
+
+}  // namespace
+
+PD_TEST(custom_transport_drives_a_whole_job_and_keeps_the_same_fence) {
+  // The point of the boundary: a printer reached over a link the core knows nothing
+  // about still gets the full GS ( H sequence, the correlated cut fence and grade A
+  // from the physical printer. If Bluetooth produced a weaker claim than TCP, the
+  // wrapper would have become part of the completion story, which is exactly what
+  // docs/compatibility-brief.md §25 is arranged to prevent.
+  auto device = std::make_shared<pdfake::FakePrinter>();
+  ScriptedLink link(device);
+
+  PrinterDriver driver(StorageConfig::inMemory());
+  PrinterConfig config;
+  config.id = "bluetooth-printer";
+  config.transport = link.factory();
+  config.width_dots = escpos::kWidth58mm;
+  config.profile = pdfake::fastProfile(CompletionMechanism::GsParenH);
+  std::shared_ptr<Printer> printer = driver.addPrinter(config);
+
+  auto job = printer->print(Payload::raw(textPayload("BLUETOOTH TICKET")));
+  const JobResult result = job->result();
+
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.confidence, ConfidenceLevel::CutFaultFree);
+  CHECK_EQ(result.grade, ConfidenceGrade::A_JobLevelConfirmation);
+  CHECK_EQ(result.authority, CompletionAuthority::PhysicalPrinter);
+  CHECK_EQ(result.method, std::string("GS(H) fn48"));
+
+  // The bytes really went through the embedder's callback, and the paper really moved.
+  CHECK(link.connects() >= 1);
+  CHECK(link.writes() >= 1);
+  CHECK(link.bytesWritten() > 0);
+  CHECK_EQ(device->cuts(), static_cast<size_t>(1));
+  CHECK(device->receivedContains("BLUETOOTH TICKET"));
+
+  driver.shutdown();
+  // Closing the driver closes the link: a Bluetooth channel left open holds a radio
+  // connection and, on the Epson portables, the printer's single allowed pairing slot.
+  CHECK(link.closes() >= 1);
+}
+
+PD_TEST(custom_transport_reports_a_refused_link_as_unreachable) {
+  auto device = std::make_shared<pdfake::FakePrinter>();
+  ScriptedLink link(device);
+  link.refuseConnections();
+
+  PrinterDriver driver(StorageConfig::inMemory());
+  PrinterConfig config;
+  config.id = "unpaired-printer";
+  config.transport = link.factory();
+  config.profile = pdfake::fastProfile(CompletionMechanism::GsParenH);
+  std::shared_ptr<Printer> printer = driver.addPrinter(config);
+
+  const JobResult result = printer->print(Payload::raw(textPayload("NOWHERE")))->result();
+  CHECK_EQ(result.outcome, JobOutcome::Failed);
+  CHECK_EQ(result.reason, FailureReason::TransportUnreachable);
+  CHECK_EQ(result.grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(device->received().size(), static_cast<size_t>(0));
+  driver.shutdown();
+}
+
+PD_TEST(custom_transport_feeding_with_nothing_bound_is_information_not_a_crash) {
+  // Bytes can arrive from a Bluetooth peripheral before the core has connected or after
+  // it has closed — a notification already in flight, a buffered chunk delivered late.
+  // Dropping them is right; crashing on them is not, and neither is queueing them into
+  // a parser that has no job to attribute them to.
+  auto device = std::make_shared<pdfake::FakePrinter>();
+  ScriptedLink link(device);
+  const uint8_t stray[] = {0x12, 0x34};
+  CHECK(!link.link()->bound());
+  CHECK(!link.link()->feedBytes(stray, sizeof(stray)));
+  CHECK(!link.link()->linkDropped("gone"));
+
+  PrinterDriver driver(StorageConfig::inMemory());
+  PrinterConfig config;
+  config.id = "late-bytes-printer";
+  config.transport = link.factory();
+  config.profile = pdfake::fastProfile(CompletionMechanism::GsParenH);
+  std::shared_ptr<Printer> printer = driver.addPrinter(config);
+  CHECK_EQ(printer->print(Payload::raw(textPayload("ONE")))->result().outcome,
+           JobOutcome::Done);
+  // Now a transport exists and is bound, so the same call is delivered.
+  CHECK(link.link()->bound());
+  CHECK(link.link()->feedBytes(stray, sizeof(stray)));
+
+  driver.shutdown();
+  CHECK(!link.link()->bound());
+  CHECK(!link.link()->feedBytes(stray, sizeof(stray)));
+}
+
+PD_TEST(custom_transport_short_write_leaves_the_job_unknown_not_failed) {
+  // docs/api.md §4: how far a write got is what separates a receipt that certainly did
+  // not print from one that may have printed most of itself. A Bluetooth link that dies
+  // mid-receipt is the case this exists for.
+  auto device = std::make_shared<pdfake::FakePrinter>();
+  ScriptedLink link(device);
+  link.failWritesAfter(1);  // the preflight goes out, the payload does not
+
+  PrinterDriver driver(StorageConfig::inMemory());
+  PrinterConfig config;
+  config.id = "dropping-printer";
+  config.transport = link.factory();
+  config.profile = pdfake::fastProfile(CompletionMechanism::GsParenH);
+  std::shared_ptr<Printer> printer = driver.addPrinter(config);
+
+  const JobResult result = printer->print(Payload::raw(textPayload("HALF")))->result();
+  CHECK(result.outcome != JobOutcome::Done);
+  CHECK(result.grade == ConfidenceGrade::E_TransportOnly ||
+        result.grade == ConfidenceGrade::C_DeviceStatusAround);
+  driver.shutdown();
+}
+
+PD_TEST(engine_refuses_zebra_and_brother_without_writing_a_byte) {
+  // docs/compatibility-brief.md §16 and §17. ZPL, CPCL and Brother Raster are not
+  // ESC/POS at any level; an ESC/POS engine pointed at one prints a metre of text
+  // rather than a label. The refusal has to happen before the transport is even
+  // opened, which is what the byte and connect counts below assert — a refusal that
+  // still wasted a roll would be a worse bug than the one it replaced.
+  for (const CapabilityProfile& profile :
+       {devices::zebra_zq300_plus(), devices::zebra_zq500(), devices::zebra_zq600_plus(),
+        devices::brother_rj2000(), devices::brother_rj3000(), devices::brother_rj4000()}) {
+    Rig rig(CompletionMechanism::GsParenH);
+    rig.profile = profile;
+    rig.build();
+    const JobResult result = runOne(rig, "LABEL");
+
+    CHECK_EQ(result.outcome, JobOutcome::Failed);
+    CHECK_EQ(result.reason, FailureReason::Unsupported);
+    CHECK_EQ(result.grade, ConfidenceGrade::E_TransportOnly);
+    CHECK_EQ(result.authority, CompletionAuthority::TransportOnly);
+    CHECK_EQ(result.method, std::string("none"));
+    // Zero bytes, zero connections, zero cuts, zero paper.
+    CHECK_EQ(rig.link.device->received().size(), static_cast<size_t>(0));
+    CHECK_EQ(rig.link.stats->bytes.load(), static_cast<size_t>(0));
+    CHECK_EQ(rig.link.stats->connects.load(), static_cast<size_t>(0));
+    CHECK_EQ(rig.link.device->cuts(), static_cast<size_t>(0));
+  }
+}
+
+PD_TEST(engine_prints_generic_unknown_at_grade_e_and_claims_nothing_more) {
+  // The other half of the refusal story. An unidentified ESC/POS device is not refused
+  // — refusing to print because nobody has catalogued the printer would be useless in a
+  // venue — but nothing about the result is inflated to compensate.
+  Rig rig(CompletionMechanism::None);
+  rig.profile = devices::generic_unknown();
+  rig.build();
+  const JobResult result = runOne(rig, "UNIDENTIFIED");
+
+  CHECK_EQ(result.outcome, JobOutcome::Done);
+  CHECK_EQ(result.confidence, ConfidenceLevel::TransportAccepted);
+  CHECK_EQ(result.grade, ConfidenceGrade::E_TransportOnly);
+  CHECK_EQ(result.authority, CompletionAuthority::TransportOnly);
+  CHECK(rig.link.device->receivedContains("UNIDENTIFIED"));
+}

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -36,9 +37,42 @@ enum class CompletionMechanism {
 // honestly; pointing this engine at one fails Unsupported rather than pretending.
 bool isDrivableByEscposEngine(CompletionMechanism) noexcept;
 
-// docs/device-database.md "Interface ≠ transport ≠ language". Only ESC/POS is
-// implemented; the rest exist so a fleet containing them can be described.
-enum class CommandLanguage { EscPos, StarPrnt, StarLine, EposXml };
+// docs/device-database.md "Interface ≠ transport ≠ language",
+// docs/compatibility-brief.md §1. Only ESC/POS is implemented; the rest exist so a
+// fleet containing them can be described rather than misdriven. Zebra (ZPL/CPCL) and
+// Brother (raster/ESC/P) are the reason this matters: pointing an ESC/POS engine at
+// either produces confetti, so a profile that names them is refused outright
+// (drivableByEscposEngine) instead of being sent bytes it cannot read.
+enum class CommandLanguage {
+  EscPos,
+  StarPrnt,
+  StarLine,
+  EposXml,
+  Zpl,           // Zebra Programming Language (Link-OS)
+  Cpcl,          // Comtec/Zebra mobile, also documented by Citizen CMP portables
+  BrotherRaster, // Brother's own raster command reference
+  EscP,          // Brother ESC/P (not Epson ESC/POS — a different language entirely)
+};
+
+// Several devices document more than one language on the same hardware: the Citizen
+// CMP-20II/30II publish ESC/POS, CPCL and ZPL2 command references for one printer
+// (docs/compatibility-brief.md §11-12), and a Zebra ZQ630 Plus documents three. Which
+// languages exist is a fact about the device; which one this core drives is
+// CapabilityProfile::language. Recording only the second would throw away the first.
+struct CommandLanguages {
+  bool esc_pos = false;
+  bool star_prnt = false;
+  bool star_line = false;
+  bool epos_xml = false;
+  bool zpl = false;
+  bool cpcl = false;
+  bool brother_raster = false;
+  bool esc_p = false;
+
+  void add(CommandLanguage language) noexcept;
+  bool has(CommandLanguage language) const noexcept;
+  size_t count() const noexcept;
+};
 
 // The cut this printer's mechanism actually performs.
 enum class CutVariant { Partial, Full, None };
@@ -63,13 +97,42 @@ struct DeviceIdentity {
   bool trusted = false;
 };
 
+// docs/compatibility-brief.md §25: **never `bluetooth = true`**. Five different things
+// hide behind that boolean and they need five different stacks — a Classic SPP socket,
+// a vendor protocol over Classic, a BLE GATT profile, Apple's MFi/ExternalAccessory
+// channel, and "the vendor SDK is the only documented path". An Epson TM-P20II
+// documents Classic *and* BLE (`TM-P20II-xxxxxx` and `TM-P20II-xxxxxx-L`); a Star
+// SM-S230i is driven through Star's SDK; Citizen CMP sells an MFi variant; Zebra
+// exposes separate Classic and BLE status connections.
+struct BluetoothTransport {
+  bool classic_spp = false;     // Bluetooth Classic, Serial Port Profile: a byte stream
+  bool classic_vendor = false;  // Classic, but under the vendor's own framing
+  bool ble = false;             // Bluetooth Low Energy, GATT
+  bool mfi = false;             // Apple MFi / ExternalAccessory (iOS without BLE)
+  bool vendor_sdk = false;      // the documented path is the SDK, not a raw socket
+
+  // docs/compatibility-brief.md §6: the Epson portables document **4 KB of receive
+  // buffer normally and 64 KB for Bluetooth** — same printer, different number by
+  // path, which is exactly why pacing cannot be derived from a model name. 0 means the
+  // manufacturer does not document it, which is not the same as "small".
+  uint32_t receive_buffer_bytes = 0;
+  uint32_t bluetooth_receive_buffer_bytes = 0;
+
+  bool any() const noexcept {
+    return classic_spp || classic_vendor || ble || mfi || vendor_sdk;
+  }
+};
+
 // docs/device-database.md "Interface ≠ transport ≠ language".
 struct TransportCapabilities {
   bool raw_tcp_9100 = true;
   bool serial = false;
   bool usb = false;
-  bool bluetooth_spp = false;
+  bool wifi = false;
   bool epos = false;  // vendor HTTP/ePOS-Print endpoint
+  // Faceted per §25 rather than a single flag. Reached through a custom transport
+  // (see transport.hpp): the socket belongs to the platform, the protocol to the core.
+  BluetoothTransport bluetooth;
 };
 
 struct CompletionCapabilities {
@@ -88,6 +151,19 @@ struct CompletionCapabilities {
   // Bixolon and Star document their own status APIs as the primary path; raw ESC/POS
   // is the fallback there, not the other way round.
   bool prefer_vendor_sdk = false;
+
+  // docs/compatibility-brief.md §28: what each flag above is worth. Unverified is the
+  // default everywhere, so a family added without evidence claims nothing. Epson is
+  // the only family whose shipped defaults carry Documented for the process-ID echo —
+  // its command tables list `GS ( H` fn 48 per model. Xprinter's XP-S260M answers it
+  // on our bench but Xprinter does not document it, so the *default* is Unverified and
+  // the probe writes Probed. Rongta advertises ESC/POS and OPOS with no manufacturer-
+  // hosted manual proving the extension: Unverified, corrected from an earlier
+  // assumption. Partner Tech is probe-only across the board (§15).
+  Provenance process_id_gs_h_provenance = Provenance::Unverified;
+  Provenance queued_gs_r_provenance = Provenance::Unverified;
+  Provenance vendor_idle_provenance = Provenance::Unverified;
+  Provenance epos_job_id_provenance = Provenance::Unverified;
 };
 
 struct StatusCapabilities {
@@ -95,6 +171,13 @@ struct StatusCapabilities {
   bool asb = true;            // GS a automatic status back
   bool extended_asb = false;  // FS ( e, optional/extended devices
   bool cutter_error = true;   // DLE EOT 3 bit 3 is meaningful on this model
+
+  // Same rule as above. `DLE EOT` and ASB are in Epson's documentation for the listed
+  // TM models; everywhere else they are a default until something establishes them.
+  Provenance dle_eot_provenance = Provenance::Unverified;
+  Provenance asb_provenance = Provenance::Unverified;
+  Provenance extended_asb_provenance = Provenance::Unverified;
+  Provenance cutter_error_provenance = Provenance::Unverified;
 };
 
 // Data only. Nothing in the core ever sends these: a resume replays the line the error
@@ -124,9 +207,18 @@ struct Quirks {
 // and deriving one from the other is how receipts end up clipped.
 struct MediaProfile {
   uint16_t nominal_roll_width_mm = 80;
+  // The image, not the roll. docs/compatibility-brief.md §18: a CT-S4500 takes 112 mm
+  // media and prints 104 mm, and a renderer that derives one from the other clips every
+  // wide receipt.
+  uint16_t printable_width_mm = 72;
   uint32_t printable_width_dots = escpos::kWidth80mm;
   uint16_t dpi = 203;
   bool paper_guide_58mm = false;
+  // What the same mechanism prints once the 58 mm paper guide is fitted — a separate
+  // documented number, not a proportion of the 80 mm figure: a TM-T20III prints 576
+  // dots on 80 mm and 420 on 58 mm (§2, §18), where scaling would predict 417. 0 means
+  // the model has no documented 58 mm configuration.
+  uint32_t printable_width_dots_58mm = 0;
   bool black_mark_sensor = false;
   bool gap_sensor = false;
   bool near_end_sensor = false;
@@ -149,7 +241,11 @@ struct CapabilityProfile {
   std::string name = "generic-escpos";
 
   DeviceIdentity identity;
+  // The language this profile is driven in. Only EscPos is implemented.
   CommandLanguage language = CommandLanguage::EscPos;
+  // Every language the manufacturer documents for the same hardware. Set together with
+  // `language` through setLanguage(); a device with several gets the extra ones added.
+  CommandLanguages languages;
   TransportCapabilities transport;
   CompletionMechanism completion = CompletionMechanism::GsR1;
   CompletionCapabilities completion_caps;
@@ -190,8 +286,13 @@ struct CapabilityProfile {
   JobEvidence evidence() const noexcept;
 
   // Whether this core can print this profile at all. False for the vendor stacks
-  // that are first-class rather than ESC/POS-emulated, whose entries exist as data.
+  // that are first-class rather than ESC/POS-emulated, whose entries exist as data,
+  // and false for ZPL/CPCL/Brother-raster devices, which are not ESC/POS at any level.
   bool drivableByEscposEngine() const noexcept;
+
+  // Sets the drive language and records it in the documented set in one step, so the
+  // two can never disagree.
+  void setLanguage(CommandLanguage primary) noexcept;
 };
 
 // docs/device-database.md: A — job-level confirmation, B — ordered device response,
@@ -207,6 +308,15 @@ CapabilityProfile xp_s260m();
 // The conservative default for anything not yet probed: queued GS r 1 fence, pacing
 // on, so a cheap clone with no flow control still receives a whole receipt.
 CapabilityProfile generic_escpos();
+
+// Declaration order, for wrapper generators and the bridge tests that enumerate
+// members without a hand-maintained list (same contract as types.hpp's kAll* arrays).
+constexpr std::array<CommandLanguage, 8> kAllCommandLanguages{
+    CommandLanguage::EscPos, CommandLanguage::StarPrnt,
+    CommandLanguage::StarLine, CommandLanguage::EposXml,
+    CommandLanguage::Zpl, CommandLanguage::Cpcl,
+    CommandLanguage::BrotherRaster, CommandLanguage::EscP,
+};
 
 const char* to_string(CompletionMechanism) noexcept;
 const char* to_string(CutVariant) noexcept;

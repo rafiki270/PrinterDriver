@@ -36,3 +36,42 @@ internal fun interface NativeLogCallback {
     /** JNI signature "(Ljava/lang/String;)V". Bridges pd_log_cb. */
     fun onMessage(message: String)
 }
+
+/**
+ * The embedder half of pd_transport_vtable (pd.h "Custom transports",
+ * docs/compatibility-brief.md §25): the platform owns the socket, the core owns the
+ * protocol. A plain interface rather than a `fun interface` because the vtable has three
+ * operations, but the naming/visibility rules above apply unchanged -- each method is
+ * looked up by name and signature at registration time.
+ *
+ * THREAD CONTRACT, restated from pd.h because getting it wrong here deadlocks the core:
+ * all three methods are called BY THE CORE on the owning printer's worker thread, one at
+ * a time, never concurrently with each other. None of them may call
+ * [NativeBridge.transportFeedBytes] -- the thread they run on is the thread that would
+ * have to service the delivery. Received bytes go back in from the implementation's own
+ * reader thread instead, which may run concurrently with [write].
+ *
+ * The registration outlives an individual connection: after a link drop the core calls
+ * [connect] again on the same object, so an implementation must be reusable rather than
+ * single-shot.
+ */
+internal interface NativeTransportCallback {
+    /** JNI signature "()Z". Open the link; `false` fails the connect attempt (the core
+     *  retries on the next job). Must not block indefinitely -- it holds the printer's
+     *  worker thread. */
+    fun connect(): Boolean
+
+    /**
+     * JNI signature "([B)I". Returns the number of bytes actually handed to the link, or
+     * a negative value for a hard failure.
+     *
+     * The count is reported honestly rather than rounded up to [data]`.size`: pd.h makes
+     * zero bytes out a known failure and one byte out an Unknown outcome (docs/api.md
+     * §4), and which of those an operator sees decides whether they reprint.
+     */
+    fun write(data: ByteArray): Int
+
+    /** JNI signature "()V". Close the link. Called once per successful [connect]; calling
+     *  it again must be harmless. */
+    fun close()
+}

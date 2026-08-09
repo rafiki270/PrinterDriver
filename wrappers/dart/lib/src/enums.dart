@@ -436,20 +436,32 @@ enum Binarization {
 /// Carried by `pd_job_result`, so [JobDone.grade] is the core's own answer rather than
 /// anything this wrapper derived.
 enum ConfidenceGrade {
-  /// `GS ( H`, ePOS JobID result, Star checked block.
-  aJobLevelConfirmation(0),
+  /// A durable, queryable printer-side job: ePOS submits, returns a JobID and the
+  /// result is retrievable afterwards — the only mechanism in the hierarchy that
+  /// survives the application losing its connection between submission and answer
+  /// (docs/compatibility-brief.md §24).
+  ///
+  /// **Nothing produces this grade.** The ePOS transport does not exist in the core, so
+  /// no `pd_job_result` can carry it; a profile that reports an ePOS JobID is describing
+  /// hardware rather than making a claim, and grades [aJobLevelConfirmation]. It is
+  /// mirrored now because these enums are closed and four wrappers mirror them, and
+  /// adding a member later would renumber every mirror a second time.
+  aPlusDurableQueryableJob(0),
+
+  /// `GS ( H`, Star checked block, documented vendor equivalent.
+  aJobLevelConfirmation(1),
 
   /// `GS r`, vendor idle query.
-  bOrderedDeviceResponse(1),
+  bOrderedDeviceResponse(2),
 
   /// `DLE EOT`, ASB or SNMP taken around the transmission.
-  cDeviceStatusAround(2),
+  cDeviceStatusAround(3),
 
   /// A spooler or IPP gateway said completed.
-  dSpoolerCompleted(3),
+  dSpoolerCompleted(4),
 
   /// The write succeeded and nothing else is known.
-  eTransportOnly(4),
+  eTransportOnly(5),
 
   /// A `pd_confidence_grade` this build does not know.
   unrecognized(-1);
@@ -459,11 +471,15 @@ enum ConfidenceGrade {
   final int nativeValue;
 
   /// Mirrors `PD_GRADE_COUNT`.
-  static const int nativeCount = 5;
+  static const int nativeCount = 6;
 
   /// The letter used in reports; `?` for a grade this build cannot name.
-  String get letter =>
-      nativeValue < 0 ? '?' : const ['A', 'B', 'C', 'D', 'E'][nativeValue];
+  ///
+  /// Strongest first, so `grade.index` and [nativeValue] order the hierarchy the way
+  /// §24 states it and two grades compare numerically.
+  String get letter => nativeValue < 0
+      ? '?'
+      : const ['A+', 'A', 'B', 'C', 'D', 'E'][nativeValue];
 
   static ConfidenceGrade fromNative(int value) {
     for (final member in values) {
@@ -498,6 +514,86 @@ enum CompletionAuthority {
   static const int nativeCount = 5;
 
   static CompletionAuthority fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
+}
+
+/// Where the claim that a printer has a capability comes from
+/// (docs/compatibility-brief.md §28).
+///
+/// Recognising ESC/POS print commands does not prove the Epson feedback extensions, so
+/// "the manufacturer's manual says so", "we asked the hardware and it answered" and
+/// "nobody has checked" are three answers rather than one boolean.
+///
+/// The three are independent, not ordered: a probe can contradict documentation when the
+/// interface path swallows responses, and documentation can cover a model no probe has
+/// reached. Comparing two provenances for strength is therefore meaningless, which is
+/// why nothing here offers a comparison.
+///
+/// Mirrors `pd_provenance`.
+enum Provenance {
+  /// The manufacturer's command documentation lists it.
+  documented(0),
+
+  /// This driver asked the installed hardware.
+  probed(1),
+
+  /// Neither — a default nobody has confirmed.
+  unverified(2),
+
+  /// A `pd_provenance` this build does not know.
+  unrecognized(-1);
+
+  const Provenance(this.nativeValue);
+
+  final int nativeValue;
+
+  /// Mirrors `PD_PROVENANCE_COUNT`.
+  static const int nativeCount = 3;
+
+  static Provenance fromNative(int value) {
+    for (final member in values) {
+      if (member.nativeValue == value) return member;
+    }
+    return unrecognized;
+  }
+}
+
+/// What a device actually speaks (docs/compatibility-brief.md §1).
+///
+/// Only [escPos] is implemented. The rest exist so that a fleet containing them can be
+/// *described* rather than misdriven: a profile naming [zpl], [cpcl], [brotherRaster] or
+/// [escP] is refused with [FailureReason.unsupported] before a byte is written, which is
+/// the whole difference between a label printer that prints nothing and one that spools
+/// a roll of ESC/POS as garbage.
+///
+/// Mirrors `pd_command_language`.
+enum CommandLanguage {
+  escPos(0),
+  starPrnt(1),
+  starLine(2),
+  eposXml(3),
+  zpl(4),
+  cpcl(5),
+  brotherRaster(6),
+
+  /// Brother ESC/P — a different language from Epson ESC/POS, despite the name.
+  escP(7),
+
+  /// A `pd_command_language` this build does not know.
+  unrecognized(-1);
+
+  const CommandLanguage(this.nativeValue);
+
+  final int nativeValue;
+
+  /// Mirrors `PD_LANGUAGE_COUNT`.
+  static const int nativeCount = 8;
+
+  static CommandLanguage fromNative(int value) {
     for (final member in values) {
       if (member.nativeValue == value) return member;
     }
