@@ -42,8 +42,9 @@ data class JobEvent(
  *
  * pd_job_result also carries the evidence triple of docs/device-database.md
  * "Confidence grades for every route": [ConfidenceGrade], [CompletionAuthority] and the
- * command that produced the claim. It is surfaced on [Done], where a claim is actually
- * being made -- never a bare success.
+ * command that produced the claim. The ABI carries them on all three outcomes -- a
+ * refusal's grade E / TransportOnly is as much information as a Done's grade A -- so
+ * every case surfaces them; never a bare success.
  */
 sealed class JobResult {
     /** Reached DoneSoftware (or PhysicallyVerified later). [confidence] says what that
@@ -62,12 +63,23 @@ sealed class JobResult {
 
     /** FailedKnown: nothing printed, or the failure was confirmed (preflight refusal,
      *  transport unreachable, cutter fault...). Safe to resubmit the same key. */
-    data class Failed(val reason: FailureReason, val confidence: ConfidenceLevel) : JobResult()
+    data class Failed(
+        val reason: FailureReason,
+        val confidence: ConfidenceLevel,
+        val grade: ConfidenceGrade,
+        val authority: CompletionAuthority,
+        val method: String
+    ) : JobResult()
 
     /** Bytes were sent, no acknowledgement (timeout, crash, link drop). NOT success,
      *  NOT failure -- surface to an operator; resolve via [Printer.forceReprint] or
      *  manual confirmation. */
-    data class Unknown(val confidence: ConfidenceLevel) : JobResult()
+    data class Unknown(
+        val confidence: ConfidenceLevel,
+        val grade: ConfidenceGrade,
+        val authority: CompletionAuthority,
+        val method: String
+    ) : JobResult()
 
     internal companion object {
         // Raw pd_job_outcome values (pd.h): DONE=0, FAILED=1, UNKNOWN=2.
@@ -82,8 +94,10 @@ sealed class JobResult {
             val level = ConfidenceLevel.fromRaw(confidence)
             return when (outcome) {
                 0 -> Done(level, ConfidenceGrade.fromRaw(grade), CompletionAuthority.fromRaw(authority), method)
-                1 -> Failed(FailureReason.fromRaw(reason), level)
-                2 -> Unknown(level)
+                1 -> Failed(FailureReason.fromRaw(reason), level,
+                    ConfidenceGrade.fromRaw(grade), CompletionAuthority.fromRaw(authority), method)
+                2 -> Unknown(level,
+                    ConfidenceGrade.fromRaw(grade), CompletionAuthority.fromRaw(authority), method)
                 else -> {
                     // An outcome value this wrapper has never heard of is, by
                     // construction, not known to be Done or Failed -- Unknown is the
@@ -92,7 +106,8 @@ sealed class JobResult {
                     // UNRECOGNIZED handling, just at the sealed-class boundary instead
                     // of an enum's.
                     PdLog.w("Unrecognized pd_job_outcome raw value: $outcome; reporting Unknown")
-                    Unknown(level)
+                    Unknown(level, ConfidenceGrade.fromRaw(grade),
+                        CompletionAuthority.fromRaw(authority), method)
                 }
             }
         }

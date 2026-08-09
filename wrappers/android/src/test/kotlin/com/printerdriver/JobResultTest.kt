@@ -55,6 +55,10 @@ class JobResultTest {
         val failed = result as JobResult.Failed
         assertEquals(FailureReason.PREFLIGHT_PAPER_OUT, failed.reason)
         assertEquals(ConfidenceLevel.PRINTER_HEALTHY, failed.confidence)
+        // The ABI carries evidence on every outcome: a refusal is grade E, not blank.
+        assertEquals(ConfidenceGrade.E_TRANSPORT_ONLY, failed.grade)
+        assertEquals(CompletionAuthority.TRANSPORT_ONLY, failed.authority)
+        assertEquals("none", failed.method)
     }
 
     @Test
