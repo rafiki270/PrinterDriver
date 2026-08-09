@@ -1,0 +1,82 @@
+{
+  "name": "printerdriver-react-native",
+  "version": "0.1.0",
+  "description": "React Native / Expo bindings for the PrinterDriver receipt-printing SDK: ordered completion fences, an honest tri-state job result, and a per-printer device event stream over the portable C++ core.",
+  "license": "MIT",
+  "author": "Ondrej Rafaj",
+  "homepage": "https://github.com/rafiki270/PrinterDriver/tree/main/wrappers/react-native#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rafiki270/PrinterDriver.git",
+    "directory": "wrappers/react-native"
+  },
+  "bugs": {
+    "url": "https://github.com/rafiki270/PrinterDriver/issues"
+  },
+  "keywords": [
+    "react-native",
+    "expo",
+    "escpos",
+    "receipt-printer",
+    "thermal-printer",
+    "pos",
+    "turbomodule"
+  ],
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "react-native": "src/index.ts",
+  "source": "src/index.ts",
+  "files": [
+    "src",
+    "lib",
+    "cpp",
+    "ios",
+    "android",
+    "native",
+    "scripts/stage-native-sources.mjs",
+    "app.plugin.js",
+    "react-native.config.js",
+    "printerdriver-react-native.podspec",
+    "README.md",
+    "LICENSE",
+    "!**/__tests__",
+    "!**/*.test.ts",
+    "!**/*.tsbuildinfo"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --project tsconfig.build.json",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"test/**/*.test.ts\"",
+    "abi:generate": "node scripts/generate-abi-mirror.mjs",
+    "abi:check": "node scripts/generate-abi-mirror.mjs --check",
+    "cpp:syntax": "bash scripts/check_rn_cpp_syntax.sh",
+    "verify": "npm run abi:check && npm run typecheck && npm test && npm run cpp:syntax",
+    "stage": "node scripts/stage-native-sources.mjs",
+    "prepack": "node scripts/stage-native-sources.mjs && npm run build",
+    "postpack": "node scripts/stage-native-sources.mjs --clean"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.71.0"
+  },
+  "devDependencies": {
+    "react": "^19.2.0",
+    "react-native": "^0.86.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "codegenConfig": {
+    "name": "RNPrinterDriverSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.printerdriver.reactnative"
+    },
+    "includesGeneratedCode": false
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

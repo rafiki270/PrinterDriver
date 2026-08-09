@@ -1,0 +1,47 @@
+{
+  "//": [
+    "Two things drive this configuration.",
+    "",
+    "1. Node runs the sources and the tests directly. Node 22+ strips TypeScript types",
+    "   from .ts files but does not resolve extensionless specifiers, so every relative",
+    "   import in src/ and test/ carries an explicit '.ts'. allowImportingTsExtensions",
+    "   accepts that, and rewriteRelativeImportExtensions (tsconfig.build.json) turns each",
+    "   one back into '.js' in the emitted lib/, so the published package is ordinary",
+    "   JavaScript.",
+    "",
+    "2. erasableSyntaxOnly forbids the TypeScript constructs Node cannot strip (enum,",
+    "   namespace, parameter properties). That is not a limitation being worked around:",
+    "   it is the rule that keeps the enum mirrors in src/enums.ts const objects, which",
+    "   is what makes them comparable to pd.h by a test.",
+    "",
+    "This file is the typecheck and editor configuration and covers the tests too;",
+    "tsconfig.build.json is the one that emits lib/. Metro consumes src/index.ts directly",
+    "(package.json 'react-native'), so an app never waits for that build."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "erasableSyntaxOnly": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    "types": ["node"],
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "lib"]
+}

@@ -1,0 +1,21 @@
+{
+  "//": [
+    "The emitting configuration: src/ only, into lib/, with the '.ts' specifiers rewritten",
+    "to '.js'. `npm run build` uses this; `npm run typecheck` uses tsconfig.json, which",
+    "also covers test/."
+  ],
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "module": "CommonJS",
+    "moduleResolution": "Node10",
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "lib",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "lib", "test"]
+}
