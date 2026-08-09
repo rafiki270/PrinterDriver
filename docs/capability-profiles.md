@@ -258,3 +258,5 @@ A TM-T20III becomes a set of capabilities rather than a huge inheritance case.
 Potentially **four of the five named printer families give a real completion
 acknowledgement** — the feedback architecture is considerably more viable than it first
 looked.
+
+> **2026-08-09:** superseded where it conflicts by [compatibility-brief.md](compatibility-brief.md) — notably: Rongta `GS ( H` is **UNVERIFIED** (no manufacturer-hosted manual found), Xprinter `GS ( H` is **PROBED, not documented**, and per-capability provenance (DOCUMENTED/PROBED/UNVERIFIED) is now required.

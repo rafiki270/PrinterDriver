@@ -195,3 +195,5 @@ a "identical" unit on other firmware lands at
 `generic_escpos + gsRFence + noASB + 576Dots + earlyCutFeed=6`. That is what makes this
 robust for the "whatever thermal printer happens to be installed at the venue" reality —
 not an endless hard-coded compatibility list.
+
+> **2026-08-09:** extended and corrected by [compatibility-brief.md](compatibility-brief.md) — adds Zebra/Brother (non-ESC/POS), portables, the A+ grade, Bluetooth transport hierarchy, and capability provenance.
