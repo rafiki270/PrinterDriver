@@ -71,6 +71,20 @@ add_library(printerdriver_core STATIC
   # SwiftPM, which compiles every file in core/src, honest. Syntax-checked only; see
   # scripts/check_linux_bluetooth_syntax.sh and the note at the top of the file.
   core/src/transport_bluez.cpp
+  # --- M13b (docs/wire-protocols.md) -------------------------------------------------
+  # Star Line Mode: the two documented raw fences, the line-mode encoder and the
+  # ESC/POS -> Star transcoder (§2).
+  core/src/star.cpp
+  # The Epson ePOS-Print service: SOAP envelopes, namespace-aware parsing, the spooler's
+  # accepted-not-printed discipline and JobID retrieval (§1). Its HTTP client is plain
+  # sockets through net_platform.hpp — no dependency enters the core for it.
+  core/src/epos.cpp
+  # Does a print server in the path pass the printer's answers back? (§19-§23 of
+  # docs/compatibility-brief.md.) Behind `pdctl probe-path`.
+  core/src/probe_path.cpp
+  # RS-232 over POSIX termios, with its own Windows branch inside the file for the same
+  # reason transport_bluez.cpp has one.
+  core/src/transport_serial.cpp
   ${printerdriver_platform_sources})
 
 target_include_directories(printerdriver_core PUBLIC
@@ -129,7 +143,13 @@ target_include_directories(printerdriver_capi PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/capi/include>)
 target_include_directories(printerdriver_capi PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/capi/src)
-target_link_libraries(printerdriver_capi PUBLIC printerdriver_core)
+# M13b: pd_queue_* binds the print-queue addon (docs/sdk-spec.md §12). The addon stays a
+# separate library — an app that does not want holding, expiry and priority still must not
+# have to link a policy engine — but the ABI carries it, because a wrapper cannot
+# reimplement the three §12 rules without eventually getting one of them wrong.
+# printerdriver_queue PUBLIC-links the core, so naming both here would put the same
+# archive on the link line twice.
+target_link_libraries(printerdriver_capi PUBLIC printerdriver_queue)
 
 printerdriver_warnings(printerdriver_capi)
 
@@ -143,6 +163,9 @@ if(PD_BUILD_SHARED_CAPI)
   # The core is static and gets linked into a shared object here, so it has to be
   # position-independent. Scoped to this option so the default build is untouched.
   set_property(TARGET printerdriver_core PROPERTY POSITION_INDEPENDENT_CODE ON)
+  # M13b: the queue addon is linked into the same shared object now that pd_queue_*
+  # exists, so it needs the same treatment.
+  set_property(TARGET printerdriver_queue PROPERTY POSITION_INDEPENDENT_CODE ON)
 
   add_library(printerdriver_capi_shared SHARED capi/src/pd_capi.cpp)
   set_target_properties(printerdriver_capi_shared PROPERTIES
@@ -151,7 +174,7 @@ if(PD_BUILD_SHARED_CAPI)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/capi/include>)
   target_include_directories(printerdriver_capi_shared PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/capi/src)
-  target_link_libraries(printerdriver_capi_shared PRIVATE printerdriver_core)
+  target_link_libraries(printerdriver_capi_shared PRIVATE printerdriver_queue)  # M13b
   printerdriver_warnings(printerdriver_capi_shared)
 
   # Same ABI plus the scripted device and the enum bridge, so a wrapper's test suite can
@@ -166,7 +189,7 @@ if(PD_BUILD_SHARED_CAPI)
     ${CMAKE_CURRENT_SOURCE_DIR}/capi/src
     ${CMAKE_CURRENT_SOURCE_DIR}/capi/tests
     ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
-  target_link_libraries(printerdriver_capi_testing PRIVATE printerdriver_core)
+  target_link_libraries(printerdriver_capi_testing PRIVATE printerdriver_queue)  # M13b
   printerdriver_warnings(printerdriver_capi_testing)
 endif()
 
@@ -175,7 +198,11 @@ endif()
 # main, so the test suite can spin the real server on a loopback port in-process.
 add_library(printerdriver_agent STATIC
   agent/src/http.cpp
-  agent/src/agent.cpp)
+  agent/src/agent.cpp
+  # M13b: the Star CloudPRNT server (docs/wire-protocols.md §2). The printer polls us, so
+  # it cannot go through the byte-transport engine at all — a pulled job has no socket to
+  # fence — and it keeps its own job repository with its own retain-until-confirmed rules.
+  agent/src/cloudprnt.cpp)
 
 target_include_directories(printerdriver_agent PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/agent/include>)
@@ -204,7 +231,12 @@ set(printerdriver_tests
   test_identity
   test_profiles
   test_discovery
-  test_engine)
+  test_engine
+  # --- M13b ---------------------------------------------------------------------------
+  test_star        # docs/wire-protocols.md §2: fences, counter packing, transcoding
+  test_epos        # docs/wire-protocols.md §1: envelopes, parsing, spooler discipline
+  test_serial      # RS-232 over a pty pair, driving the same scripted device
+  test_probe_path) # docs/compatibility-brief.md §19-§23: PRINT_SERVER_ONLY
 
 foreach(test_name IN LISTS printerdriver_tests)
   add_executable(${test_name}
@@ -256,6 +288,17 @@ target_link_libraries(test_agent PRIVATE printerdriver_agent)
 target_include_directories(test_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
 printerdriver_warnings(test_agent)
 add_test(NAME test_agent COMMAND test_agent)
+
+# M13b. The CloudPRNT contract, walked by a scripted HTTP printer client over real
+# loopback sockets: poll -> get -> delete, plus the re-download and never-consume-on-GET
+# rules that a server which only ever handled the happy path would silently break.
+add_executable(test_cloudprnt
+  agent/tests/test_cloudprnt.cpp
+  core/tests/test_harness.cpp)
+target_link_libraries(test_cloudprnt PRIVATE printerdriver_agent)
+target_include_directories(test_cloudprnt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/tests)
+printerdriver_warnings(test_cloudprnt)
+add_test(NAME test_cloudprnt COMMAND test_cloudprnt)
 
 # Compiled as C11 on purpose. pd_test_support.cpp is the only C++ in this target: it
 # holds the scripted transport and the enum bridge, and it is deliberately not part of

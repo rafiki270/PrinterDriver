@@ -128,6 +128,55 @@ internal static class NativeMethods
     internal static extern void pd_subscribe_device(nint driver, nint printer,
                                                     DeviceEventCallback callback, nint context);
 
+    // --- M13b: the print-queue addon (docs/sdk-spec.md §12) ---------------------------
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_queue_create(nint driver, in PdQueuePolicy policy);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void pd_queue_destroy(nint queue);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nint pd_queue_enqueue(nint queue, nint printer,
+                                                 in PdPayload payload,
+                                                 in PdQueueOptions options);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void pd_queue_pause(nint queue,
+                                               [MarshalAs(UnmanagedType.LPUTF8Str)] string printerId);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void pd_queue_resume(nint queue,
+                                                [MarshalAs(UnmanagedType.LPUTF8Str)] string printerId);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_queue_is_paused(nint queue,
+                                                  [MarshalAs(UnmanagedType.LPUTF8Str)] string printerId);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int pd_queue_is_blocked(nint queue,
+                                                   [MarshalAs(UnmanagedType.LPUTF8Str)] string printerId);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void pd_queue_unblock(nint queue,
+                                                 [MarshalAs(UnmanagedType.LPUTF8Str)] string printerId);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nuint pd_queue_pending(nint queue,
+                                                  [MarshalAs(UnmanagedType.LPUTF8Str)] string? printerId);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nuint pd_queue_expired_count(nint queue);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nuint pd_queue_overflow_count(nint queue);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nuint pd_queue_drained_count(nint queue);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void pd_queue_tick(nint queue);
+
     // --- Jobs ------------------------------------------------------------------------
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -278,6 +327,32 @@ internal struct PdJobOptions
     public uint TopFeedDots;
     public uint BottomFeedDots;
     public int SuppressVerificationId;
+}
+
+/// <summary>
+/// <c>pd_queue_policy</c>. All-zeroes is a pure serializer: hold nothing, never expire,
+/// unlimited depth, FIFO.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdQueuePolicy
+{
+    public int HoldWhileOffline;
+    public uint DefaultTtlMs;
+    public uint MaxDepth;
+    public int DrainOrder;
+}
+
+/// <summary><c>pd_queue_options</c>.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PdQueueOptions
+{
+    public nint Key;
+    public uint TtlMs;
+    public int Priority;
+    public int Cut;
+    public int OpenDrawer;
+    public int Preflight;
+    public uint TimeoutMs;
 }
 
 [StructLayout(LayoutKind.Sequential)]

@@ -140,6 +140,87 @@ TransportFactory tcp(std::string host, uint16_t port = 9100,
                      uint32_t connect_timeout_ms = 3000);
 TransportFactory tcp(TcpConfig config);
 
+// --- M13b: RS-232 (docs/compatibility-brief.md §1, §13-§15) --------------------------
+//
+// Serial is not a legacy footnote in this fleet. Bixolon's SRP-350V documents USB,
+// Ethernet, serial, dual serial and parallel; the Citizen CMP portables are RS-232 plus
+// USB; Rongta and Xprinter desktops ship serial as standard. More to the point, serial is
+// the one interface where the ETB fence of docs/wire-protocols.md §2 is unconditionally
+// safe — there is no shared port and no broadcast, so the exclusivity that TCP 9100
+// cannot promise is a property of the cable.
+//
+// The parameters below are not decoration. A printer configured for 7E1 at 19 200 that is
+// driven at 8N1 at 9600 does not fail: it prints garbage, slowly, and the status
+// backchannel returns bytes that parse as nothing. So every frame parameter is explicit
+// and none has a "usual" value inferred from another.
+
+enum class SerialParity { None, Even, Odd };
+
+enum class SerialFlowControl {
+  None,     // no handshaking at all: only correct with a printer that never fills up
+  RtsCts,   // hardware handshaking — what a receipt printer's manual almost always means
+  XonXoff,  // software handshaking; unusable for binary raster data on some firmware
+};
+
+struct SerialConfig {
+  std::string device;  // e.g. "/dev/ttyUSB0", "/dev/cu.usbserial-1420"
+  uint32_t baud = 9600;
+  uint8_t data_bits = 8;   // 5..8
+  SerialParity parity = SerialParity::None;
+  uint8_t stop_bits = 1;   // 1 or 2
+  SerialFlowControl flow = SerialFlowControl::None;
+  uint32_t write_timeout_ms = 5000;
+};
+
+// POSIX termios. Declared unconditionally so that a Windows build still sees the
+// configuration type — a fleet description that mentions a serial printer must not stop
+// compiling — while core/src/transport_serial.cpp implements it only where termios
+// exists. connect() on a platform without it fails with a message saying so, rather than
+// pretending to open a port.
+class SerialTransport : public Transport {
+ public:
+  explicit SerialTransport(SerialConfig config);
+  ~SerialTransport() override;
+
+  using Transport::write;  // the vector overload, hidden by the override below
+
+  void onBytes(BytesCallback callback) override;
+  void onDisconnected(DisconnectCallback callback) override;
+
+  TransportResult connect() override;
+  TransportResult write(const uint8_t* data, size_t size) override;
+  void close() override;
+  bool isConnected() const override;
+  std::string describe() const override;
+
+  const SerialConfig& config() const noexcept { return config_; }
+
+  // Whether this build has a termios implementation behind it. False on Windows, where
+  // the answer is a real one rather than a crash: the port would have to be opened
+  // through the Win32 COM API, which this core does not carry.
+  static bool supported() noexcept;
+
+ private:
+  void readerLoop();
+  void teardown(bool notify, TransportError error, const std::string& message);
+
+  SerialConfig config_;
+  BytesCallback on_bytes_;
+  DisconnectCallback on_disconnected_;
+
+  mutable std::mutex mutex_;
+  int fd_ = -1;
+  int wake_read_fd_ = -1;
+  int wake_write_fd_ = -1;
+  std::thread reader_;
+  std::atomic<bool> connected_{false};
+  std::atomic<bool> closing_{false};
+  std::atomic<bool> notified_{false};
+};
+
+TransportFactory serial(SerialConfig config);
+TransportFactory serial(std::string device, uint32_t baud = 9600);
+
 // --- Custom transports: the link belongs to the embedder ----------------------------
 //
 // docs/compatibility-brief.md §25. Bluetooth cannot live in this core and should not:

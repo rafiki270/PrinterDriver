@@ -41,7 +41,24 @@ set(PD_CORE_SOURCES
     ${PD_REPO_ROOT}/core/src/capability_profile.cpp
     ${PD_REPO_ROOT}/core/src/job_store.cpp
     ${PD_REPO_ROOT}/core/src/transport.cpp
-    ${PD_REPO_ROOT}/core/src/driver.cpp)
+    ${PD_REPO_ROOT}/core/src/driver.cpp
+    # M13b (docs/wire-protocols.md): the Star engine and the ePOS client are part of the
+    # core, so the Android build compiles them like every other translation unit.
+    ${PD_REPO_ROOT}/core/src/star.cpp
+    ${PD_REPO_ROOT}/core/src/epos.cpp
+    ${PD_REPO_ROOT}/core/src/probe_path.cpp
+    ${PD_REPO_ROOT}/core/src/transport_serial.cpp
+    ${PD_REPO_ROOT}/core/src/device_profiles.cpp
+    ${PD_REPO_ROOT}/core/src/identity.cpp
+    ${PD_REPO_ROOT}/core/src/capability_probe.cpp
+    ${PD_REPO_ROOT}/core/src/discovery.cpp
+    ${PD_REPO_ROOT}/core/src/transport_custom.cpp
+    ${PD_REPO_ROOT}/core/src/platform_file_posix.cpp)
+
+# M13b: pd_queue_* binds the print-queue addon (docs/sdk-spec.md §12), which the JNI layer
+# now exposes as com.printerdriver.PrintQueue.
+set(PD_QUEUE_SOURCES
+    ${PD_REPO_ROOT}/queue/src/print_queue.cpp)
 
 # The C ABI every wrapper binds (docs/api.md §9) -- pd_capi.cpp's static_asserts are
 # what keep this wrapper's hand-mirrored Kotlin enums honest against the core.
@@ -56,11 +73,13 @@ set(PD_JNI_SOURCES
 
 add_library(printerdriver_jni SHARED
     ${PD_CORE_SOURCES}
+    ${PD_QUEUE_SOURCES}
     ${PD_CAPI_SOURCES}
     ${PD_JNI_SOURCES})
 
 target_include_directories(printerdriver_jni PRIVATE
     ${PD_REPO_ROOT}/core/include
+    ${PD_REPO_ROOT}/queue/include
     ${PD_REPO_ROOT}/capi/include
     # pd_internal.hpp, included by pd_capi.cpp only -- never included by
     # printerdriver_jni.cpp itself (that file binds pd.h only; see its header comment).

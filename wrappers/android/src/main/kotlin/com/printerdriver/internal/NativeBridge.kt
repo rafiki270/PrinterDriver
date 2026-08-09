@@ -204,6 +204,75 @@ internal object NativeBridge {
         suppressVerificationId: Boolean
     ): Long
 
+    // --- M13b: the print-queue addon (docs/sdk-spec.md section 12) ------------------
+    //
+    // pd_queue* crosses as a Long like every other handle, with 0L as the failure
+    // sentinel. It is the one handle the caller owns and frees: queueDestroy must run
+    // before driverDestroy, because the addon is layered on the driver rather than being
+    // part of its object graph.
+
+    /** Returns 0L on failure -- check driverLastError. */
+    @JvmStatic external fun queueCreate(
+        driverHandle: Long,
+        holdWhileOffline: Boolean,
+        defaultTtlMs: Int,
+        maxDepth: Int,
+        drainOrder: Int
+    ): Long
+
+    /** Stops the queue thread. Held jobs stay held and stay non-terminal: the queue does
+     *  not invent an outcome for a job whose fate it does not know. */
+    @JvmStatic external fun queueDestroy(queueHandle: Long)
+
+    /**
+     * pd_queue_enqueue with a raw payload. Returns an ordinary job handle -- already sent
+     * when the printer is usable and its lane is free, otherwise held, or already terminal
+     * with QUEUE_OVERFLOW when the lane is full.
+     *
+     * Raw only in this milestone. The raster and document tiers reach the queue through
+     * the same pd_queue_enqueue call and need the same two-pass marshaling printRaster and
+     * printDocument already carry; until those entry points exist, a caller that wants a
+     * queued document renders it and enqueues the bytes, which is a declared limitation
+     * rather than a silent one.
+     */
+    @JvmStatic external fun queueEnqueueRaw(
+        queueHandle: Long,
+        printerHandle: Long,
+        bytes: ByteArray,
+        key: String?,
+        ttlMs: Int,
+        priority: Int,
+        cut: Int,
+        openDrawer: Boolean,
+        preflight: Int,
+        timeoutMs: Int
+    ): Long
+
+    @JvmStatic external fun queuePause(queueHandle: Long, printerId: String)
+
+    @JvmStatic external fun queueResume(queueHandle: Long, printerId: String)
+
+    @JvmStatic external fun queueIsPaused(queueHandle: Long, printerId: String): Boolean
+
+    /** True once a job on this printer ended UNKNOWN. Nothing more drains onto that lane
+     *  until queueUnblock -- an operator decision, never a timer. */
+    @JvmStatic external fun queueIsBlocked(queueHandle: Long, printerId: String): Boolean
+
+    @JvmStatic external fun queueUnblock(queueHandle: Long, printerId: String)
+
+    /** Held jobs. A null or empty [printerId] counts every lane. */
+    @JvmStatic external fun queuePending(queueHandle: Long, printerId: String?): Long
+
+    @JvmStatic external fun queueExpiredCount(queueHandle: Long): Long
+
+    @JvmStatic external fun queueOverflowCount(queueHandle: Long): Long
+
+    @JvmStatic external fun queueDrainedCount(queueHandle: Long): Long
+
+    /** One expiry-and-drain pass on the calling thread. The queue's own thread already
+     *  does this on every device event and whenever a TTL comes due. */
+    @JvmStatic external fun queueTick(queueHandle: Long)
+
     /** Returns 0L when [key] is unknown, or when its job was reconstructed from the
      *  journal (pd.h: "those records carry what happened to a job, never what it
      *  contained") -- both routine, both handled by Printer.forceReprint returning

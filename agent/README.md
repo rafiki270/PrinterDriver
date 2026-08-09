@@ -77,9 +77,17 @@ Flags:
       "tcp": { "host": "192.168.1.102" },
       "widthDots": 384,
       "profile": "xprinter_pos58" }
+  ],
+  "cloudprnt": [
+    { "id": "counter",
+      "mac": "00:11:62:aa:bb:cc",
+      "mediaTypes": ["application/vnd.star.line"],
+      "maxPendingJobs": 32 }
   ]
 }
 ```
+
+`cloudprnt` printers have no host and no port — see below.
 
 ## Routes
 
@@ -91,6 +99,10 @@ Flags:
 | `POST /printers` | add one at runtime |
 | `GET /printers/<id>/status` | device status; `?refresh=1` queries the device |
 | `GET /healthz` | liveness, journal depth, instance nonce |
+| `POST\|GET\|DELETE /cloudprnt/<id>` | the CloudPRNT printer's own poll, job download and confirmation |
+| `POST /cloudprnt/<id>/jobs` | hand bytes to a CloudPRNT printer |
+| `GET /cloudprnt/<id>/jobs[/<token>]` | what is queued, and how each job ended |
+| `GET /cloudprnt` | every polling printer, with its last poll |
 
 Path segments are percent-decoded **after** the path is split, so an idempotency key
 containing `#` and a base-94 verification token containing `/` both survive — but the
@@ -203,6 +215,57 @@ curl -sS localhost:8080/printers -H 'content-type: application/json' -d '{
 
 Adding a printer whose id is taken, or whose `host:port` another lane already owns,
 answers **409** — the single-owner invariant, enforced inside the process.
+
+### CloudPRNT printers
+
+A CloudPRNT printer is the opposite topology: **it** polls **us**. Nothing here can open a
+socket to it, so it is not a `PrinterDriver` lane, has no `tcp` block, and never touches
+the job journal — there is no send for a journal to record. Point the printer's CloudPRNT
+URL at `http://<agent>:8080/cloudprnt/<id>` and it will do the rest
+([wire-protocols §2](../docs/wire-protocols.md)):
+
+```sh
+# hand it a document — already encoded, because nothing here renders for a puller
+curl -sS localhost:8080/cloudprnt/counter/jobs \
+     -H 'content-type: application/vnd.star.line' --data-binary @receipt.bin
+# {"token":"cp-…","state":"queued","grade":"E","method":"none", …}
+
+curl -sS localhost:8080/cloudprnt/counter/jobs/cp-…
+# after the printer confirms:
+# {"state":"confirmed","outcome":"Done","code":200,"grade":"A",
+#  "authority":"PhysicalPrinter","method":"CloudPRNT","confidence":"PrintConfirmed"}
+```
+
+JSON works too: `{"mediaType": "...", "base64": "..."}` or `{"text": "..."}`.
+
+The three rules the server keeps, which are what make this path safe:
+
+- **Retained until confirmed.** The `DELETE` is the only thing that deletes a job. A
+  printer that lost power mid-transfer polls again and gets the same token.
+- **Idempotent download.** `GET` never consumes: the same token yields the same bytes as
+  often as the printer asks, and a repeated `DELETE` answers success rather than sending a
+  retrying printer round the loop forever.
+- **Keyed by identity + token.** A job belongs to one printer. Pin `mac` in the config and
+  a device claiming the route with another MAC is answered as though the route did not
+  exist; leave it out and the first MAC to poll is adopted. Refusals are counted as
+  `identityRefusals` — the polling shape of `foreignWriterDetected`.
+
+Grading is the same hierarchy as everywhere else
+([compatibility-brief §24](../docs/compatibility-brief.md)): confirmation `code=200` is a
+job-level statement by the printer, so **A** / `PhysicalPrinter` / `CloudPRNT`. Everything
+else is not that. The documented failure codes come back as honest failures —
+`410 → PreflightPaperOut`, `420 → PreflightCoverOpen`, `411`/`412 →
+PreflightHardwareError`, `510`/`511`/`512`/`521 → Unsupported`, `520 →
+TimeoutAwaitingCompletion` — and a job that was downloaded but never confirmed has **no
+outcome at all** until it is, because a poll only proves the printer is alive. The status
+codes that describe the device (`211` paper low, `410` paper out, `420` cover open, `411`
+jam) surface as the same `DeviceEvent` values an ASB frame produces; the ones the enum has
+no member for (`201`, `220`, `230`, `231` …) are recorded verbatim under `conditions`
+rather than bent onto a neighbouring event.
+
+`GET /printers/<id>` answers for a polling printer too, from its last poll. `?refresh=1`
+cannot be honoured there — there is no socket to send `DLE EOT` down — and the response
+says `refreshSupported: false` instead of pretending the snapshot is fresh.
 
 ### Health
 

@@ -296,6 +296,56 @@ final class PdJobOptions extends Struct {
   external int suppressVerificationId;
 }
 
+// --- M13b: the print-queue addon (docs/sdk-spec.md §12) -------------------------------
+
+/// `pd_queue` — a policy queue in front of one driver. The one handle in this ABI the
+/// caller owns and frees, because it is an addon rather than part of the driver's object
+/// graph: `pd_queue_destroy` must run before `pd_destroy`.
+final class PdQueue extends Opaque {}
+
+/// `pd_queue_policy`. All-zeroes is a pure serializer: hold nothing, never expire,
+/// unlimited depth, FIFO.
+final class PdQueuePolicy extends Struct {
+  @Int32()
+  external int holdWhileOffline;
+
+  /// 0 means a held job never expires.
+  @Uint32()
+  external int defaultTtlMs;
+
+  /// 0 is unlimited, which recreates the printer's own buffer problem one layer up.
+  @Uint32()
+  external int maxDepth;
+
+  @Int32()
+  external int drainOrder;
+}
+
+/// `pd_queue_options`
+final class PdQueueOptions extends Struct {
+  external Pointer<Char> key;
+
+  /// 0 uses the policy default.
+  @Uint32()
+  external int ttlMs;
+
+  /// Orders the waiting set only; a job in flight is never preempted.
+  @Int32()
+  external int priority;
+
+  @Int32()
+  external int cut;
+
+  @Int32()
+  external int openDrawer;
+
+  @Int32()
+  external int preflight;
+
+  @Uint32()
+  external int timeoutMs;
+}
+
 /// `pd_reprint_options`
 final class PdReprintOptions extends Struct {
   external PdJobOptions job;
@@ -669,6 +719,69 @@ final class PrinterDriverBindings {
   final Pointer<Char> Function(int) completionMechanismName;
   final Pointer<Char> Function(int) cutVariantName;
   final int Function(int) codePageAt;
+
+  // --- M13b: the print-queue addon (docs/sdk-spec.md §12) ---------------------------
+  //
+  // Resolved lazily rather than in the constructor, so that a host binding an older
+  // shared library still gets a working driver and only fails if it actually asks for a
+  // queue — the same treatment the test-support symbols get below.
+
+  late final Pointer<PdQueue> Function(Pointer<PdDriver>, Pointer<PdQueuePolicy>)
+      queueCreate = _library.lookupFunction<
+          Pointer<PdQueue> Function(Pointer<PdDriver>, Pointer<PdQueuePolicy>),
+          Pointer<PdQueue> Function(
+              Pointer<PdDriver>, Pointer<PdQueuePolicy>)>('pd_queue_create');
+
+  late final void Function(Pointer<PdQueue>) queueDestroy =
+      _library.lookupFunction<Void Function(Pointer<PdQueue>),
+          void Function(Pointer<PdQueue>)>('pd_queue_destroy');
+
+  late final Pointer<PdJob> Function(Pointer<PdQueue>, Pointer<PdPrinter>,
+      Pointer<PdPayload>, Pointer<PdQueueOptions>) queueEnqueue =
+      _library.lookupFunction<
+          Pointer<PdJob> Function(Pointer<PdQueue>, Pointer<PdPrinter>,
+              Pointer<PdPayload>, Pointer<PdQueueOptions>),
+          Pointer<PdJob> Function(Pointer<PdQueue>, Pointer<PdPrinter>,
+              Pointer<PdPayload>, Pointer<PdQueueOptions>)>('pd_queue_enqueue');
+
+  late final void Function(Pointer<PdQueue>, Pointer<Char>) queuePause =
+      _library.lookupFunction<Void Function(Pointer<PdQueue>, Pointer<Char>),
+          void Function(Pointer<PdQueue>, Pointer<Char>)>('pd_queue_pause');
+
+  late final void Function(Pointer<PdQueue>, Pointer<Char>) queueResume =
+      _library.lookupFunction<Void Function(Pointer<PdQueue>, Pointer<Char>),
+          void Function(Pointer<PdQueue>, Pointer<Char>)>('pd_queue_resume');
+
+  late final int Function(Pointer<PdQueue>, Pointer<Char>) queueIsPaused =
+      _library.lookupFunction<Int32 Function(Pointer<PdQueue>, Pointer<Char>),
+          int Function(Pointer<PdQueue>, Pointer<Char>)>('pd_queue_is_paused');
+
+  late final int Function(Pointer<PdQueue>, Pointer<Char>) queueIsBlocked =
+      _library.lookupFunction<Int32 Function(Pointer<PdQueue>, Pointer<Char>),
+          int Function(Pointer<PdQueue>, Pointer<Char>)>('pd_queue_is_blocked');
+
+  late final void Function(Pointer<PdQueue>, Pointer<Char>) queueUnblock =
+      _library.lookupFunction<Void Function(Pointer<PdQueue>, Pointer<Char>),
+          void Function(Pointer<PdQueue>, Pointer<Char>)>('pd_queue_unblock');
+
+  late final int Function(Pointer<PdQueue>, Pointer<Char>) queuePending =
+      _library.lookupFunction<Size Function(Pointer<PdQueue>, Pointer<Char>),
+          int Function(Pointer<PdQueue>, Pointer<Char>)>('pd_queue_pending');
+
+  late final int Function(Pointer<PdQueue>) queueExpiredCount =
+      _library.lookupFunction<Size Function(Pointer<PdQueue>),
+          int Function(Pointer<PdQueue>)>('pd_queue_expired_count');
+
+  late final int Function(Pointer<PdQueue>) queueOverflowCount =
+      _library.lookupFunction<Size Function(Pointer<PdQueue>),
+          int Function(Pointer<PdQueue>)>('pd_queue_overflow_count');
+
+  late final int Function(Pointer<PdQueue>) queueDrainedCount =
+      _library.lookupFunction<Size Function(Pointer<PdQueue>),
+          int Function(Pointer<PdQueue>)>('pd_queue_drained_count');
+
+  late final void Function(Pointer<PdQueue>) queueTick = _library.lookupFunction<
+      Void Function(Pointer<PdQueue>), void Function(Pointer<PdQueue>)>('pd_queue_tick');
 
   /// Whether this library carries `capi/tests/pd_test_support.h`, i.e. whether it was
   /// built from the `printerdriver_capi_testing` target.

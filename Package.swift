@@ -25,11 +25,17 @@ let package = Package(
       sources: [
         "core/src",
         "capi/src",
+        // M13b: pd_queue_* binds the print-queue addon (docs/sdk-spec.md §12). CMake keeps
+        // it a separate library so an app that does not want holding, expiry and priority
+        // need not link a policy engine; SwiftPM has one target for the whole ABI, so the
+        // addon's single translation unit joins it here.
+        "queue/src",
       ],
       publicHeadersPath: "capi/include",
       cxxSettings: [
         .headerSearchPath("core/include"),
         .headerSearchPath("capi/src"),
+        .headerSearchPath("queue/include"),
       ]
     ),
 
@@ -56,6 +62,7 @@ let package = Package(
         .headerSearchPath("core/include"),
         .headerSearchPath("core/tests"),
         .headerSearchPath("capi/src"),
+        .headerSearchPath("queue/include"),
       ]
     ),
 

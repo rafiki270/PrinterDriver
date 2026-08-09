@@ -364,6 +364,14 @@ public enum CompletionMechanism: UInt32, ABIMirroredEnum {
   case eposJobId = 3
   case starCheckedBlock = 4
   case none = 5
+  /// M13b (docs/wire-protocols.md §2): Star's ETB fence — `0x17` plus the five-bit ASB
+  /// print-end counter. Selected only where this driver holds the printer's session
+  /// exclusively, because the ASB frame carrying that counter is broadcast to every host
+  /// connected to TCP 9100 and so cannot say *whose* data finished.
+  case starEtb = 6
+  /// M13b: Star's `ESC GS ETX` fence, which echoes the correlation bytes it was handed and
+  /// replies only to the issuing session. The default on every Star model the core drives.
+  case starEscGsEtx = 7
 
   public static let abiTypeName = "CompletionMechanism"
   /// Claims nothing. An unrecognized mechanism must not imply a fence the wrapper cannot

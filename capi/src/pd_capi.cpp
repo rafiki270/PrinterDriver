@@ -10,6 +10,10 @@
 #include "printerdriver/capability_profile.hpp"
 #include "printerdriver/device_profiles.hpp"
 #include "printerdriver/escpos_encoder.hpp"
+// M13b: the print-queue addon, bound below. The addon is a separate library on purpose
+// (docs/sdk-spec.md §12) and stays one — this ABI links it so that every wrapper can
+// reach the same policy engine, not so that the core grows a queue.
+#include "printerdriver/print_queue.hpp"
 #include "printerdriver/transport.hpp"
 #include "printerdriver/types.hpp"
 
@@ -157,6 +161,12 @@ static_assert(PD_COMPLETION_EPOS_JOB_ID == value_of(pd::CompletionMechanism::Epo
 static_assert(PD_COMPLETION_STAR_CHECKED_BLOCK ==
               value_of(pd::CompletionMechanism::StarCheckedBlock));
 static_assert(PD_COMPLETION_NONE == value_of(pd::CompletionMechanism::None));
+// M13b (docs/wire-protocols.md §2).
+static_assert(PD_COMPLETION_STAR_ETB == value_of(pd::CompletionMechanism::StarEtb));
+static_assert(PD_COMPLETION_STAR_ESC_GS_ETX ==
+              value_of(pd::CompletionMechanism::StarEscGsEtx));
+static_assert(PD_DRAIN_FIFO == value_of(pd::DrainOrder::Fifo));
+static_assert(PD_DRAIN_PRIORITY == value_of(pd::DrainOrder::Priority));
 
 static_assert(PD_CUT_VARIANT_PARTIAL == value_of(pd::CutVariant::Partial));
 static_assert(PD_CUT_VARIANT_FULL == value_of(pd::CutVariant::Full));
@@ -235,7 +245,11 @@ const char* const kJobOutcomeNames[PD_OUTCOME_COUNT] = {"Done", "Failed", "Unkno
 const char* const kPayloadKindNames[PD_PAYLOAD_KIND_COUNT] = {"Raster", "Document", "Raw"};
 
 const char* const kCompletionNames[PD_COMPLETION_COUNT] = {
-    "GsParenH", "GsR1", "VendorIdle", "EposJobId", "StarCheckedBlock", "None"};
+    "GsParenH", "GsR1", "VendorIdle", "EposJobId", "StarCheckedBlock", "None",
+    /* M13b */ "StarEtb", "StarEscGsEtx"};
+
+/* M13b */
+const char* const kDrainOrderNames[PD_DRAIN_ORDER_COUNT] = {"Fifo", "Priority"};
 
 const char* const kCutVariantNames[PD_CUT_VARIANT_COUNT] = {"Partial", "Full", "None"};
 
@@ -736,6 +750,12 @@ extern "C" pd_provenance pd_printer_completion_provenance(pd_printer* printer) {
       return static_cast<pd_provenance>(profile.completion_caps.vendor_idle_provenance);
     case pd::CompletionMechanism::EposJobId:
       return static_cast<pd_provenance>(profile.completion_caps.epos_job_id_provenance);
+    // M13b: each Star fence has its own provenance, because a profile can have the
+    // documentation for one and nothing at all for the other.
+    case pd::CompletionMechanism::StarEtb:
+      return static_cast<pd_provenance>(profile.star.etb_provenance);
+    case pd::CompletionMechanism::StarEscGsEtx:
+      return static_cast<pd_provenance>(profile.star.esc_gs_etx_provenance);
     case pd::CompletionMechanism::None:
       break;
   }
@@ -1050,4 +1070,168 @@ extern "C" pd_code_page pd_code_page_at(int32_t index) {
     return PD_CODE_PAGE_PC437;
   }
   return kCodePages[index];
+}
+
+// =====================================================================================
+// M13b: the print-queue addon through the ABI (docs/sdk-spec.md §12)
+// =====================================================================================
+//
+// A thin binding and nothing more, which is the point. The three rules of §12 — a queue
+// is not a retry engine, idempotency keys flow through, no bypass — are enforced by
+// pd::PrintQueue in the addon library, so a wrapper reaching them through this ABI gets
+// exactly the behaviour a C++ caller gets. Re-implementing any of them here would create
+// a second queue whose rules could drift, which is the failure mode this whole ABI is
+// shaped to avoid.
+
+struct pd_queue {
+  pd_driver* owner = nullptr;
+  std::unique_ptr<pd::PrintQueue> queue;
+};
+
+namespace {
+
+bool checkQueue(pd_queue* queue) {
+  return queue != nullptr && queue->owner != nullptr && queue->queue != nullptr;
+}
+
+pd::QueueOptions toQueueOptions(const pd_queue_options* options) {
+  pd::QueueOptions out;
+  if (options == nullptr) {
+    return out;
+  }
+  if (options->key != nullptr) {
+    out.key = options->key;  // copied: the caller's buffer is not retained
+  }
+  out.ttl_ms = options->ttl_ms;
+  out.priority = options->priority;
+  out.cut = static_cast<pd::CutSetting>(options->cut);
+  out.open_drawer = options->open_drawer != 0;
+  out.preflight = static_cast<pd::PreflightMode>(options->preflight);
+  out.timeout_ms = options->timeout_ms;
+  return out;
+}
+
+std::string laneId(const char* printer_id) {
+  return printer_id == nullptr ? std::string() : std::string(printer_id);
+}
+
+}  // namespace
+
+extern "C" pd_queue* pd_queue_create(pd_driver* driver, const pd_queue_policy* policy) {
+  if (driver == nullptr || !driver->driver) {
+    return nullptr;
+  }
+  pd::QueuePolicy built;
+  if (policy != nullptr) {
+    built.hold_while_offline = policy->hold_while_offline != 0;
+    built.default_ttl_ms = policy->default_ttl_ms;
+    built.max_depth = static_cast<size_t>(policy->max_depth);
+    built.drain_order = static_cast<pd::DrainOrder>(policy->drain_order);
+  } else {
+    // An all-zeroes pd_queue_policy is a pure serializer, and a NULL pointer means the
+    // same thing rather than the C++ defaults: two spellings of "I did not configure
+    // this" must not produce two different queues.
+    built.hold_while_offline = false;
+    built.default_ttl_ms = 0;
+    built.max_depth = 0;
+    built.drain_order = pd::DrainOrder::Fifo;
+  }
+  auto handle = std::unique_ptr<pd_queue>(new pd_queue());
+  handle->owner = driver;
+  handle->queue.reset(new pd::PrintQueue(*driver->driver, built));
+  clearError(driver);
+  return handle.release();
+}
+
+extern "C" void pd_queue_destroy(pd_queue* queue) {
+  if (queue == nullptr) {
+    return;
+  }
+  // stop() before the delete so held jobs are left held and non-terminal: the queue does
+  // not invent an outcome for a job whose fate it does not know.
+  if (queue->queue) {
+    queue->queue->stop();
+  }
+  delete queue;
+}
+
+extern "C" pd_job* pd_queue_enqueue(pd_queue* queue, pd_printer* printer,
+                                    const pd_payload* payload,
+                                    const pd_queue_options* options) {
+  if (!checkQueue(queue)) {
+    return nullptr;
+  }
+  pd_driver* driver = queue->owner;
+  if (!checkHandles(driver, printer)) {
+    return nullptr;
+  }
+  pd::Payload built;
+  if (!buildPayload(driver, payload, &built)) {
+    return nullptr;
+  }
+  std::shared_ptr<pd::PrintJob> job =
+      queue->queue->enqueue(printer->printer, std::move(built), toQueueOptions(options));
+  if (!job) {
+    setError(driver, "the queue did not accept the job");
+    return nullptr;
+  }
+  // Interned exactly like a pd_print job, so a key that dedupes against a direct print is
+  // visible to C as pointer equality — rule 2 of §12, observable rather than documented.
+  return pd::capi::internJob(driver, job);
+}
+
+extern "C" void pd_queue_pause(pd_queue* queue, const char* printer_id) {
+  if (checkQueue(queue)) {
+    queue->queue->pause(laneId(printer_id));
+  }
+}
+
+extern "C" void pd_queue_resume(pd_queue* queue, const char* printer_id) {
+  if (checkQueue(queue)) {
+    queue->queue->resume(laneId(printer_id));
+  }
+}
+
+extern "C" int32_t pd_queue_is_paused(pd_queue* queue, const char* printer_id) {
+  return checkQueue(queue) && queue->queue->paused(laneId(printer_id)) ? 1 : 0;
+}
+
+extern "C" int32_t pd_queue_is_blocked(pd_queue* queue, const char* printer_id) {
+  return checkQueue(queue) && queue->queue->blocked(laneId(printer_id)) ? 1 : 0;
+}
+
+extern "C" void pd_queue_unblock(pd_queue* queue, const char* printer_id) {
+  if (checkQueue(queue)) {
+    queue->queue->unblock(laneId(printer_id));
+  }
+}
+
+extern "C" size_t pd_queue_pending(pd_queue* queue, const char* printer_id) {
+  if (!checkQueue(queue)) {
+    return 0;
+  }
+  const std::string lane = laneId(printer_id);
+  return lane.empty() ? queue->queue->depth() : queue->queue->depth(lane);
+}
+
+extern "C" size_t pd_queue_expired_count(pd_queue* queue) {
+  return checkQueue(queue) ? queue->queue->expiredCount() : 0;
+}
+
+extern "C" size_t pd_queue_overflow_count(pd_queue* queue) {
+  return checkQueue(queue) ? queue->queue->overflowCount() : 0;
+}
+
+extern "C" size_t pd_queue_drained_count(pd_queue* queue) {
+  return checkQueue(queue) ? queue->queue->drainedCount() : 0;
+}
+
+extern "C" void pd_queue_tick(pd_queue* queue) {
+  if (checkQueue(queue)) {
+    queue->queue->tick();
+  }
+}
+
+extern "C" const char* pd_drain_order_name(pd_drain_order value) {
+  return nameAt(kDrainOrderNames, value);
 }

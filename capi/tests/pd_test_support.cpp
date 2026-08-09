@@ -279,7 +279,8 @@ extern "C" int pd_test_cpp_enum_count(pd_test_enum which) {
     case PD_TEST_ENUM_CUT: return 4;             // CutSetting: Profile, Partial, Full, None
     case PD_TEST_ENUM_PREFLIGHT: return 2;        // PreflightMode: Strict, Skip
     case PD_TEST_ENUM_PAYLOAD_KIND: return 3;     // PayloadKind: Raster, Document, Raw
-    case PD_TEST_ENUM_COMPLETION: return 6;       // CompletionMechanism incl. vendor mechanisms
+    // M13b: + StarEtb and StarEscGsEtx (docs/wire-protocols.md §2).
+    case PD_TEST_ENUM_COMPLETION: return 8;       // CompletionMechanism incl. vendor mechanisms
     case PD_TEST_ENUM_CUT_VARIANT: return 3;      // CutVariant: Partial, Full, None
     case PD_TEST_ENUM_ALIGNMENT: return 3;        // escpos::Alignment: Left, Center, Right
     case PD_TEST_ENUM_CODE_PAGE: return 5;        // escpos::CodePage, non-contiguous values
@@ -329,7 +330,9 @@ extern "C" int pd_test_cpp_enum_value(pd_test_enum which, int index) {
       static constexpr pd::CompletionMechanism kValues[] = {
           pd::CompletionMechanism::GsParenH,  pd::CompletionMechanism::GsR1,
           pd::CompletionMechanism::VendorIdle, pd::CompletionMechanism::EposJobId,
-          pd::CompletionMechanism::StarCheckedBlock, pd::CompletionMechanism::None};
+          pd::CompletionMechanism::StarCheckedBlock, pd::CompletionMechanism::None,
+          /* M13b */ pd::CompletionMechanism::StarEtb,
+          pd::CompletionMechanism::StarEscGsEtx};
       return static_cast<int>(kValues[index]);
     }
     case PD_TEST_ENUM_CUT_VARIANT: {

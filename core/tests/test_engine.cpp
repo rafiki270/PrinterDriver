@@ -1304,11 +1304,16 @@ PD_TEST(engine_grades_a_status_refusal_and_an_unacknowledged_job_honestly) {
 }
 
 PD_TEST(engine_refuses_a_mechanism_it_cannot_drive_instead_of_printing_blind) {
-  // A Star profile describes a checked-block device this core does not speak.
-  // Printing it through Star's ESC/POS emulation would put paper out with no fence
+  // A profile whose completion mechanism is an SDK call this core does not speak.
+  // Printing it through a vendor's ESC/POS emulation would put paper out with no fence
   // behind it and a result nobody should believe.
+  //
+  // M13b changed which profile makes the point. The Star *desktops* are now driven for
+  // real over a documented raw fence, so they are no longer an example of anything being
+  // refused; the SDK-first portables are, because beginCheckedBlock is an API and not a
+  // wire primitive, and no amount of raw socket makes it one.
   Rig rig(CompletionMechanism::GsParenH);
-  rig.profile = devices::star_tsp100();
+  rig.profile = devices::star_sm_s230();
   rig.build();
   const JobResult result = runOne(rig, "STAR TICKET");
 

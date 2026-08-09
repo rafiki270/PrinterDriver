@@ -877,6 +877,140 @@ JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printDocume
   return job != nullptr ? reinterpret_cast<jlong>(job) : 0;
 }
 
+// --- M13b: the print-queue addon (docs/sdk-spec.md section 12) -------------------------
+//
+// A thin binding and nothing more. The three rules of section 12 -- a queue is not a
+// retry engine, idempotency keys flow through, no bypass -- are enforced by the addon
+// behind pd.h, so a Kotlin caller gets exactly the behaviour a C++ caller gets.
+// Re-deciding any of them here would create a second queue whose rules could drift.
+
+namespace {
+
+pd_queue* AsQueue(jlong handle) {
+  return reinterpret_cast<pd_queue*>(static_cast<intptr_t>(handle));
+}
+
+}  // namespace
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_queueCreate(
+    JNIEnv*, jclass, jlong driverHandle, jboolean holdWhileOffline, jint defaultTtlMs,
+    jint maxDepth, jint drainOrder) {
+  JniDriverHandle* handle = AsDriverHandle(driverHandle);
+  if (handle == nullptr) {
+    return 0;
+  }
+  pd_queue_policy policy{};
+  policy.hold_while_offline = holdWhileOffline != JNI_FALSE ? 1 : 0;
+  // Kotlin's Int is signed and neither of these can be: a negative budget is a caller
+  // mistake, and clamping to the documented zero (never expire / unlimited) is the
+  // reading that keeps tickets printing.
+  policy.default_ttl_ms = defaultTtlMs > 0 ? static_cast<uint32_t>(defaultTtlMs) : 0u;
+  policy.max_depth = maxDepth > 0 ? static_cast<uint32_t>(maxDepth) : 0u;
+  policy.drain_order = static_cast<pd_drain_order>(drainOrder);
+  pd_queue* queue = pd_queue_create(handle->driver, &policy);
+  return queue != nullptr ? reinterpret_cast<jlong>(queue) : 0;
+}
+
+JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_queueDestroy(
+    JNIEnv*, jclass, jlong queueHandle) {
+  pd_queue_destroy(AsQueue(queueHandle));
+}
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_queueEnqueueRaw(
+    JNIEnv* env, jclass, jlong queueHandle, jlong printerHandle, jbyteArray bytes, jstring key,
+    jint ttlMs, jint priority, jint cut, jboolean openDrawer, jint preflight, jint timeoutMs) {
+  pd_queue* queue = AsQueue(queueHandle);
+  pd_printer* printer = AsPrinter(printerHandle);
+  if (queue == nullptr || printer == nullptr) {
+    return 0;
+  }
+
+  jbyte* byteElems = bytes != nullptr ? env->GetByteArrayElements(bytes, nullptr) : nullptr;
+  const jsize byteCount = bytes != nullptr ? env->GetArrayLength(bytes) : 0;
+
+  pd_raw raw{};
+  raw.bytes = reinterpret_cast<const uint8_t*>(byteElems);
+  raw.size = static_cast<size_t>(byteCount);
+
+  pd_payload payload{};
+  payload.kind = PD_PAYLOAD_RAW;
+  payload.as.raw = raw;
+
+  const std::string keyStorage = JStringToStd(env, key);
+  pd_queue_options options{};
+  options.key = key != nullptr ? keyStorage.c_str() : nullptr;
+  options.ttl_ms = ttlMs > 0 ? static_cast<uint32_t>(ttlMs) : 0u;
+  options.priority = priority;
+  options.cut = static_cast<pd_cut>(cut);
+  options.open_drawer = openDrawer != JNI_FALSE ? 1 : 0;
+  options.preflight = static_cast<pd_preflight>(preflight);
+  options.timeout_ms = timeoutMs > 0 ? static_cast<uint32_t>(timeoutMs) : 0u;
+
+  pd_job* job = pd_queue_enqueue(queue, printer, &payload, &options);
+
+  if (byteElems != nullptr) {
+    env->ReleaseByteArrayElements(bytes, byteElems, JNI_ABORT);
+  }
+  return job != nullptr ? reinterpret_cast<jlong>(job) : 0;
+}
+
+JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_queuePause(
+    JNIEnv* env, jclass, jlong queueHandle, jstring printerId) {
+  const std::string id = JStringToStd(env, printerId);
+  pd_queue_pause(AsQueue(queueHandle), id.c_str());
+}
+
+JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_queueResume(
+    JNIEnv* env, jclass, jlong queueHandle, jstring printerId) {
+  const std::string id = JStringToStd(env, printerId);
+  pd_queue_resume(AsQueue(queueHandle), id.c_str());
+}
+
+JNIEXPORT jboolean JNICALL Java_com_printerdriver_internal_NativeBridge_queueIsPaused(
+    JNIEnv* env, jclass, jlong queueHandle, jstring printerId) {
+  const std::string id = JStringToStd(env, printerId);
+  return pd_queue_is_paused(AsQueue(queueHandle), id.c_str()) != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_printerdriver_internal_NativeBridge_queueIsBlocked(
+    JNIEnv* env, jclass, jlong queueHandle, jstring printerId) {
+  const std::string id = JStringToStd(env, printerId);
+  return pd_queue_is_blocked(AsQueue(queueHandle), id.c_str()) != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_queueUnblock(
+    JNIEnv* env, jclass, jlong queueHandle, jstring printerId) {
+  const std::string id = JStringToStd(env, printerId);
+  pd_queue_unblock(AsQueue(queueHandle), id.c_str());
+}
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_queuePending(
+    JNIEnv* env, jclass, jlong queueHandle, jstring printerId) {
+  const std::string id = JStringToStd(env, printerId);
+  return static_cast<jlong>(
+      pd_queue_pending(AsQueue(queueHandle), printerId != nullptr ? id.c_str() : nullptr));
+}
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_queueExpiredCount(
+    JNIEnv*, jclass, jlong queueHandle) {
+  return static_cast<jlong>(pd_queue_expired_count(AsQueue(queueHandle)));
+}
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_queueOverflowCount(
+    JNIEnv*, jclass, jlong queueHandle) {
+  return static_cast<jlong>(pd_queue_overflow_count(AsQueue(queueHandle)));
+}
+
+JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_queueDrainedCount(
+    JNIEnv*, jclass, jlong queueHandle) {
+  return static_cast<jlong>(pd_queue_drained_count(AsQueue(queueHandle)));
+}
+
+JNIEXPORT void JNICALL Java_com_printerdriver_internal_NativeBridge_queueTick(
+    JNIEnv*, jclass, jlong queueHandle) {
+  pd_queue_tick(AsQueue(queueHandle));
+}
+
 JNIEXPORT jlong JNICALL Java_com_printerdriver_internal_NativeBridge_printRaw(
     JNIEnv* env, jclass, jlong driverHandle, jlong printerHandle, jbyteArray bytes, jstring key,
     jint cut, jboolean openDrawer, jint preflight, jint timeoutMs, jint topFeedDots, jint bottomFeedDots,

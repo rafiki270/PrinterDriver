@@ -42,6 +42,27 @@ class PrinterDriver private constructor(internal val handle: Long) : AutoCloseab
      *  last call succeeded (pd_last_error's own contract, unchanged here). Only
      *  meaningful immediately after a failure -- pd.h: "valid until the next pd_* call
      *  on that same driver." */
+    /**
+     * M13b. Creates a print queue on this driver (docs/sdk-spec.md section 12).
+     *
+     * The returned [PrintQueue] must be closed before this driver is: it is the one handle
+     * in this ABI the caller owns, because the addon is layered on the driver rather than
+     * part of its object graph.
+     */
+    fun printQueue(policy: QueuePolicy = QueuePolicy()): PrintQueue {
+        val queue = com.printerdriver.internal.NativeBridge.queueCreate(
+            handle,
+            policy.holdWhileOffline,
+            policy.defaultTtlMs,
+            policy.maxDepth,
+            policy.drainOrder.raw,
+        )
+        if (queue == 0L) {
+            throw PrinterDriverException("pd_queue_create failed: $lastError")
+        }
+        return PrintQueue(this, queue)
+    }
+
     val lastError: String
         get() {
             checkOpen()

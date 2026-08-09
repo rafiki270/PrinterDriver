@@ -96,10 +96,18 @@ PD_TEST(profile_only_escpos_mechanisms_are_drivable_here) {
 
   CHECK(devices::generic_80().drivableByEscposEngine());
   CHECK(devices::epson_tm_t20().drivableByEscposEngine());
-  // Language and mechanism are separate reasons to refuse, and a Star profile is
-  // both: StarPRNT bytes and a checked block this core does not speak.
-  CHECK_EQ(devices::star_tsp100().language, CommandLanguage::StarPrnt);
+  // Language and mechanism are separate reasons to refuse. M13b: the Star desktops are
+  // driven in Star Line Mode with a documented raw fence, so they are refused by the
+  // *ESC/POS* engine and accepted by the Star one — which is the distinction this pair of
+  // predicates exists to keep.
+  CHECK_EQ(devices::star_tsp100().language, CommandLanguage::StarLine);
+  CHECK(devices::star_tsp100().languages.has(CommandLanguage::StarPrnt));
   CHECK(!devices::star_tsp100().drivableByEscposEngine());
+  CHECK(devices::star_tsp100().drivableByStarEngine());
+  // The SDK-first portables are still refused by both: beginCheckedBlock is an SDK call,
+  // not a wire primitive.
+  CHECK(!devices::star_sm_s230().drivableByEscposEngine());
+  CHECK(!devices::star_sm_s230().drivableByStarEngine());
   CapabilityProfile mislabelled = devices::star_tsp650();
   mislabelled.completion = CompletionMechanism::GsR1;
   CHECK(!mislabelled.drivableByEscposEngine());
@@ -189,13 +197,25 @@ PD_TEST(device_database_records_the_researched_per_family_facts) {
   CHECK(!devices::partner_rp110().completion_caps.process_id_gs_h);
   CHECK_EQ(devices::sewoo_slk_ts().identity.vendor, std::string("Sewoo"));
 
-  // Star: checked block, StarPRNT parser, no ESC/POS status assumptions.
+  // Star desktops (M13b): the documented session-scoped raw fence, a Star parser, and no
+  // ESC/POS status assumptions anywhere. ETB is recorded as a capability and deliberately
+  // not selected — its counter is broadcast to every host on TCP 9100.
   for (const CapabilityProfile& star :
        {devices::star_tsp100(), devices::star_tsp650(), devices::star_mcprint()}) {
-    CHECK_EQ(star.completion, CompletionMechanism::StarCheckedBlock);
+    CHECK_EQ(star.completion, CompletionMechanism::StarEscGsEtx);
     CHECK_EQ(star.quirks.response_parser, ResponseParserVariant::StarPrnt);
     CHECK(!star.status.dle_eot);
     CHECK(star.completion_caps.prefer_vendor_sdk);
+    CHECK(star.star.esc_gs_etx);
+    CHECK(star.star.etb_counter);
+    CHECK(!star.star.exclusive_single_session);
+    CHECK_EQ(star.transport.bluetooth.mfi_protocol, std::string("jp.star-m.starpro"));
+    CHECK(star.transport.bluetooth.ble_profile_unknown);
+  }
+  // The portables keep the SDK path, which this core still does not speak.
+  for (const CapabilityProfile& star :
+       {devices::star_sm_s230(), devices::star_sm_l200(), devices::star_sm_t400()}) {
+    CHECK_EQ(star.completion, CompletionMechanism::StarCheckedBlock);
   }
 
   // Bixolon: vendor SDK first, GS ( H never assumed from "ESC/POS compatible".

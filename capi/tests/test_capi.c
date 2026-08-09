@@ -758,6 +758,90 @@ static void test_profile_ids_expose_the_whole_catalogue(void) {
   CHECK_EQ(saw_p20ii, 1);
 }
 
+/* --- m. M13b: the print-queue addon through the ABI (docs/sdk-spec.md §12) ---------
+ *
+ * One happy path, over the same scripted device the direct-print tests use, because the
+ * point being proved is that there is no second engine: a queued job takes the identical
+ * path a pd_print job takes and therefore earns the identical claim from the identical
+ * fence (§12 rule 3). The dedupe check is rule 2: the key is claimed in the driver's own
+ * index at enqueue time, so a direct pd_print of the same key finds the queued job rather
+ * than printing a second receipt. */
+
+static void test_queue_addon_drains_through_the_same_engine(void) {
+  pd_driver* driver = pd_create(NULL);
+  CHECK(driver != NULL);
+  if (driver == NULL) {
+    return;
+  }
+
+  pd_printer* printer = pd_add_printer_scripted(driver, "capi-queue", "ok");
+  CHECK(printer != NULL);
+
+  pd_queue_policy policy;
+  memset(&policy, 0, sizeof(policy));
+  policy.hold_while_offline = 1;
+  policy.max_depth = 64;
+  policy.drain_order = PD_DRAIN_FIFO;
+
+  pd_queue* queue = pd_queue_create(driver, &policy);
+  CHECK(queue != NULL);
+  if (queue == NULL) {
+    pd_destroy(driver);
+    return;
+  }
+  CHECK_EQ(pd_queue_is_paused(queue, "capi-queue"), 0);
+  CHECK_EQ(pd_queue_is_blocked(queue, "capi-queue"), 0);
+  CHECK_STREQ(pd_drain_order_name(PD_DRAIN_FIFO), "Fifo");
+  CHECK_STREQ(pd_drain_order_name(PD_DRAIN_PRIORITY), "Priority");
+
+  const char text[] = "QUEUED VIA THE ABI";
+  pd_payload payload;
+  memset(&payload, 0, sizeof(payload));
+  payload.kind = PD_PAYLOAD_RAW;
+  payload.as.raw.bytes = (const uint8_t*)text;
+  payload.as.raw.size = sizeof(text) - 1;
+
+  pd_queue_options options;
+  memset(&options, 0, sizeof(options));
+  options.key = "capi-queued-1";
+
+  pd_job* job = pd_queue_enqueue(queue, printer, &payload, &options);
+  CHECK(job != NULL);
+
+  pd_job_result result;
+  memset(&result, 0, sizeof(result));
+  CHECK_EQ(pd_job_await(driver, job, 5000, &result), 1);
+  CHECK_EQ(result.outcome, PD_OUTCOME_DONE);
+  CHECK_EQ(result.grade, PD_GRADE_A_JOB_LEVEL_CONFIRMATION);
+  CHECK_EQ(result.authority, PD_AUTHORITY_PHYSICAL_PRINTER);
+  CHECK_STREQ(result.method, "GS(H) fn48");
+  CHECK(pd_test_received_contains(printer, text));
+
+  /* Rule 2: pointer equality is how dedupe is visible through this ABI. */
+  pd_job_options direct;
+  memset(&direct, 0, sizeof(direct));
+  direct.key = "capi-queued-1";
+  pd_job* deduped = pd_print(driver, printer, &payload, &direct);
+  CHECK(deduped == job);
+  CHECK_EQ(pd_test_cuts(printer), 1);
+
+  CHECK_EQ((int)pd_queue_pending(queue, NULL), 0);
+  CHECK_EQ((int)pd_queue_pending(queue, "capi-queue"), 0);
+  CHECK_EQ((int)pd_queue_expired_count(queue), 0);
+  CHECK_EQ((int)pd_queue_overflow_count(queue), 0);
+  pd_queue_tick(queue);
+
+  pd_queue_pause(queue, "capi-queue");
+  CHECK_EQ(pd_queue_is_paused(queue, "capi-queue"), 1);
+  pd_queue_resume(queue, "capi-queue");
+  CHECK_EQ(pd_queue_is_paused(queue, "capi-queue"), 0);
+
+  /* Destroyed before the driver: the queue is the one handle this ABI hands to the
+   * caller to free, because the addon is layered on the driver rather than owned by it. */
+  pd_queue_destroy(queue);
+  pd_destroy(driver);
+}
+
 int main(void) {
   test_submit_reaches_terminal_done();
   test_verification_identifier_round_trip();
@@ -771,6 +855,7 @@ int main(void) {
   test_grade_hierarchy_gained_a_plus();
   test_provenance_is_readable_per_printer();
   test_profile_ids_expose_the_whole_catalogue();
+  test_queue_addon_drains_through_the_same_engine();
 
   if (g_failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", g_failures);

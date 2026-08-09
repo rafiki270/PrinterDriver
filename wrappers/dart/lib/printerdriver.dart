@@ -1040,3 +1040,212 @@ final class PrintJob {
   @override
   String toString() => 'PrintJob($id, key: $key)';
 }
+
+// =====================================================================================
+// M13b: the print-queue addon (docs/sdk-spec.md §12), through `pd_queue_*`
+// =====================================================================================
+
+/// In what order a lane's waiting jobs are chosen.
+enum DrainOrder {
+  /// Submission order. The safe default for tickets that must stay in sequence.
+  fifo(0),
+
+  /// Higher [QueueOptions.priority] first, submission order within equal priorities.
+  priority(1);
+
+  const DrainOrder(this.nativeValue);
+
+  final int nativeValue;
+}
+
+/// What the queue does with a job it cannot send yet.
+final class QueuePolicy {
+  const QueuePolicy({
+    this.holdWhileOffline = true,
+    this.defaultTimeToLive,
+    this.maxDepth = 64,
+    this.drainOrder = DrainOrder.fifo,
+  });
+
+  /// Park jobs while the printer is known to be offline, coverless or out of paper,
+  /// instead of failing them one at a time. False makes the queue a pure serializer.
+  final bool holdWhileOffline;
+
+  /// Shelf life for a held job. Null means it never expires — and a kitchen ticket must
+  /// not print into a recovered kitchen half an hour late.
+  final Duration? defaultTimeToLive;
+
+  /// Held jobs per printer. 0 is unlimited, which recreates the printer's own buffer
+  /// problem one layer up.
+  final int maxDepth;
+
+  final DrainOrder drainOrder;
+}
+
+/// Per-job queue settings. The printing half mirrors [JobOptions].
+final class QueueOptions {
+  const QueueOptions({
+    this.key,
+    this.timeToLive,
+    this.priority = 0,
+    this.cut = CutSetting.profile,
+    this.openDrawer = false,
+    this.preflight = PreflightMode.strict,
+    this.timeout,
+  });
+
+  /// The idempotency key. A key that already has a job — held, printing, or finished
+  /// months ago — returns that job and prints nothing.
+  final String? key;
+
+  /// Null uses [QueuePolicy.defaultTimeToLive].
+  final Duration? timeToLive;
+
+  /// Orders the waiting set only. A job already in flight is never preempted.
+  final int priority;
+
+  final CutSetting cut;
+  final bool openDrawer;
+  final PreflightMode preflight;
+
+  /// Null uses the profile's completion timeout.
+  final Duration? timeout;
+}
+
+/// A policy queue in front of one [PrinterDriver].
+///
+/// Layered on the public API, never part of it. The core already contains the only queue
+/// correctness requires — one active job per printer, with a completion fence between
+/// jobs. Everything here is policy: holding, draining on recovery, expiry, priority,
+/// depth limits.
+///
+/// Three rules from docs/sdk-spec.md §12 are load-bearing, and none of them is
+/// implemented in Dart: they live in the C++ addon behind the ABI, so this behaves
+/// identically to the Swift and .NET surfaces.
+///
+///  1. **A queue is not a retry engine.** A job that ends [JobOutcome.unknown] blocks its
+///     printer's lane, and nothing further drains onto that printer until [unblock] is
+///     called by somebody who has looked at the paper.
+///  2. **Idempotency keys flow through**, all the way into the driver's own index.
+///  3. **No bypass.** Draining runs the identical engine path [Printer.print] takes.
+///
+/// Call [dispose] before disposing the driver.
+final class PrintQueue {
+  PrintQueue(this._driver, {QueuePolicy policy = const QueuePolicy()}) {
+    _driver._checkAlive();
+    _handle = Arena.using((arena) {
+      final native = arena.allocate<PdQueuePolicy>(sizeOf<PdQueuePolicy>());
+      native.ref
+        ..holdWhileOffline = policy.holdWhileOffline ? 1 : 0
+        ..defaultTtlMs = policy.defaultTimeToLive?.inMilliseconds ?? 0
+        ..maxDepth = policy.maxDepth
+        ..drainOrder = policy.drainOrder.nativeValue;
+      return _driver._bindings.queueCreate(_driver._handle, native);
+    });
+    if (_handle == nullptr) {
+      throw PrinterDriverException(_driver.lastError);
+    }
+  }
+
+  final PrinterDriver _driver;
+  late final Pointer<PdQueue> _handle;
+  bool _disposed = false;
+
+  /// Enqueues a job.
+  ///
+  /// The returned [PrintJob] is an ordinary job handle — same id, same event stream —
+  /// already sent when the printer is usable and its lane is free, otherwise held, or
+  /// already terminal with [FailureReason.queueOverflow] when the lane is full.
+  PrintJob enqueue(
+    Printer printer,
+    Payload payload, {
+    QueueOptions options = const QueueOptions(),
+  }) {
+    _checkAlive();
+    final handle = Arena.using((arena) {
+      final nativePayload = arena.allocate<PdPayload>(sizeOf<PdPayload>());
+      payload.fillNative(arena, nativePayload);
+      final nativeOptions =
+          arena.allocate<PdQueueOptions>(sizeOf<PdQueueOptions>());
+      nativeOptions.ref
+        ..key = options.key == null ? nullptr : arena.string(options.key!)
+        ..ttlMs = options.timeToLive?.inMilliseconds ?? 0
+        ..priority = options.priority
+        ..cut = options.cut.nativeValue
+        ..openDrawer = options.openDrawer ? 1 : 0
+        ..preflight = options.preflight.nativeValue
+        ..timeoutMs = options.timeout?.inMilliseconds ?? 0;
+      return _driver._bindings
+          .queueEnqueue(_handle, printer._handle, nativePayload, nativeOptions);
+    });
+    if (handle == nullptr) {
+      throw PrinterDriverException(_driver.lastError);
+    }
+    return _driver._internJob(handle);
+  }
+
+  /// Operator hold, independent of what the device is reporting.
+  void pause(String printerId) => _withId(printerId, _driver._bindings.queuePause);
+  void resume(String printerId) => _withId(printerId, _driver._bindings.queueResume);
+  bool isPaused(String printerId) =>
+      _queryId(printerId, _driver._bindings.queueIsPaused) != 0;
+
+  /// True once a job on this printer ended [JobOutcome.unknown]. Rule 1: nothing more
+  /// drains onto that lane until a person has looked at the paper and called [unblock].
+  bool isBlocked(String printerId) =>
+      _queryId(printerId, _driver._bindings.queueIsBlocked) != 0;
+  void unblock(String printerId) => _withId(printerId, _driver._bindings.queueUnblock);
+
+  /// Held jobs. Omit [printerId] to count every lane.
+  int pending([String? printerId]) {
+    _checkAlive();
+    if (printerId == null) {
+      return _driver._bindings.queuePending(_handle, nullptr);
+    }
+    return _queryId(printerId, _driver._bindings.queuePending);
+  }
+
+  int get expiredCount => _count(_driver._bindings.queueExpiredCount);
+  int get overflowCount => _count(_driver._bindings.queueOverflowCount);
+  int get drainedCount => _count(_driver._bindings.queueDrainedCount);
+
+  /// Runs one expiry-and-drain pass on the calling isolate's thread. The queue's own
+  /// thread already does this on every device event and whenever a TTL comes due.
+  void tick() {
+    _checkAlive();
+    _driver._bindings.queueTick(_handle);
+  }
+
+  /// Stops the queue thread and frees the handle. Held jobs stay held and stay
+  /// non-terminal: the queue does not invent an outcome for a job whose fate it does not
+  /// know. Must run before [PrinterDriver.dispose].
+  void dispose() {
+    if (_disposed) {
+      return;
+    }
+    _disposed = true;
+    _driver._bindings.queueDestroy(_handle);
+  }
+
+  void _checkAlive() {
+    if (_disposed) {
+      throw StateError('this PrintQueue has been disposed');
+    }
+    _driver._checkAlive();
+  }
+
+  void _withId(String printerId, void Function(Pointer<PdQueue>, Pointer<Char>) call) {
+    _checkAlive();
+    Arena.using((arena) => call(_handle, arena.string(printerId)));
+  }
+
+  int _queryId(String printerId, int Function(Pointer<PdQueue>, Pointer<Char>) call) {
+    _checkAlive();
+    return Arena.using((arena) => call(_handle, arena.string(printerId)));
+  }
+
+  int _count(int Function(Pointer<PdQueue>) call) {
+    _checkAlive();
+    return call(_handle);
+  }
+}

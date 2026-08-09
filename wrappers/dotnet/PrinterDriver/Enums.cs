@@ -354,6 +354,21 @@ public enum CompletionMechanism
 
     /// <summary>No completion fence at all: the job can never do better than Unknown.</summary>
     None = 5,
+
+    /// <summary>
+    /// Star's ETB fence: 0x17 plus the five-bit ASB print-end counter (M13b,
+    /// docs/wire-protocols.md section 2). Selected only where the driver holds the
+    /// printer's session exclusively, because the ASB frame carrying that counter is
+    /// broadcast to every host connected to TCP 9100 and cannot say whose data finished.
+    /// </summary>
+    StarEtb = 6,
+
+    /// <summary>
+    /// Star's ESC GS ETX fence, which echoes the correlation bytes it was handed and
+    /// replies only to the issuing session. The default on every Star model the core
+    /// drives itself.
+    /// </summary>
+    StarEscGsEtx = 7,
 }
 
 /// <summary>The cut a profile's mechanism actually performs.</summary>

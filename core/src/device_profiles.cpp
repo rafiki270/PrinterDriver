@@ -82,6 +82,16 @@ CapabilityProfile epsonBase() {
   profile.recovery.clear_buffers = true;  // DLE DC4 fn 8
   profile.transport.usb = true;
   profile.transport.serial = true;
+  // --- M13b (docs/wire-protocols.md §4) --------------------------------------------
+  // The MFi ExternalAccessory protocol string, recorded once for the family. It is the
+  // exact value an iOS app puts in UISupportedExternalAccessoryProtocols, and there is no
+  // way to derive it — an EASession opened with the wrong string simply never opens.
+  profile.transport.bluetooth.mfi_protocol = "com.epson.escpos";
+  // Epson publishes no raw GATT map: the TM-P20II's BLE path is the ePOS SDK's dedicated
+  // profile. A generic BLE-UART scan that finds an FFE1 characteristic on one of these
+  // has found a coincidence, and mapping onto it would be the silent substitution §4
+  // forbids.
+  profile.transport.bluetooth.ble_profile_unknown = true;
   profile.final_feed_lines = 3;
   // Mid-range of the TM family's documented 10-15 mm head-to-cutter gap at 203 dpi;
   // tighten per model once a unit is actually probed.
@@ -175,6 +185,48 @@ CapabilityProfile starBase() {
   profile.status.cutter_error = false;
   profile.quirks.response_parser = ResponseParserVariant::StarPrnt;
   profile.transport.usb = true;
+  // --- M13b (docs/wire-protocols.md §2, §4) ----------------------------------------
+  // Both raw fences are documented in Star's own Line Mode Command Specifications, which
+  // is a different fact from whether this profile *selects* one: starRawBase() below does
+  // that for the models where a raw socket is the deployed path, and the SDK-first
+  // portables keep the checked block. Recording the capability on the shared base keeps
+  // "the printer can do this" and "we drive it this way" apart, which is the distinction
+  // docs/compatibility-brief.md §28 exists to protect.
+  profile.star.etb_counter = true;
+  profile.star.esc_gs_etx = true;
+  profile.star.etb_provenance = Provenance::Documented;
+  profile.star.esc_gs_etx_provenance = Provenance::Documented;
+  profile.transport.bluetooth.mfi_protocol = "jp.star-m.starpro";
+  // Star's SDK addresses BLE devices by `BLE:<device>` name; the GATT map is hidden.
+  profile.transport.bluetooth.ble_profile_unknown = true;
+  return profile;
+}
+
+// M13b. The Star models this core drives itself over a raw socket
+// (docs/wire-protocols.md §2). Until this milestone every Star entry was refused with
+// FailureReason::Unsupported before a byte was written, which was the honest answer while
+// the only documented mechanism was an SDK call. It is no longer the whole truth: ESC GS
+// ETX is a documented wire primitive, it waits for prior printing and motor activity, it
+// carries a print-end counter, and it **replies only to the issuing session** — so a
+// receipt on one of these printers now earns grade A with the physical printer as the
+// authority, exactly like a GS ( H echo on an Epson.
+//
+// ESC GS ETX and not ETB, on every one of them. ETB is equally documented and equally
+// real, but its counter arrives inside an ASB frame that TCP 9100 broadcasts to every
+// connected host, so on a shared port it cannot say *whose* data finished. Selecting it
+// is therefore a deliberate act by a deployment that owns the session
+// (StarCapabilities::exclusive_single_session), never a shipped default.
+CapabilityProfile starRawBase() {
+  CapabilityProfile profile = starBase();
+  // Driven in Line Mode, which is what star::Encoder emits and what the ETB/ESC GS ETX
+  // specifications describe. StarPRNT stays in the documented set because the hardware
+  // documents it too; the drive language is the narrower, verified claim.
+  profile.setLanguage(CommandLanguage::StarLine);
+  profile.languages.add(CommandLanguage::StarPrnt);
+  profile.completion = CompletionMechanism::StarEscGsEtx;
+  profile.star.exclusive_single_session = false;
+  profile.star.raster_line_mode = true;
+  profile.star.asb_block_bytes = 8;
   return profile;
 }
 
@@ -191,6 +243,11 @@ CapabilityProfile bixolonBase() {
   profile.quirks.unreliable_identity = true;
   profile.transport.usb = true;
   profile.transport.serial = true;
+  // M13b (docs/wire-protocols.md §4): the published MFi protocol string. The SPP-R310 is
+  // dual-mode BLE plus MFi iAP2 with no public GATT map, so the BLE side stays unknown
+  // rather than being mapped onto a generic UART profile.
+  profile.transport.bluetooth.mfi_protocol = "com.bixolon.protocol";
+  profile.transport.bluetooth.ble_profile_unknown = true;
   return profile;
 }
 
@@ -202,6 +259,13 @@ CapabilityProfile citizenBase() {
   profile.status.cutter_error = true;
   profile.transport.usb = true;
   profile.transport.serial = true;
+  // M13b (docs/wire-protocols.md §4): Citizen's MFi protocol string is **vendor-gated** —
+  // issued only through MFi registration and approval — so there is nothing legitimate to
+  // record. The flag says exactly that, which is a different statement from "nobody
+  // looked it up": this is a blocked integration with a known next step, and guessing a
+  // string here would produce an EASession that never opens and a support case nobody can
+  // reproduce.
+  profile.transport.bluetooth.mfi_protocol_vendor_gated = true;
   return profile;
 }
 
@@ -492,6 +556,13 @@ CapabilityProfile epson_tm_t88vi() {
   // ePOS-Print Service.
   profile.transport.epos = true;
   profile.transport.wifi = true;
+  // M13b (docs/wire-protocols.md §1): **plain network TM-T88VI has the spooler**, which
+  // is worth stating loudly because its successor does not — see epson_tm_t88vii below.
+  // Model number order is not capability order, and "OmniLink" in a product name is not
+  // a capability proxy: the matrix is by exact model and firmware or it is worthless.
+  profile.epos.spooler = true;
+  profile.epos.job_id = true;
+  profile.epos.spooler_provenance = Provenance::Documented;
   return profile;
 }
 
@@ -504,6 +575,14 @@ CapabilityProfile epson_tm_t88vii() {
   // Nothing about speed changes the fence, but a faster mechanism finishes a long
   // ticket inside a shorter completion budget.
   profile.completion_timeout_ms = 12000;
+  // M13b (docs/wire-protocols.md §1): **plain TM-T88VII has NO spooler**, unlike the
+  // TM-T88VI it replaces. Recorded as Documented-absent rather than left at the Unverified
+  // default, because "we checked and it is not there" is the fact that stops a caller
+  // waiting for a JobID result that will never exist — the first success=true from this
+  // model *is* the completion.
+  profile.epos.spooler = false;
+  profile.epos.job_id = false;
+  profile.epos.spooler_provenance = Provenance::Documented;
   return profile;
 }
 
@@ -517,6 +596,13 @@ CapabilityProfile epson_tm_m() {
   profile.transport.wifi = true;
   profile.transport.bluetooth.classic_spp = true;
   profile.transport.bluetooth.ble = true;
+  // M13b (docs/wire-protocols.md §1): the whole plain m-series — TM-m10, TM-m30, TM-m30II
+  // — has **no spooler**. They speak ePOS-Print, and the submission does not return until
+  // the data has printed, which is grade A rather than A+: strong, immediate, and gone the
+  // moment the connection is lost.
+  profile.epos.spooler = false;
+  profile.epos.job_id = false;
+  profile.epos.spooler_provenance = Provenance::Documented;
   return profile;
 }
 
@@ -709,6 +795,19 @@ CapabilityProfile epson_tm_i() {
   profile.transport.epos = true;
   profile.transport.wifi = true;
   profile.status.extended_asb = true;
+  // --- M13b (docs/wire-protocols.md §1) --------------------------------------------
+  // The head of the documented spooler matrix: TM-i with ePOS-Print Service firmware 4.1
+  // or newer has both the printer-side spooler and the JobIDs needed to retrieve a
+  // result, which together are the only grade A+ mechanism in this SDK.
+  //
+  // Spooling is a DEVICE SETTING (TMNet WebConfig / EpsonNet Config / the setup utility),
+  // not a request attribute, so this flag describes how the unit was configured, and a
+  // deployment that left the spooler off gets submit-completes-after-print semantics from
+  // the same model. It is carried per profile precisely because it cannot be asked for on
+  // the wire.
+  profile.epos.spooler = true;
+  profile.epos.job_id = true;
+  profile.epos.spooler_provenance = Provenance::Documented;
   return profile;
 }
 
@@ -866,7 +965,7 @@ CapabilityProfile partner_rp710() {
 // --- Star ---------------------------------------------------------------------------
 
 CapabilityProfile star_tsp100() {
-  CapabilityProfile profile = starBase();
+  CapabilityProfile profile = starRawBase();
   profile.name = "star_tsp100";
   profile.identity.model = "TSP100 series";
   profile.media.paper_guide_58mm = true;
@@ -898,7 +997,7 @@ CapabilityProfile star_tsp100iv() {
 }
 
 CapabilityProfile star_tsp650() {
-  CapabilityProfile profile = starBase();
+  CapabilityProfile profile = starRawBase();
   profile.name = "star_tsp650";
   profile.identity.model = "TSP650II";
   profile.media.paper_guide_58mm = true;
@@ -909,7 +1008,7 @@ CapabilityProfile star_tsp650() {
 }
 
 CapabilityProfile star_mcprint() {
-  CapabilityProfile profile = starBase();
+  CapabilityProfile profile = starRawBase();
   profile.name = "star_mcprint";
   profile.identity.model = "mC-Print series";
   profile.media.paper_guide_58mm = true;

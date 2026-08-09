@@ -302,6 +302,15 @@ enum CompletionMechanism {
   /// Write-only. Nothing above [ConfidenceLevel.transportAccepted] is claimable.
   none(5),
 
+  /// Star's ETB fence: `0x17` plus the five-bit ASB print-end counter (M13b,
+  /// docs/wire-protocols.md §2). Selected only on an exclusively held session, because
+  /// the ASB frame carrying the counter is broadcast to every host on TCP 9100.
+  starEtb(6),
+
+  /// Star's `ESC GS ETX` fence: echoes the correlation bytes it was handed and replies
+  /// only to the issuing session. The default on every Star model the core drives.
+  starEscGsEtx(7),
+
   /// A `pd_completion_mechanism` this build does not know.
   unrecognized(-1);
 
@@ -310,7 +319,7 @@ enum CompletionMechanism {
   final int nativeValue;
 
   /// Mirrors `PD_COMPLETION_COUNT`.
-  static const int nativeCount = 6;
+  static const int nativeCount = 8;
 
   static CompletionMechanism fromNative(int value) {
     for (final member in values) {

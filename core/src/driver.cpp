@@ -13,6 +13,11 @@
 #include <utility>
 
 #include "printerdriver/response_parser.hpp"
+// M13b: the Star engine (docs/wire-protocols.md §2). A second command language driven by
+// the same runtime, the same journal and the same confidence grading — the point of
+// keeping the fence logic here rather than in a transport is that neither engine can
+// weaken the other's guarantees, and both end up in one evidence document.
+#include "printerdriver/star.hpp"
 
 namespace pd {
 
@@ -535,6 +540,21 @@ class PrinterRuntime {
   void runJob(const std::shared_ptr<PrintJob>& job, const Payload& payload,
               const JobOptions& options, uint32_t attempt, bool banner);
 
+  // --- M13b: Star (docs/wire-protocols.md §2) --------------------------------------
+  // A separate job path, not a branch inside runJob(). The two languages disagree about
+  // what ESC d means, so every step from the first byte to the fence differs; sharing one
+  // function would be a switch statement in every paragraph of it.
+  void runStarJob(const std::shared_ptr<PrintJob>& job, const Payload& payload,
+                  const JobOptions& options, uint32_t attempt, bool banner);
+  escpos::Bytes buildStarPayload(const CapabilityProfile& profile, const Payload& payload,
+                                 const JobOptions& options, uint32_t attempt,
+                                 const std::string& key, bool banner,
+                                 std::vector<std::string>* dropped) const;
+  // Arms the next fence and returns the bytes that carry it. Arming before sending is not
+  // an optimisation: the answer can arrive inside the very write that asks for it.
+  escpos::Bytes armStarFence(const CapabilityProfile& profile);
+  WaitOutcome awaitStarFence(std::chrono::milliseconds timeout);
+
   // Mints this attempt's verification identifiers and makes them durable and
   // resolvable before a byte carrying them can leave. Returns an empty lease when the
   // profile has no GS ( H fence, and therefore no wire token to promote.
@@ -601,6 +621,22 @@ class PrinterRuntime {
   size_t queued_answers_ = 0;
   std::vector<escpos::ParsedEvent> realtime_answers_;
   bool link_down_ = false;
+
+  // --- M13b: Star fence state, all under io_mutex_ -----------------------------------
+  star::ResponseParser star_parser_;
+  // Which parser owns the backchannel. A Star printer never answers an ESC/POS frame and
+  // vice versa, so routing by profile is exact rather than a guess.
+  bool star_mode_ = false;
+  bool star_fence_outstanding_ = false;
+  bool star_fence_signalled_ = false;
+  bool star_fence_is_etb_ = false;
+  uint8_t star_expect_n1_ = 0;
+  uint8_t star_expect_n2_ = 0;
+  uint8_t star_expect_counter_ = 0;
+  // The last ETB counter this driver has seen. Unset until the counter is cleared at the
+  // start of a session, because "we have never looked" and "it is zero" are different.
+  std::optional<uint8_t> star_counter_;
+  uint16_t star_sequence_ = 0;
 
   mutable std::mutex status_mutex_;
   DeviceStatus status_;
@@ -794,33 +830,78 @@ void PrinterRuntime::onBytes(const uint8_t* data, size_t size) {
   std::vector<DeviceEvent> events;
   {
     std::lock_guard<std::mutex> lock(io_mutex_);
-    for (escpos::ParsedEvent& event : parser_.feed(data, size)) {
-      switch (event.kind) {
-        case escpos::ParsedEventKind::GsHAck:
-          // A structurally valid frame whose token carries somebody else's instance
-          // nonce is somebody else's receipt (docs/api.md §14, docs/sdk-spec.md §14).
-          // It is reported and dropped: attributing it would let a second writer's
-          // printer finish one of our jobs, which is the failure the one-owner rule
-          // exists to prevent. Nothing waiting is consumed either way — this branch
-          // never touches a queued or realtime expectation.
-          if (markers_ && !markers_->isOurs(event.token)) {
-            events.push_back(DeviceEvent::ForeignWriterDetected);
+    // --- M13b: the Star backchannel (docs/wire-protocols.md §2) ---------------------
+    if (star_mode_) {
+      for (const star::Event& event : star_parser_.feed(data, size)) {
+        switch (event.kind) {
+          case star::EventKind::EtxAck:
+            // ESC GS ETX replies only to the issuing session and echoes the correlation
+            // bytes it was handed, so an answer that does not carry ours is not ours.
+            if (star_fence_outstanding_ && !star_fence_is_etb_ &&
+                event.n1 == star_expect_n1_ && event.n2 == star_expect_n2_) {
+              star_fence_signalled_ = true;
+            } else {
+              events.push_back(DeviceEvent::ForeignWriterDetected);
+            }
+            break;
+          case star::EventKind::AsbStatus: {
+            // THE MISATTRIBUTION GUARD. On TCP 9100 the ASB frame carrying the ETB
+            // counter is broadcast to *every* connected host, so a counter that moved is
+            // not evidence that our data finished — it is evidence that somebody's data
+            // finished. A change is only ever accepted as our completion when we have a
+            // fence outstanding AND the counter landed on exactly the value that fence
+            // was expecting. Anything else is reported as a foreign writer and confirms
+            // nothing, which fails our job Unknown: the correct answer for a receipt
+            // whose fate we cannot establish, and the whole reason ETB is gated behind
+            // an exclusive session in the first place.
+            const bool changed =
+                !star_counter_.has_value() || event.counter != *star_counter_;
+            if (!changed) {
+              break;
+            }
+            const bool ours = star_fence_outstanding_ && star_fence_is_etb_ &&
+                              event.counter == star_expect_counter_;
+            star_counter_ = event.counter;
+            if (ours) {
+              star_fence_signalled_ = true;
+            } else {
+              events.push_back(DeviceEvent::ForeignWriterDetected);
+            }
             break;
           }
-          gsh_tokens_.push_back(event.token);
-          break;
-        case escpos::ParsedEventKind::QueuedStatus:
-          ++queued_answers_;
-          break;
-        case escpos::ParsedEventKind::RealtimeStatus:
-          mergeStatus(event.flags, &events);
-          realtime_answers_.push_back(event);
-          break;
-        case escpos::ParsedEventKind::AsbStatus:
-          mergeStatus(event.flags, &events);
-          break;
-        case escpos::ParsedEventKind::UnknownByte:
-          break;
+          case star::EventKind::UnknownByte:
+            break;
+        }
+      }
+    } else {
+      for (escpos::ParsedEvent& event : parser_.feed(data, size)) {
+        switch (event.kind) {
+          case escpos::ParsedEventKind::GsHAck:
+            // A structurally valid frame whose token carries somebody else's instance
+            // nonce is somebody else's receipt (docs/api.md §14, docs/sdk-spec.md §14).
+            // It is reported and dropped: attributing it would let a second writer's
+            // printer finish one of our jobs, which is the failure the one-owner rule
+            // exists to prevent. Nothing waiting is consumed either way — this branch
+            // never touches a queued or realtime expectation.
+            if (markers_ && !markers_->isOurs(event.token)) {
+              events.push_back(DeviceEvent::ForeignWriterDetected);
+              break;
+            }
+            gsh_tokens_.push_back(event.token);
+            break;
+          case escpos::ParsedEventKind::QueuedStatus:
+            ++queued_answers_;
+            break;
+          case escpos::ParsedEventKind::RealtimeStatus:
+            mergeStatus(event.flags, &events);
+            realtime_answers_.push_back(event);
+            break;
+          case escpos::ParsedEventKind::AsbStatus:
+            mergeStatus(event.flags, &events);
+            break;
+          case escpos::ParsedEventKind::UnknownByte:
+            break;
+        }
       }
     }
   }
@@ -886,6 +967,13 @@ void PrinterRuntime::beginJobIo() {
   queued_answers_ = 0;
   realtime_answers_.clear();
   link_down_ = false;
+  // M13b. star_counter_ is deliberately not cleared here: it is session state, not job
+  // state, and forgetting the last counter between jobs would make every second fence
+  // expect a baseline it has no reason to believe.
+  star_parser_.reset();
+  star_mode_ = false;
+  star_fence_outstanding_ = false;
+  star_fence_signalled_ = false;
 }
 
 void PrinterRuntime::clearRealtime() {
@@ -946,6 +1034,52 @@ WaitOutcome PrinterRuntime::awaitRealtime(size_t count, std::chrono::millisecond
     *out = realtime_answers_;
   }
   if (realtime_answers_.size() >= count) {
+    return WaitOutcome::Signalled;
+  }
+  if (link_down_) {
+    return WaitOutcome::LinkDown;
+  }
+  if (stopping_.load()) {
+    return WaitOutcome::Aborted;
+  }
+  return WaitOutcome::Timeout;
+}
+
+// --- M13b: Star fences (docs/wire-protocols.md §2) ----------------------------------
+
+escpos::Bytes PrinterRuntime::armStarFence(const CapabilityProfile& profile) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
+  star_fence_signalled_ = false;
+  star_fence_outstanding_ = true;
+  if (profile.completion == CompletionMechanism::StarEtb) {
+    star_fence_is_etb_ = true;
+    // The value this fence will produce. Modelled explicitly because the counter is five
+    // bits and wraps 31 -> 0: an implementation that just compares "bigger than before"
+    // stops confirming once per 32 receipts, at 3 a.m., on the busiest printer.
+    star_expect_counter_ = star::nextEtbCounter(star_counter_.value_or(0));
+    return star::etbFence();
+  }
+  star_fence_is_etb_ = false;
+  // Correlation bytes. They come back verbatim, which is what turns "a printer finished
+  // something" into "the data this call sent finished". Sequenced from 1 so that a zeroed
+  // buffer can never look like a valid answer.
+  ++star_sequence_;
+  star_expect_n1_ = static_cast<uint8_t>((star_sequence_ >> 8) & 0xFFu);
+  star_expect_n2_ = static_cast<uint8_t>(star_sequence_ & 0xFFu);
+  return star::escGsEtxFence(star_expect_n1_, star_expect_n2_);
+}
+
+WaitOutcome PrinterRuntime::awaitStarFence(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(io_mutex_);
+  io_cv_.wait_for(lock, timeout, [this] {
+    return stopping_.load() || link_down_ || star_fence_signalled_;
+  });
+  const bool signalled = star_fence_signalled_;
+  // Disarmed either way. A late answer to a fence whose job has already given up must not
+  // be handed to the next job, which is the same rule the GS ( H marker lease enforces.
+  star_fence_outstanding_ = false;
+  star_fence_signalled_ = false;
+  if (signalled) {
     return WaitOutcome::Signalled;
   }
   if (link_down_) {
@@ -1084,6 +1218,11 @@ escpos::Bytes PrinterRuntime::buildCut(const CapabilityProfile& profile,
     case CompletionMechanism::VendorIdle:
     case CompletionMechanism::EposJobId:
     case CompletionMechanism::StarCheckedBlock:
+    // M13b: the Star fences are not ESC/POS bytes and never ride on an ESC/POS cut. A
+    // Star job is built by buildStarPayload and fenced by armStarFence; this function is
+    // only ever reached on the ESC/POS path.
+    case CompletionMechanism::StarEtb:
+    case CompletionMechanism::StarEscGsEtx:
     case CompletionMechanism::None:
       break;
   }
@@ -1166,9 +1305,16 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
                                     CompletionAuthority::PhysicalPrinter, "DLE EOT"};
 
   if (!profile.drivableByEscposEngine()) {
-    // Star's checked block and the ePOS JobID are real mechanisms this core does not
-    // speak. Printing anyway would produce a receipt with no fence behind it and a
-    // result nobody should believe (docs/device-database.md "Vendor stacks").
+    // M13b: Star Line Mode / StarPRNT fenced by ETB or ESC GS ETX is now a real path, so
+    // it is dispatched rather than refused (docs/wire-protocols.md §2). Everything else —
+    // the StarPRNT SDK's checked block, the ePOS JobID, ZPL, CPCL, Brother raster — is
+    // still a mechanism this engine does not speak, and printing anyway would produce a
+    // receipt with no fence behind it and a result nobody should believe
+    // (docs/device-database.md "Vendor stacks").
+    if (profile.drivableByStarEngine()) {
+      runStarJob(job, payload, options, attempt, banner);
+      return;
+    }
     terminate(job, JobState::FailedKnown,
               JobResult::failed(FailureReason::Unsupported, reached()).with(no_evidence));
     return;
@@ -1294,6 +1440,9 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
     case CompletionMechanism::VendorIdle:
     case CompletionMechanism::EposJobId:
     case CompletionMechanism::StarCheckedBlock:
+    // M13b: unreachable on this path — a Star profile is dispatched to runStarJob above.
+    case CompletionMechanism::StarEtb:
+    case CompletionMechanism::StarEscGsEtx:
     case CompletionMechanism::None:
       // Nothing will ever be waited for, so the cut goes out with the payload rather
       // than after an acknowledgement that is never coming. The non-ESC/POS
@@ -1408,6 +1557,230 @@ void PrinterRuntime::runJob(const std::shared_ptr<PrintJob>& job, const Payload&
   }
   // Answers empty means the bit could not be read, so the claim stays at
   // CutProcessed instead of being upgraded on silence.
+  terminate(job, JobState::DoneSoftware,
+            JobResult::done(reached()).with(profile.evidence()));
+}
+
+// --- M13b: the Star job path (docs/wire-protocols.md §2) -----------------------------
+
+escpos::Bytes PrinterRuntime::buildStarPayload(const CapabilityProfile& profile,
+                                               const Payload& payload,
+                                               const JobOptions& options, uint32_t attempt,
+                                               const std::string& key, bool banner,
+                                               std::vector<std::string>* dropped) const {
+  const auto note = [dropped](const std::string& what) {
+    if (dropped != nullptr &&
+        std::find(dropped->begin(), dropped->end(), what) == dropped->end()) {
+      dropped->push_back(what);
+    }
+  };
+
+  star::Encoder encoder;
+  encoder.initialize();
+  if (options.top_feed_dots > 0) {
+    encoder.feedDots(options.top_feed_dots);
+  }
+  if (banner) {
+    encoder.align(escpos::Alignment::Center)
+        .bold(true)
+        .line(kReprintBannerLine)
+        .bold(false);
+    if (!key.empty()) {
+      encoder.line("ORDER: " + key);
+    }
+    encoder.line(std::string(kReprintAttemptPrefix) + std::to_string(attempt))
+        .align(escpos::Alignment::Left)
+        .feed();
+  }
+
+  if (std::holds_alternative<RasterPayload>(payload.content)) {
+    const RasterPayload& raster = std::get<RasterPayload>(payload.content);
+    if (!profile.star.raster_line_mode) {
+      note("raster image: this profile does not enable Star raster line mode");
+    } else if (raster.width > 0 && raster.height > 0 && !raster.gray.empty()) {
+      encoder.rasterGrayscale(raster.gray.data(), raster.width, raster.height,
+                              config_.width_dots, raster.binarization, raster.threshold);
+    }
+  } else if (std::holds_alternative<DocumentPayload>(payload.content)) {
+    // The document tier is escpos::Encoder output — including everything the receipt DSL
+    // renders — so it is transcoded rather than refused. What has no Star equivalent is
+    // named in `dropped` and reaches the caller as a declared degradation.
+    star::TranscodeOptions transcode;
+    transcode.raster_line_mode = profile.star.raster_line_mode;
+    star::TranscodeResult converted = star::transcodeFromEscPos(
+        std::get<DocumentPayload>(payload.content).bytes, transcode);
+    encoder.raw(converted.bytes);
+    for (const std::string& entry : converted.dropped) {
+      note(entry);
+    }
+  } else {
+    // Tier 3 is documented as passed through verbatim (docs/api.md §3): the caller owns
+    // these bytes, and on a Star profile that means the caller owes Star bytes. Silently
+    // transcoding them would break the one tier whose whole contract is that nothing
+    // touches it.
+    encoder.raw(std::get<RawPayload>(payload.content).bytes);
+  }
+
+  if (options.open_drawer) {
+    note("cash drawer kick: Star's drawer command varies by model and interface and is "
+         "not established here");
+  }
+  if (options.print_verification_id) {
+    // The printed verification identifier is the GS ( H wire token promoted onto paper
+    // (docs/api.md §14). A Star fence carries a counter, not a per-job token, so there is
+    // nothing to print — and inventing one would put a code on a receipt that resolves to
+    // nothing.
+    note("printed verification identifier: the Star fences carry a counter, not a "
+         "per-job token, so there is no wire token to promote onto the paper");
+  }
+  encoder.feedLines(profile.final_feed_lines);
+  return encoder.take();
+}
+
+void PrinterRuntime::runStarJob(const std::shared_ptr<PrintJob>& job,
+                                const Payload& payload, const JobOptions& options,
+                                uint32_t attempt, bool banner) {
+  const CapabilityProfile profile = this->profile();
+  const ConfidenceLevel ceiling = profile.maxConfidence();
+  const auto timeout = std::chrono::milliseconds(
+      options.timeout_ms != 0 ? options.timeout_ms : profile.completion_timeout_ms);
+  ConfidenceLevel confidence = ConfidenceLevel::TransportAccepted;
+  const auto reached = [&] { return clampTo(confidence, ceiling); };
+  const JobEvidence transport_evidence = evidenceFor(CompletionMechanism::None);
+  const JobEvidence no_evidence{ConfidenceGrade::E_TransportOnly,
+                                CompletionAuthority::TransportOnly, "none"};
+
+  std::string error;
+  if (!ensureConnected(&error)) {
+    terminate(job, JobState::FailedKnown,
+              JobResult::failed(FailureReason::TransportUnreachable, reached())
+                  .with(no_evidence));
+    return;
+  }
+  beginJobIo();
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    star_mode_ = true;
+    star_parser_.setAsbBlockBytes(profile.star.asb_block_bytes);
+  }
+
+  // There is no preflight here, and that is a declared degradation rather than an
+  // oversight: the realtime DLE EOT query this engine refuses to print without on
+  // ESC/POS has no equivalent in the Star subset established in
+  // docs/wire-protocols.md §2, so a Star job cannot refuse before printing on a
+  // cover-open. The fence is where the truth comes out instead.
+
+  if (profile.completion == CompletionMechanism::StarEtb) {
+    // Enable ASB and zero the counter, so the first fence has a known baseline rather
+    // than whatever the previous owner of this printer left in it.
+    escpos::Bytes preamble = star::asbEnable();
+    const escpos::Bytes clear = star::clearEtbCounter();
+    preamble.insert(preamble.end(), clear.begin(), clear.end());
+    if (!sendPaced(profile, preamble).ok) {
+      terminate(job, JobState::FailedKnown,
+                JobResult::failed(FailureReason::TransportUnreachable, reached())
+                    .with(no_evidence));
+      return;
+    }
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    star_counter_ = 0;
+  }
+
+  std::vector<std::string> dropped;
+  const escpos::Bytes wire =
+      buildStarPayload(profile, payload, options, attempt, job->key(), banner, &dropped);
+
+  // Same ordering rule as the ESC/POS path (docs/techspec.md §5.1): SendStarted is
+  // durable before the socket sees byte one.
+  advance(job, JobState::SendStarted, reached(), FailureReason::None);
+
+  const TransportResult sent = sendPaced(profile, wire);
+  if (!sent.ok) {
+    if (sent.bytes_written == 0) {
+      terminate(job, JobState::FailedKnown,
+                JobResult::failed(FailureReason::TransportUnreachable, reached())
+                    .with(no_evidence));
+    } else {
+      terminate(job, JobState::Unknown,
+                JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
+                    .with(transport_evidence));
+    }
+    return;
+  }
+
+  const CutVariant cut = effectiveCut(options.cut, profile);
+
+  if (profile.completion == CompletionMechanism::None) {
+    if (cut != CutVariant::None) {
+      star::Encoder cutter;
+      cutter.cut(cut == CutVariant::Full ? star::Cut::Full : star::Cut::Partial);
+      sendPaced(profile, cutter.take());
+    }
+    advance(job, JobState::BytesSent, reached(), FailureReason::None);
+    terminate(job, JobState::DoneSoftware,
+              JobResult::done(clampTo(ConfidenceLevel::TransportAccepted, ceiling))
+                  .with(profile.evidence()));
+    return;
+  }
+
+  const escpos::Bytes print_fence = armStarFence(profile);
+  if (!sendPaced(profile, print_fence).ok) {
+    terminate(job, JobState::Unknown,
+              JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
+                  .with(transport_evidence));
+    return;
+  }
+  advance(job, JobState::BytesSent, reached(), FailureReason::None);
+
+  const WaitOutcome print_ack = awaitStarFence(timeout);
+  if (print_ack != WaitOutcome::Signalled) {
+    // Bytes went out and the fence never came back. The receipt may well be on the
+    // counter, so this is Unknown and never Failed — including the case where an ASB
+    // counter moved for somebody else's job, which the misattribution guard in onBytes()
+    // deliberately refuses to accept as ours.
+    terminate(job, JobState::Unknown,
+              JobResult{JobOutcome::Unknown, reached(),
+                        print_ack == WaitOutcome::Timeout
+                            ? FailureReason::TimeoutAwaitingCompletion
+                            : FailureReason::Unknown}
+                  .with(transport_evidence));
+    return;
+  }
+  confidence = raise(confidence, ConfidenceLevel::PrintConfirmed);
+  advance(job, JobState::PrintConfirmed, reached(), FailureReason::None);
+
+  if (cut == CutVariant::None) {
+    terminate(job, JobState::DoneSoftware,
+              JobResult::done(reached()).with(profile.evidence()));
+    return;
+  }
+
+  star::Encoder cutter;
+  cutter.cut(cut == CutVariant::Full ? star::Cut::Full : star::Cut::Partial);
+  escpos::Bytes cut_bytes = cutter.take();
+  const escpos::Bytes cut_fence = armStarFence(profile);
+  cut_bytes.insert(cut_bytes.end(), cut_fence.begin(), cut_fence.end());
+  if (!sendPaced(profile, cut_bytes).ok) {
+    terminate(job, JobState::Unknown,
+              JobResult{JobOutcome::Unknown, reached(), FailureReason::Unknown}
+                  .with(transport_evidence));
+    return;
+  }
+  const WaitOutcome cut_ack = awaitStarFence(timeout);
+  if (cut_ack != WaitOutcome::Signalled) {
+    terminate(job, JobState::Unknown,
+              JobResult{JobOutcome::Unknown, reached(),
+                        cut_ack == WaitOutcome::Timeout
+                            ? FailureReason::TimeoutAwaitingCompletion
+                            : FailureReason::Unknown}
+                  .with(transport_evidence));
+    return;
+  }
+  confidence = raise(confidence, ConfidenceLevel::CutProcessed);
+  advance(job, JobState::CutCommandProcessed, reached(), FailureReason::None);
+
+  // Neither Star fence carries a cutter-fault bit, so the claim stops at "the cut command
+  // was processed" — the same ceiling GS r 1 has, for the same reason.
   terminate(job, JobState::DoneSoftware,
             JobResult::done(reached()).with(profile.evidence()));
 }

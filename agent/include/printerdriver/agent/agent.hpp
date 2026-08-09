@@ -10,6 +10,9 @@
 #include "printerdriver/agent/http.hpp"
 #include "printerdriver/driver.hpp"
 #include "printerdriver/dsl/json.hpp"
+// M13b: the embedded CloudPRNT server (docs/wire-protocols.md §2). A polling printer is
+// not a lane the engine can write to, so it lives beside the driver rather than inside it.
+#include "printerdriver/agent/cloudprnt.hpp"
 
 // The local printer agent of docs/techspec.md §5 and docs/sdk-spec.md §12/§14: the
 // shared-agent deployment shape, compiled from the same core every wrapper binds.
@@ -61,6 +64,14 @@ struct AgentConfig {
   // caller can poll GET /jobs/<key>.
   uint32_t wait_ms = 20000;
   std::vector<PrinterSpec> printers;
+
+  // --- M13b: CloudPRNT ------------------------------------------------------------------
+  // A separate list because these are a different topology, not a different transport:
+  // nothing here has a host or a port, because the printer dials the agent
+  // (docs/wire-protocols.md §2). Their ids share one namespace with `printers` above, so a
+  // reader of GET /printers never has to wonder which "kitchen" was meant.
+  std::vector<CloudPrntSpec> cloudprnt;
+  // --- end M13b -------------------------------------------------------------------------
 };
 
 // Config file shape:
@@ -105,6 +116,13 @@ class Agent {
   PrinterDriver& driver() noexcept { return *driver_; }
   const AgentConfig& config() const noexcept { return config_; }
 
+  // --- M13b: CloudPRNT ------------------------------------------------------------------
+  // The polling printers, exposed so an embedder can hand bytes in without going through
+  // HTTP and can subscribe to the device events their polls carry.
+  CloudPrntServer& cloudprnt() noexcept { return cloudprnt_; }
+  const CloudPrntServer& cloudprnt() const noexcept { return cloudprnt_; }
+  // --- end M13b -------------------------------------------------------------------------
+
  private:
   struct Owned {
     PrinterSpec spec;
@@ -146,6 +164,14 @@ class Agent {
   HttpResponse getPrinterStatus(const std::string& id, const HttpRequest& request);
   HttpResponse getHealth() const;
 
+  // --- M13b: CloudPRNT ------------------------------------------------------------------
+  // The printer-facing triple plus the application-facing submission route, split out so
+  // Agent::handle stays a routing table and nothing about the polling contract leaks into
+  // the pushed path.
+  HttpResponse cloudPrntRoute(const std::vector<std::string>& path,
+                              const HttpRequest& request);
+  // --- end M13b -------------------------------------------------------------------------
+
   std::shared_ptr<Printer> lookup(const std::string& id) const;
   const Owned* owned(const std::string& id) const;
   dsl::Json printerJson(const Owned& entry) const;
@@ -156,6 +182,10 @@ class Agent {
 
   AgentConfig config_;
   std::unique_ptr<PrinterDriver> driver_;
+  // M13b: its own repository, its own lock. A CloudPRNT job never enters the driver's
+  // journal because it never enters the driver: the printer pulls, and there is no send
+  // for the journal to record (docs/wire-protocols.md §2).
+  CloudPrntServer cloudprnt_;
   HttpServer server_;
   std::shared_ptr<ForeignWriters> foreign_;
   PrinterConfigHook hook_;

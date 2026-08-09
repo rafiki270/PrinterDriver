@@ -20,6 +20,7 @@
 #include "printerdriver/discovery.hpp"
 #include "printerdriver/driver.hpp"
 #include "printerdriver/identity.hpp"
+#include "printerdriver/probe_path.hpp"
 #include "printerdriver/receipt_dsl.hpp"
 #include "printerdriver/response_parser.hpp"
 #include "printerdriver/transport.hpp"
@@ -92,6 +93,42 @@ void row(const char* label, const std::string& value) {
 }
 
 void row(const char* label, const char* value) { row(label, std::string(value)); }
+
+// Word wrap for the prose parts of a report. Deliberately never used for the verdict line
+// of `probe-path`: `completionAuthority = PRINT_SERVER_ONLY` is the phrase
+// docs/compatibility-brief.md §21 defines and the phrase a CI job greps for, so it is
+// printed on one line that no wrapping rule is allowed to break in half.
+void wrapped(const std::string& first_prefix, const std::string& rest_prefix,
+             const std::string& text, size_t width = 70) {
+  std::string line;
+  bool first = true;
+  size_t start = 0;
+  while (start <= text.size()) {
+    size_t end = text.find(' ', start);
+    if (end == std::string::npos) {
+      end = text.size();
+    }
+    const std::string word = text.substr(start, end - start);
+    if (!word.empty()) {
+      if (!line.empty() && line.size() + 1 + word.size() > width) {
+        std::cout << (first ? first_prefix : rest_prefix) << line << "\n";
+        line.clear();
+        first = false;
+      }
+      line += line.empty() ? word : " " + word;
+    }
+    if (end == text.size()) {
+      break;
+    }
+    start = end + 1;
+  }
+  if (!line.empty()) {
+    std::cout << (first ? first_prefix : rest_prefix) << line << "\n";
+  }
+}
+
+void paragraph(const std::string& text) { wrapped("  ", "  ", text); }
+void bullet(const std::string& text) { wrapped("  - ", "    ", text); }
 
 // Three states, printed as three words: a capability nobody established is not the
 // same as one that is absent.
@@ -207,6 +244,24 @@ int usage() {
       "\n"
       "  pdctl identify <host[:port]> [--mac <address>] [--vendor <name>]\n"
       "      Fingerprint only. GS I is never trusted on its own.\n"
+      "\n"
+      "  pdctl probe-path --server <host[:port]> [--expect-printer-behind]\n"
+      "                   [--timeout <ms>] [--print-test-line]\n"
+      "      Classify the completion authority of a path that runs THROUGH a\n"
+      "      print server - a USB/Ethernet print server box, or any other 9100\n"
+      "      forwarder (docs/compatibility-brief.md §19-§23). Connects to the\n"
+      "      endpoint, asks DLE EOT 1 and ONE correlated GS ( H fn 48 fence, and\n"
+      "      reports whether the printer's answers survive the path:\n"
+      "        PHYSICAL_PRINTER   the correlated echo came back with our token\n"
+      "        PRINT_SERVER_ONLY  every byte was accepted and none came back\n"
+      "        TRANSPORT_ONLY     something came back, but not this host's answer\n"
+      "      The last two are different findings and are never collapsed: a path\n"
+      "      that answers DLE EOT but loses the correlated echo is not a path that\n"
+      "      swallows responses.\n"
+      "      --expect-printer-behind turns the report into a CI assertion: a\n"
+      "      PRINT_SERVER_ONLY verdict then exits non-zero. Without it the command\n"
+      "      always exits 0 and only reports. Writes nothing printable unless\n"
+      "      --print-test-line is given. --timeout is the fence budget in ms.\n"
       "\n"
       "  pdctl verify <token> [--store <dir>]\n"
       "      Paper to job: resolves the four-character V: code on a receipt and\n"
@@ -583,6 +638,186 @@ int runIdentify(const Endpoint& endpoint, DiscoveryArgs args) {
                  "at least one printer family ships answering as somebody else's model\n";
   }
   return discovery.findings.reported.answered() ? kExitDone : kExitFailed;
+}
+
+// --- probe-path -----------------------------------------------------------------------
+//
+// docs/compatibility-brief.md §19-§23. Every other command here points at a printer; this
+// one points at the *path* and asks who is allowed to claim a completion across it. The
+// report is deliberately two-columned in the sense of §28: what this measurement
+// established, and — just as prominently — what it did not, because a print-server path
+// that answers one question and not the other is exactly where "the write succeeded" gets
+// silently promoted to "the receipt printed".
+
+struct PathArgs {
+  Endpoint server;
+  bool expect_printer_behind = false;
+  bool print_test_line = false;
+  uint32_t fence_timeout_ms = 0;  // 0 = the core's default budget
+};
+
+int runProbePath(const PathArgs& args) {
+  pd::PathProbeOptions options;
+  options.host = args.server.host;
+  options.port = args.server.port;
+  options.print_test_line = args.print_test_line;
+  if (args.fence_timeout_ms != 0) {
+    options.fence_timeout_ms = args.fence_timeout_ms;
+  }
+
+  const pd::PathProbeFindings findings = pd::probePath(options);
+
+  std::cout << "Print-server path probe - " << args.server.host << ":" << args.server.port
+            << "\n";
+
+  section("Path");
+  row("endpoint", findings.endpoint);
+  row("connect", findings.connected
+                     ? ("ok in " + std::to_string(findings.connect_ms) + " ms")
+                     : ("FAILED - " + findings.connect_error));
+  row("DLE EOT 1 written", findings.wrote_status_query ? "YES" : "NO");
+  row("GS ( H fn 48 written",
+      findings.wrote_fence ? ("YES, token " + findings.token) : std::string("NO"));
+  if (!findings.write_error.empty()) {
+    row("write error", findings.write_error);
+  }
+  row("closed by far side",
+      findings.link_dropped
+          ? ("YES - " + (findings.drop_message.empty() ? std::string("no reason given")
+                                                       : findings.drop_message))
+          : std::string("NO"));
+
+  section("What came back");
+  row("bytes returned", std::to_string(findings.raw.size()));
+  row("DLE EOT 1 answer", findings.dle_eot_response.empty()
+                              ? "NO RESPONSE"
+                              : hex(findings.dle_eot_response));
+  row("DLE EOT 1 recognised", yesNo(findings.dle_eot_answered));
+  row("real-time wait", std::to_string(findings.status_ms) + " ms");
+  row("GS ( H fn 48 echo", yesNo(findings.fence_echoed));
+  row("fence wait", std::to_string(findings.fence_ms) + " ms");
+  if (findings.foreign_token_echoed) {
+    std::string tokens;
+    for (const std::string& token : findings.foreign_tokens) {
+      tokens += (tokens.empty() ? "" : ", ") + token;
+    }
+    row("foreign token echo", tokens);
+  }
+  if (!findings.unclassified.empty()) {
+    row("unclassified bytes", hex(findings.unclassified));
+  }
+  if (!findings.raw.empty()) {
+    row("raw stream", hex(findings.raw));
+  }
+
+  // The two columns of docs/compatibility-brief.md §28, spelled out as prose because on a
+  // print-server path the interesting entry in the right-hand column is usually the one
+  // an operator would otherwise assume belongs in the left-hand one.
+  section("What this path PROVED (brief §28)");
+  if (!findings.connected) {
+    bullet("nothing: the path never opened, so every statement below is about an "
+           "address rather than about a printer");
+  } else {
+    bullet("the endpoint accepts a TCP connection");
+    if (findings.wrote_status_query && findings.wrote_fence) {
+      bullet("it accepted every byte this probe wrote, printable or not");
+    }
+    if (findings.dle_eot_answered) {
+      bullet("the printer's real-time status byte traverses printer -> path -> host: "
+             "the backchannel of docs/techspec.md §4 is not broken here");
+    }
+    if (findings.fence_echoed) {
+      bullet("a GS ( H fn 48 echo carrying this host's own token (" + findings.token +
+             ") crossed the path, so a completion can be correlated to one receipt "
+             "(brief §24, grade A)");
+    }
+    if (findings.foreign_token_echoed) {
+      bullet("the path carries GS ( H frames in general - one arrived for a token this "
+             "host never issued");
+    }
+    if (!findings.dle_eot_answered && !findings.fence_echoed &&
+        findings.pathCarriesResponses()) {
+      bullet("bytes do come back across the path, so it is not one-way - but none of "
+             "them was an answer to a question this probe asked");
+    }
+  }
+
+  section("What this path did NOT prove (brief §28)");
+  if (!findings.fence_echoed) {
+    bullet("that any completion can be attributed to a receipt: no correlated "
+           "GS ( H fn 48 echo carrying token " + findings.token + " came back");
+  }
+  if (!findings.dle_eot_answered) {
+    bullet("that printer status reaches this host at all: DLE EOT 1 went unanswered, so "
+           "cover, paper and error state are invisible from here");
+  }
+  if (findings.responsesSwallowed()) {
+    bullet("anything whatsoever about the device on the far side: it never spoke, and a "
+           "silent path cannot distinguish a healthy printer from an unplugged one");
+  }
+  if (findings.correlationLostOnly()) {
+    bullet("which of the two possible causes applies: the device may have no fn 48, or "
+           "something on the path may drop the correlated echo. No probe standing at "
+           "this end can separate them");
+  }
+  bullet(args.print_test_line
+             ? std::string("that anything physically printed: one test line was sent and "
+                           "nothing was cut, and no probe of any kind verifies paper")
+             : std::string("that anything physically printed: this probe printed nothing "
+                           "and cut nothing, by design"));
+  bullet("that TCP acceptance is printer completion. A print server acknowledges the "
+         "socket, never the paper (brief §21), and CUPS waiteof or a Windows PRINTED "
+         "state is the same claim one layer up (brief §23)");
+  if (findings.fence_echoed) {
+    bullet("that the path behaves this way under load, after a reconnect, or with "
+           "another host writing to the same printer: this is one measurement of one "
+           "moment");
+  }
+
+  section("Classification");
+  // One line, unwrapped, in the brief's own words. Everything else in this report is for
+  // a human; this line is for a human AND for whatever is grepping the log.
+  std::cout << "  completionAuthority = " << pd::pathAuthorityLabel(findings.authority)
+            << "\n"
+            << "  pd::CompletionAuthority::" << pd::to_string(findings.authority) << "\n\n";
+  paragraph(findings.rationale);
+
+  if (!args.expect_printer_behind) {
+    std::cout << "\n  exit status 0: without --expect-printer-behind this command reports "
+                 "a\n  finding and asserts nothing. PRINT_SERVER_ONLY is a fact about a "
+                 "path,\n  not a failure of the tool that measured it.\n";
+    return kExitDone;
+  }
+
+  section("Assertion (--expect-printer-behind)");
+  if (findings.authority == pd::CompletionAuthority::PhysicalPrinter) {
+    row("expected", "a physical printer answering across this path");
+    row("result", "PASS");
+    return kExitDone;
+  }
+  if (findings.authority == pd::CompletionAuthority::PrintServer) {
+    row("expected", "a physical printer answering across this path");
+    row("result", "FAIL - PRINT_SERVER_ONLY");
+    std::cout << "\n  a printer was asserted behind this path and the path returned "
+                 "nothing.\n  Any job sent through it can be graded no higher than "
+                 "brief §24 grade E.\n";
+    return kExitFailed;
+  }
+  row("expected", "a physical printer answering across this path");
+  if (!findings.connected) {
+    row("result", "FAIL - the path did not open");
+    std::cout << "\n  the assertion could not be tested at all: nothing accepted a "
+                 "connection\n  at this address. A broken path is a failure, not an "
+                 "ambiguity.\n";
+    return kExitFailed;
+  }
+  row("result", "UNKNOWN - not established either way");
+  std::cout << "\n  unresolved rather than refuted: the path opened, but nothing that\n"
+               "  came back correlates to a receipt and nothing proves the responses\n"
+               "  were swallowed either. Exit 2 (unknown) is the honest answer;\n"
+               "  collapsing it into pass or fail is the mistake this command exists\n"
+               "  to prevent.\n";
+  return kExitUnknown;
 }
 
 // --- operator commands ---------------------------------------------------------------
@@ -1355,6 +1590,49 @@ int main(int argc, char** argv) {
       return kExitFailed;
     }
   }
+  // `probe-path` names its endpoint with --server rather than positionally, because the
+  // thing being measured is the path and not the device at the end of it. That also keeps
+  // it out of the endpoint dispatch below, where argv[2] would otherwise be read as a
+  // hostname called "--server".
+  if (argc >= 2 && std::string(argv[1]) == "probe-path") {
+    PathArgs args;
+    bool have_server = false;
+    for (int i = 2; i < argc; ++i) {
+      const std::string flag = argv[i];
+      const bool has_value = i + 1 < argc;
+      if (flag == "--server" && has_value) {
+        if (!parseEndpoint(argv[++i], &args.server)) {
+          std::cout << "invalid server: " << argv[i] << "\n\n";
+          return kExitUsage;
+        }
+        have_server = true;
+      } else if (flag == "--expect-printer-behind") {
+        args.expect_printer_behind = true;
+      } else if (flag == "--print-test-line") {
+        args.print_test_line = true;
+      } else if (flag == "--timeout" && has_value) {
+        args.fence_timeout_ms = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        if (args.fence_timeout_ms == 0) {
+          std::cout << "invalid timeout\n\n";
+          return kExitUsage;
+        }
+      } else {
+        std::cout << "unknown option: " << flag << "\n\n";
+        return usage();
+      }
+    }
+    if (!have_server) {
+      std::cout << "probe-path requires --server <host[:port]>\n\n";
+      return usage();
+    }
+    try {
+      return runProbePath(args);
+    } catch (const std::exception& error) {
+      std::cout << "error: " << error.what() << "\n";
+      return kExitFailed;
+    }
+  }
+
   if (argc < 3) {
     return usage();
   }

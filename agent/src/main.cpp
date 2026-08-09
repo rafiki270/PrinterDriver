@@ -51,6 +51,15 @@ int usage() {
       "  POST /printers                  add one at runtime\n"
       "  GET  /printers/<id>/status      device status (?refresh=1 to query it)\n"
       "  GET  /healthz                   liveness, journal depth, instance nonce\n"
+      // M13b: the CloudPRNT surface. The first three are the printer's, not yours —
+      // a polling printer is configured with /cloudprnt/<id> and varies the method.
+      "  POST/GET/DELETE /cloudprnt/<id> the CloudPRNT printer's own poll, job\n"
+      "                                  download and confirmation\n"
+      "  POST /cloudprnt/<id>/jobs       hand bytes to a CloudPRNT printer\n"
+      "  GET  /cloudprnt/<id>/jobs[/<token>]  what is queued, and how it ended\n"
+      "\n"
+      "CloudPRNT printers are configured with the \"cloudprnt\" list in --config;\n"
+      "they have no host and no port, because they dial the agent.\n"
       "\n"
       "The agent owns each printer connection exclusively. Do not point a second\n"
       "agent, a till, CUPS or a raw port-9100 client at a printer it owns: echoes\n"

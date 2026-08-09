@@ -225,6 +225,15 @@ enum class CompletionMechanism(internal val raw: Int) {
     EPOS_JOB_ID(3),
     STAR_CHECKED_BLOCK(4),
     NONE(5),
+
+    /** M13b (docs/wire-protocols.md section 2). Star's ETB fence: 0x17 plus the five-bit
+     *  ASB print-end counter. Selected only on an exclusively held session -- the ASB
+     *  frame carrying that counter is broadcast to every host on TCP 9100. */
+    STAR_ETB(6),
+
+    /** M13b. Star's ESC GS ETX fence: echoes the correlation bytes it was handed and
+     *  replies only to the issuing session. The default on Star models the core drives. */
+    STAR_ESC_GS_ETX(7),
     UNRECOGNIZED(-1);
 
     companion object {

@@ -189,7 +189,10 @@ class EnumMappingTest {
         assertEquals(CompletionMechanism.EPOS_JOB_ID, CompletionMechanism.fromRaw(3))
         assertEquals(CompletionMechanism.STAR_CHECKED_BLOCK, CompletionMechanism.fromRaw(4))
         assertEquals(CompletionMechanism.NONE, CompletionMechanism.fromRaw(5))
-        assertEquals(CompletionMechanism.UNRECOGNIZED, CompletionMechanism.fromRaw(6))
+        // M13b (docs/wire-protocols.md section 2).
+        assertEquals(CompletionMechanism.STAR_ETB, CompletionMechanism.fromRaw(6))
+        assertEquals(CompletionMechanism.STAR_ESC_GS_ETX, CompletionMechanism.fromRaw(7))
+        assertEquals(CompletionMechanism.UNRECOGNIZED, CompletionMechanism.fromRaw(8))
     }
 
     @Test
@@ -229,7 +232,7 @@ class EnumMappingTest {
         assertEquals(3, Alignment.entries.size - 1)              // PD_ALIGN_COUNT
         assertEquals(5, CodePage.entries.size - 1)               // PD_CODE_PAGE_COUNT
         assertEquals(2, Binarization.entries.size - 1)           // PD_BINARIZATION_COUNT
-        assertEquals(6, CompletionMechanism.entries.size - 1)    // PD_COMPLETION_COUNT
+        assertEquals(8, CompletionMechanism.entries.size - 1)    // PD_COMPLETION_COUNT
         assertEquals(3, CutVariant.entries.size - 1)             // PD_CUT_VARIANT_COUNT
         assertEquals(6, ConfidenceGrade.entries.size - 1)        // PD_GRADE_COUNT
         assertEquals(5, CompletionAuthority.entries.size - 1)    // PD_AUTHORITY_COUNT

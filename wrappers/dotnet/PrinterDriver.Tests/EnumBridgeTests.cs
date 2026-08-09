@@ -45,7 +45,7 @@ public sealed class EnumBridgeTests
         new(BridgedEnum.Cut, 4, typeof(CutSetting), false),
         new(BridgedEnum.Preflight, 2, typeof(PreflightMode), false),
         new(BridgedEnum.PayloadKind, 3, typeof(PayloadKind), true),
-        new(BridgedEnum.Completion, 6, typeof(CompletionMechanism), true),
+        new(BridgedEnum.Completion, 8, typeof(CompletionMechanism), true),  // M13b: + StarEtb, StarEscGsEtx
         new(BridgedEnum.CutVariant, 3, typeof(CutVariant), true),
         new(BridgedEnum.Alignment, 3, typeof(Alignment), false),
         new(BridgedEnum.CodePage, 5, typeof(CodePage), false),

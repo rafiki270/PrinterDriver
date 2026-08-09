@@ -233,6 +233,54 @@ bool parseAgentConfig(const Json& json, AgentConfig* out, std::string* error) {
     out->wait_ms = static_cast<uint32_t>(std::max<long long>(0, value->asInt()));
   }
 
+  // --- M13b: CloudPRNT printers (docs/wire-protocols.md §2) --------------------------
+  //
+  //   "cloudprnt": [ { "id": "counter", "mac": "00:11:62:aa:bb:cc",
+  //                    "mediaTypes": ["application/vnd.star.line"],
+  //                    "maxPendingJobs": 32 } ]
+  //
+  // No host and no port: this printer dials the agent, so its whole configuration is the
+  // URL segment it polls, the identity it may claim, and what it can be handed.
+  if (const Json* list = json.find("cloudprnt"); list != nullptr) {
+    if (!list->isArray()) {
+      return refuse("cloudprnt must be an array");
+    }
+    for (size_t i = 0; i < list->asArray().size(); ++i) {
+      const Json& entry = list->asArray()[i];
+      const std::string where = "cloudprnt[" + std::to_string(i) + "]";
+      if (!entry.isObject()) {
+        return refuse(where + " must be an object");
+      }
+      CloudPrntSpec spec;
+      if (const Json* value = entry.find("id"); value != nullptr && value->isString()) {
+        spec.id = value->asString();
+      }
+      if (spec.id.empty()) {
+        // The id is the route the printer is configured to poll. Deriving one would mean
+        // guessing what somebody typed into a printer's web console.
+        return refuse(where + ".id is required: it is the URL segment the printer polls");
+      }
+      if (const Json* value = entry.find("mac"); value != nullptr && value->isString()) {
+        spec.mac = value->asString();
+      }
+      if (const Json* value = entry.find("mediaTypes");
+          value != nullptr && value->isArray()) {
+        for (const Json& media : value->asArray()) {
+          if (!media.isString() || media.asString().empty()) {
+            return refuse(where + ".mediaTypes must be non-empty strings");
+          }
+          spec.media_types.push_back(media.asString());
+        }
+      }
+      if (const Json* value = entry.find("maxPendingJobs");
+          value != nullptr && value->isNumber()) {
+        spec.max_pending = static_cast<size_t>(std::max<long long>(1, value->asInt()));
+      }
+      out->cloudprnt.push_back(std::move(spec));
+    }
+  }
+  // --- end M13b ------------------------------------------------------------------------
+
   const Json* printers = json.find("printers");
   if (printers == nullptr) {
     return true;
@@ -417,6 +465,24 @@ bool Agent::start(std::string* error) {
       return false;
     }
   }
+  // --- M13b: CloudPRNT printers --------------------------------------------------------
+  // One id namespace for both kinds. A CloudPRNT printer that shadowed a pushed printer's
+  // id would make GET /printers ambiguous and POST /jobs route by luck.
+  for (const CloudPrntSpec& spec : config_.cloudprnt) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (by_id_.find(spec.id) != by_id_.end()) {
+        if (error != nullptr) {
+          *error = "printer id already owned: " + spec.id;
+        }
+        return false;
+      }
+    }
+    if (!cloudprnt_.addPrinter(spec, error)) {
+      return false;
+    }
+  }
+  // --- end M13b -------------------------------------------------------------------------
   if (!server_.start([this](const HttpRequest& request) { return handle(request); },
                      error)) {
     return false;
@@ -491,6 +557,23 @@ HttpResponse Agent::handle(const HttpRequest& request) {
     }
     return fail(404, "not found", request.path);
   }
+  // --- M13b: CloudPRNT (docs/wire-protocols.md §2) -------------------------------------
+  //
+  //   GET    /cloudprnt                     every polling printer this agent serves
+  //   POST   /cloudprnt/<id>                the printer's poll
+  //   GET    /cloudprnt/<id>                the printer's job download (idempotent)
+  //   DELETE /cloudprnt/<id>                the printer's confirmation (the only delete)
+  //   POST   /cloudprnt/<id>/jobs           an application hands bytes in
+  //   GET    /cloudprnt/<id>/jobs           what is queued and what was confirmed
+  //   GET    /cloudprnt/<id>/jobs/<token>   one job's evidence document
+  //
+  // The printer-facing triple all lands on the same path because that is the contract: a
+  // CloudPRNT printer is configured with one URL and varies the method, so `/cloudprnt/<id>`
+  // is what goes into its web console and the three verbs are the whole protocol.
+  if (path[0] == "cloudprnt") {
+    return cloudPrntRoute(path, request);
+  }
+  // --- end M13b -------------------------------------------------------------------------
   return fail(404, "not found", request.path);
 }
 
@@ -509,6 +592,16 @@ HttpResponse Agent::getHealth() const {
   out.set("recoveredJobs",
           Json::number(static_cast<double>(driver_->store().recoveredCount())));
   out.set("foreignWriterDetected", Json::boolean(foreign_->any()));
+  // --- M13b: CloudPRNT ------------------------------------------------------------------
+  // Counted separately from `printers` above: these are not lanes this process owns a
+  // socket to, and folding them into one number would overstate what the agent can write
+  // to. `cloudprntAwaitingConfirmation` is the number of jobs a printer has been offered
+  // or has downloaded and not yet confirmed — the retention rule's backlog, in one figure.
+  out.set("cloudprntPrinters",
+          Json::number(static_cast<double>(cloudprnt_.printerCount())));
+  out.set("cloudprntAwaitingConfirmation",
+          Json::number(static_cast<double>(cloudprnt_.awaitingConfirmation())));
+  // --- end M13b -------------------------------------------------------------------------
   const auto uptime = std::chrono::duration_cast<std::chrono::milliseconds>(
                           MonotonicClock::now() - started_)
                           .count();
@@ -540,6 +633,18 @@ HttpResponse Agent::getPrinters() const {
   for (const Owned& entry : printers_) {
     list.push(printerJson(entry));
   }
+  // --- M13b: CloudPRNT ------------------------------------------------------------------
+  // The polling printers belong in this list — an operator asking what this agent prints
+  // to means all of them — but they carry `kind: "cloudprnt"` and their own field set,
+  // because there is no endpoint to dial and no fence for the engine to hold. Their device
+  // snapshot goes through the same statusJson() the pushed printers use, so "paperOut"
+  // means the same thing in both entries: something told us, and this is what it said.
+  for (const std::string& id : cloudprnt_.printerIds()) {
+    Json entry = cloudprnt_.printerJson(id);
+    entry.set("status", statusJson(cloudprnt_.deviceStatus(id)));
+    list.push(std::move(entry));
+  }
+  // --- end M13b -------------------------------------------------------------------------
   Json out = Json::object({});
   out.set("printers", std::move(list));
   return ok(200, out);
@@ -549,6 +654,17 @@ HttpResponse Agent::getPrinterStatus(const std::string& id,
                                      const HttpRequest& request) {
   std::shared_ptr<Printer> printer = lookup(id);
   if (!printer) {
+    // --- M13b: CloudPRNT ------------------------------------------------------------------
+    // A polling printer answers here too, from its last poll. `?refresh=1` cannot be
+    // honoured — there is no socket to send DLE EOT down, and the printer speaks only when
+    // it decides to — so the response says so rather than pretending the snapshot is fresh.
+    if (cloudprnt_.known(id)) {
+      Json entry = cloudprnt_.printerJson(id);
+      entry.set("status", statusJson(cloudprnt_.deviceStatus(id)));
+      entry.set("refreshSupported", Json::boolean(false));
+      return ok(200, entry);
+    }
+    // --- end M13b -------------------------------------------------------------------------
     return fail(404, "unknown printer", id);
   }
   bool refresh_asked = false;
@@ -904,5 +1020,56 @@ HttpResponse Agent::postJobs(const HttpRequest& request) {
   // GET /jobs/<key> will say how it ended. It is never a failure and never a retry cue.
   return ok(terminal ? 201 : 202, body);
 }
+
+// --- M13b: CloudPRNT routes (docs/wire-protocols.md §2) -----------------------------------
+//
+// The printer-facing triple is deliberately un-authenticated and shaped exactly as the
+// document specifies, because the client is firmware: it will send what it sends, and
+// anything this end invents it cannot be told about. The application-facing routes live
+// under the same prefix so one printer's whole surface is one subtree.
+HttpResponse Agent::cloudPrntRoute(const std::vector<std::string>& path,
+                                   const HttpRequest& request) {
+  const std::string& method = request.method;
+  if (path.size() == 1) {
+    if (method != "GET") {
+      return fail(405, "method not allowed", method);
+    }
+    return ok(200, cloudprnt_.listJson());
+  }
+  const std::string& id = path[1];
+  if (!cloudprnt_.known(id)) {
+    return fail(404, "unknown cloudprnt printer", id);
+  }
+  if (path.size() == 2) {
+    // One URL, three verbs — the printer's console holds a single CloudPRNT address.
+    if (method == "POST") {
+      return cloudprnt_.poll(id, request);
+    }
+    if (method == "GET") {
+      return cloudprnt_.fetchJob(id, request);
+    }
+    if (method == "DELETE") {
+      return cloudprnt_.confirm(id, request);
+    }
+    return fail(405, "method not allowed", method);
+  }
+  if (path.size() == 3 && path[2] == "jobs") {
+    if (method == "POST") {
+      return cloudprnt_.postJob(id, request);
+    }
+    if (method == "GET") {
+      return ok(200, cloudprnt_.jobsJson(id));
+    }
+    return fail(405, "method not allowed", method);
+  }
+  if (path.size() == 4 && path[2] == "jobs") {
+    if (method != "GET") {
+      return fail(405, "method not allowed", method);
+    }
+    return cloudprnt_.getJob(id, path[3]);
+  }
+  return fail(404, "not found", request.path);
+}
+// --- end M13b -----------------------------------------------------------------------------
 
 }  // namespace pd::agent

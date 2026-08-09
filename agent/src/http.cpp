@@ -160,6 +160,10 @@ const char* httpReason(int status) noexcept {
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
     case 413: return "Payload Too Large";
+    // M13b: a CloudPRNT job download answers 415 when the printer asks for a media type
+    // the job cannot be served as (docs/wire-protocols.md §2). The reason phrase is
+    // cosmetic to a client that reads the code, and wrong on the wire without this.
+    case 415: return "Unsupported Media Type";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
     case 503: return "Service Unavailable";

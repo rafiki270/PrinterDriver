@@ -30,12 +30,29 @@ enum class CompletionMechanism {
   EposJobId,         // ePOS JobID + queryable print result; profile data only
   StarCheckedBlock,  // StarPRNT begin/endCheckedBlock; profile data only
   None,              // write-only device: no backchannel, no ordered fence
+
+  // --- M13b: Star raw completion (docs/wire-protocols.md §2) -----------------------
+  //
+  // Appended after None on purpose. These enumerators are mirrored into pd.h and four
+  // wrappers with explicit values, so a new member may only ever be added at the end:
+  // inserting one next to its conceptual neighbours would renumber every mirror.
+  //
+  // Both are the *raw* fences Star documents for a socket the SDK is not holding, which
+  // is what makes them drivable here where StarCheckedBlock — an SDK call, not a wire
+  // primitive — is not.
+  StarEtb,        // 0x17 + ASB five-bit print-end counter (Line Mode Command Specs)
+  StarEscGsEtx,   // 1B 1D 03 01 n1 n2 -> echo + eight-bit counter, session-scoped
 };
 
 // Whether the core's ESC/POS engine can actually drive this mechanism over a raw byte
 // transport. The other mechanisms are carried so a profile can describe the hardware
 // honestly; pointing this engine at one fails Unsupported rather than pretending.
 bool isDrivableByEscposEngine(CompletionMechanism) noexcept;
+
+// M13b: the same question for the Star engine (docs/wire-protocols.md §2). True for the
+// two raw fences and for None; false for StarCheckedBlock, which is an SDK call rather
+// than a wire primitive and stays profile data.
+bool isDrivableByStarEngine(CompletionMechanism) noexcept;
 
 // docs/device-database.md "Interface ≠ transport ≠ language",
 // docs/compatibility-brief.md §1. Only ESC/POS is implemented; the rest exist so a
@@ -110,6 +127,28 @@ struct BluetoothTransport {
   bool ble = false;             // Bluetooth Low Energy, GATT
   bool mfi = false;             // Apple MFi / ExternalAccessory (iOS without BLE)
   bool vendor_sdk = false;      // the documented path is the SDK, not a raw socket
+
+  // --- M13b (docs/wire-protocols.md §4) --------------------------------------------
+  //
+  // The MFi ExternalAccessory protocol string, i.e. the exact value an iOS app puts in
+  // UISupportedExternalAccessoryProtocols. Recorded as a *profile fact* rather than
+  // derived, because it cannot be derived: `mfi = true` says a Classic accessory channel
+  // exists, and the string says which one, and getting it wrong means EASession never
+  // opens. Empty means "not recorded", which covers two different situations that the
+  // fields below keep apart.
+  std::string mfi_protocol;
+  // Citizen's string is vendor-gated: it is issued only through MFi registration and
+  // approval, so there is nothing legitimate to put in mfi_protocol. This flag exists so
+  // "we have not looked it up" and "it exists and we are not allowed to know it yet"
+  // stop being the same empty string — the second is a blocked integration with a known
+  // next step, not a gap in the database.
+  bool mfi_protocol_vendor_gated = false;
+  // docs/wire-protocols.md §4: Epson, Star and Bixolon publish no raw GATT map. Their
+  // BLE path is the vendor SDK's dedicated profile, and a generic UART probe that finds
+  // an FFE1 characteristic on one of them has found a coincidence, not a printer
+  // interface. True means: never silently map this device onto a generic BLE-UART
+  // profile, whatever a scan turns up.
+  bool ble_profile_unknown = false;
 
   // docs/compatibility-brief.md §6: the Epson portables document **4 KB of receive
   // buffer normally and 64 KB for Bluetooth** — same printer, different number by
@@ -202,6 +241,65 @@ struct Quirks {
   ResponseParserVariant response_parser = ResponseParserVariant::EpsonLike;
 };
 
+// --- M13b: Star and ePOS facets (docs/wire-protocols.md §1-§2) ----------------------
+//
+// Separate facets rather than more booleans on CompletionCapabilities, for the reason
+// the whole profile is compositional: what a Star device answers over a raw socket and
+// what an Epson device's print *service* offers are two unrelated bodies of evidence,
+// each with its own provenance, and neither is implied by the ESC/POS-shaped fields.
+
+struct StarCapabilities {
+  // docs/wire-protocols.md §2. The ETB fence (0x17) waits for all preceding printing and
+  // increments a five-bit counter reported through ASB. It is real and it is documented
+  // — and on TCP 9100 the ASB frame carrying it is **broadcast to every connected host**,
+  // so two clients on one printer can each read the other's completion as their own.
+  bool etb_counter = false;
+  // ESC GS ETX (1B 1D 03 01 n1 n2). Star's preferred Ethernet fence: it also waits for
+  // prior printing and motor activity, carries an eight-bit print-end counter, echoes
+  // back the correlation bytes it was given, and **replies only to the issuing session**.
+  // That last property is the whole reason it is the default here.
+  bool esc_gs_etx = false;
+  // Whether this driver is the only thing holding a 9100 session to this printer. ETB is
+  // permitted only when this is true, because ASB misattribution is not a risk that can
+  // be detected after the fact from inside one client — the frame looks identical either
+  // way. Configuration, not a device property, which is why it lives beside the fences it
+  // gates rather than in CompletionCapabilities.
+  bool exclusive_single_session = false;
+  // Bytes in one ASB block. The counter lives at offset 7 ("printer status 6"), which
+  // only means anything against a known block length, so the length is carried as data
+  // per model instead of being guessed from the stream.
+  uint8_t asb_block_bytes = 8;
+  // Star raster mode (ESC * r A ... b n1 n2 <row> ... ESC * r B). Line-mode text is the
+  // verified receipt path; raster is the documented-provisional one, so a profile can
+  // decline it and get an honest Unsupported instead of an unverified image command.
+  bool raster_line_mode = true;
+
+  Provenance etb_provenance = Provenance::Unverified;
+  Provenance esc_gs_etx_provenance = Provenance::Unverified;
+};
+
+struct EposCapabilities {
+  // docs/wire-protocols.md §1: **spooling is a device setting**, configured through
+  // WebConfig / EpsonNet Config / the setup utility — never a request attribute, and
+  // never inferable from "OmniLink" in a product name. This flag records the documented
+  // model matrix (TM-i fw 4.1+ yes, TM-DT2 yes, TM-T88VI-iHUB yes, plain network
+  // TM-T88VI yes; plain TM-m10/m30/m30II NO, plain TM-T88VII NO), and it decides which
+  // of two completely different completion stories the client tells: with a spooler the
+  // first success=true is an *enqueue acknowledgement*, and without one the submission
+  // does not return until the paper has moved.
+  bool spooler = false;
+  // JobIDs need ePOS-Print Service 4.1 or newer. Without it the service assigns its own
+  // and there is nothing durable to poll with, so the retrieval half of the mechanism
+  // simply is not there.
+  bool job_id = false;
+  std::string device_id = "local_printer";
+  // Request timeout in milliseconds: default 60 000, capped at 300 000 by the service
+  // (ePOS-Print XML User's Manual rev. AC).
+  uint32_t timeout_ms = 60000;
+
+  Provenance spooler_provenance = Provenance::Unverified;
+};
+
 // docs/device-database.md "Media is a capability, not a model assumption". Roll width
 // and raster width are separate facts: a CT-S4500 takes 112 mm media and prints 104 mm,
 // and deriving one from the other is how receipts end up clipped.
@@ -254,6 +352,10 @@ struct CapabilityProfile {
   Quirks quirks;
   MediaProfile media;
 
+  // --- M13b (docs/wire-protocols.md §1-§2) -----------------------------------------
+  StarCapabilities star;
+  EposCapabilities epos;
+
   // True once a capability probe has overridden these defaults with first-hand
   // observations (docs/capability-profiles.md §8: generic means UNKNOWN DEVICE).
   bool probed = false;
@@ -289,6 +391,15 @@ struct CapabilityProfile {
   // that are first-class rather than ESC/POS-emulated, whose entries exist as data,
   // and false for ZPL/CPCL/Brother-raster devices, which are not ESC/POS at any level.
   bool drivableByEscposEngine() const noexcept;
+
+  // --- M13b -------------------------------------------------------------------------
+  // Star Line Mode / StarPRNT over a raw socket, fenced by ETB or ESC GS ETX
+  // (docs/wire-protocols.md §2). A separate question from the ESC/POS one: a Star
+  // printer is not an ESC/POS device with a different dialect, it is a different
+  // command language whose completion primitive happens to be equally documented.
+  bool drivableByStarEngine() const noexcept;
+  // Either engine. What the job path actually asks before refusing Unsupported.
+  bool drivable() const noexcept;
 
   // Sets the drive language and records it in the documented set in one step, so the
   // two can never disagree.

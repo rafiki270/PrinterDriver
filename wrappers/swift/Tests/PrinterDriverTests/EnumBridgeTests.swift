@@ -139,6 +139,10 @@ final class EnumBridgeTests: XCTestCase {
     XCTAssertEqual(
       CompletionMechanism.starCheckedBlock.rawValue, PD_COMPLETION_STAR_CHECKED_BLOCK.rawValue)
     XCTAssertEqual(CompletionMechanism.none.rawValue, PD_COMPLETION_NONE.rawValue)
+    // M13b (docs/wire-protocols.md §2).
+    XCTAssertEqual(CompletionMechanism.starEtb.rawValue, PD_COMPLETION_STAR_ETB.rawValue)
+    XCTAssertEqual(
+      CompletionMechanism.starEscGsEtx.rawValue, PD_COMPLETION_STAR_ESC_GS_ETX.rawValue)
 
     XCTAssertEqual(CutVariant.partial.rawValue, PD_CUT_VARIANT_PARTIAL.rawValue)
     XCTAssertEqual(CutVariant.full.rawValue, PD_CUT_VARIANT_FULL.rawValue)

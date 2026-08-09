@@ -150,11 +150,12 @@ typedef enum pd_confidence_grade {
    * result is retrievable afterwards — the only mechanism here that survives the
    * application losing its connection between submission and answer.
    *
-   * NOTHING PRODUCES THIS GRADE YET: the ePOS transport does not exist in this core, so
-   * no pd_job_result can carry it. It is defined now because these enums are closed and
-   * mirrored by four wrappers, and adding a member later would renumber every mirror a
-   * second time. A profile that reports epos_job_id is describing hardware, not making
-   * a claim, and is graded A.
+   * M13b: this is now produced. The core's ePOS client submits under a printjobid,
+   * polls with an empty epos-print body until the job is terminal, and returns the
+   * retrieved result — which is the durable, queryable job at the top of the hierarchy.
+   * The first success=true from a printer whose spooler is enabled is an *enqueue
+   * acknowledgement* and never terminates a job, so this grade is only ever attached to
+   * a retrieved result, never to an acceptance.
    */
   PD_GRADE_APLUS_DURABLE_QUERYABLE_JOB = 0,
   PD_GRADE_A_JOB_LEVEL_CONFIRMATION = 1,  /* GS ( H, Star checked block */
@@ -245,7 +246,22 @@ typedef enum pd_completion_mechanism {
   PD_COMPLETION_EPOS_JOB_ID = 3,
   PD_COMPLETION_STAR_CHECKED_BLOCK = 4,
   PD_COMPLETION_NONE = 5,
-  PD_COMPLETION_COUNT = 6
+  /* --- M13b: Star raw completion (docs/wire-protocols.md §2) ----------------------
+   *
+   * Appended after PD_COMPLETION_NONE on purpose. These values are mirrored by four
+   * wrappers with explicit numbers, so a new member may only ever go at the end;
+   * inserting one beside its conceptual neighbours would renumber every mirror.
+   *
+   * Unlike PD_COMPLETION_STAR_CHECKED_BLOCK — an SDK call, carried as profile data —
+   * both of these are wire primitives this core drives itself, and a job on either
+   * reports grade PD_GRADE_A_JOB_LEVEL_CONFIRMATION with the physical printer as the
+   * authority. PD_COMPLETION_STAR_ETB is only accepted where the driver holds the
+   * printer's session exclusively: its ASB counter is broadcast to every host on
+   * TCP 9100, so on a shared port it cannot say whose data finished.
+   */
+  PD_COMPLETION_STAR_ETB = 6,
+  PD_COMPLETION_STAR_ESC_GS_ETX = 7,
+  PD_COMPLETION_COUNT = 8
 } pd_completion_mechanism;
 
 /* pd::CutVariant — the cut a profile's mechanism actually performs. */
@@ -715,6 +731,115 @@ const char* pd_cut_variant_name(pd_cut_variant value);
 
 /* The non-contiguous code page enum, by member index 0..PD_CODE_PAGE_COUNT-1. */
 pd_code_page pd_code_page_at(int32_t index);
+
+/* =================================================================================
+ * M13b: the print-queue addon through the ABI (docs/sdk-spec.md §12)
+ * =================================================================================
+ *
+ * The queue has existed as a C++ library since the addon landed; this block is the part
+ * every other language can reach. It is deliberately the *whole* addon and not a
+ * convenience subset, because the three rules below are the addon, and a wrapper that
+ * could only enqueue would quietly reintroduce each one as a bug:
+ *
+ *   1. **A queue is not a retry engine.** A job that ends PD_OUTCOME_UNKNOWN blocks its
+ *      printer's lane, and nothing further drains onto that printer until
+ *      pd_queue_unblock is called by somebody who has looked at the paper. There is no
+ *      timer that clears it, because no timer can see a receipt.
+ *   2. **Idempotency keys flow through.** Enqueuing a key that already has a job — held,
+ *      printing, or finished months ago — returns that job and prints nothing. The key
+ *      is claimed in the driver's own index at enqueue time, so a direct pd_print of the
+ *      same key dedupes against a job that is still parked.
+ *   3. **No bypass.** Draining runs the identical engine path a direct pd_print takes:
+ *      same worker, same preflight, same fences, same confidence grading. A queued job
+ *      is an ordinary pd_job throughout — same handle, same id, same event stream, with
+ *      PD_JOB_STATE_HELD_OFFLINE appearing in it while the bytes are parked.
+ *
+ * Lifetime: a pd_queue is created on a pd_driver and MUST be destroyed before it. It is
+ * the one handle in this ABI the caller owns and frees, because it is an addon rather
+ * than part of the driver's object graph.
+ */
+
+typedef struct pd_queue pd_queue;
+
+/* pd::DrainOrder. */
+typedef enum pd_drain_order {
+  PD_DRAIN_FIFO = 0,     /* submission order — the safe default for sequenced tickets */
+  PD_DRAIN_PRIORITY = 1, /* higher priority first, submission order within a priority */
+  PD_DRAIN_ORDER_COUNT = 2
+} pd_drain_order;
+
+/*
+ * pd::QueuePolicy. All-zeroes is valid and means: hold nothing, never expire, unlimited
+ * depth, FIFO. That is a pure serializer, which is a deliberate choice rather than a
+ * default — see the field comments for what each zero costs.
+ */
+typedef struct pd_queue_policy {
+  /* Park jobs while the printer is known to be offline, coverless or out of paper
+   * instead of failing them one at a time. 0 makes the queue a pure serializer. */
+  int32_t hold_while_offline;
+  /* Shelf life for a held job, in milliseconds; 0 means it never expires. A kitchen
+   * ticket must not print into a recovered kitchen half an hour late. */
+  uint32_t default_ttl_ms;
+  /* Held jobs per printer. 0 is unlimited, which recreates the printer's own buffer
+   * problem one layer up; the C++ default is 64 and is what a caller should copy. */
+  uint32_t max_depth;
+  pd_drain_order drain_order;
+} pd_queue_policy;
+
+/* pd::QueueOptions. */
+typedef struct pd_queue_options {
+  const char* key;      /* idempotency key; NULL or "" -> generated, no dedupe */
+  uint32_t ttl_ms;      /* 0 -> the policy default */
+  int32_t priority;     /* orders the waiting set only; in flight is never preempted */
+  pd_cut cut;
+  int32_t open_drawer;
+  pd_preflight preflight;
+  uint32_t timeout_ms;  /* 0 -> the profile's completion timeout */
+} pd_queue_options;
+
+/* NULL only when `driver` is NULL. `policy` may be NULL for the all-zeroes policy. */
+pd_queue* pd_queue_create(pd_driver* driver, const pd_queue_policy* policy);
+
+/* Stops the queue thread and frees the handle. Held jobs stay held and stay
+ * non-terminal: the queue does not invent an outcome for a job whose fate it does not
+ * know. Must be called before pd_destroy on the owning driver. */
+void pd_queue_destroy(pd_queue* queue);
+
+/*
+ * Returns an ordinary pd_job, never NULL for a valid call. It is already sent when the
+ * printer is usable and its lane is free; otherwise it is in PD_JOB_STATE_HELD_OFFLINE,
+ * or already terminal with PD_REASON_QUEUE_OVERFLOW when the lane is full. The handle is
+ * owned by the driver exactly like a pd_print handle and is freed by pd_destroy.
+ */
+pd_job* pd_queue_enqueue(pd_queue* queue, pd_printer* printer, const pd_payload* payload,
+                         const pd_queue_options* options);
+
+/* Operator hold, independent of what the device is reporting. */
+void pd_queue_pause(pd_queue* queue, const char* printer_id);
+void pd_queue_resume(pd_queue* queue, const char* printer_id);
+int32_t pd_queue_is_paused(pd_queue* queue, const char* printer_id);
+
+/*
+ * 1 once a job on this printer ended PD_OUTCOME_UNKNOWN. The lane drains nothing more
+ * until pd_queue_unblock — rule 1 above, and the reason this is a function and not a
+ * timeout.
+ */
+int32_t pd_queue_is_blocked(pd_queue* queue, const char* printer_id);
+void pd_queue_unblock(pd_queue* queue, const char* printer_id);
+
+/* Held jobs. `printer_id` NULL or "" counts every lane. */
+size_t pd_queue_pending(pd_queue* queue, const char* printer_id);
+
+size_t pd_queue_expired_count(pd_queue* queue);
+size_t pd_queue_overflow_count(pd_queue* queue);
+size_t pd_queue_drained_count(pd_queue* queue);
+
+/* Runs one expiry-and-drain pass on the calling thread. The queue's own thread does this
+ * on every device event and whenever a TTL comes due; this is for hosts that would rather
+ * pump it themselves, and for tests. */
+void pd_queue_tick(pd_queue* queue);
+
+const char* pd_drain_order_name(pd_drain_order value);
 
 #ifdef __cplusplus
 }  /* extern "C" */

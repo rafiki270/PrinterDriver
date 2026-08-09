@@ -77,13 +77,19 @@ PD_TEST(confidence_grade_and_authority_names_are_unique_and_complete) {
   CHECK_EQ(static_cast<int>(ConfidenceGrade::APlus_DurableQueryableJob), 0);
   CHECK_EQ(static_cast<int>(ConfidenceGrade::E_TransportOnly), 5);
 
-  // Nothing this core can do produces A+ yet: the ePOS transport that would retrieve a
-  // JobID result does not exist, so no mechanism maps onto it. Asserting the absence
-  // keeps the claim honest until the transport lands and this line has to change.
+  // M13b: A+ is produced now, and by exactly one mechanism. The ePOS client submits under
+  // a printjobid and retrieves the result under it, which is the durable, queryable job
+  // docs/compatibility-brief.md §24 puts at the top. Every other mechanism here is a
+  // promise about one socket, and none of them may claim it.
+  CHECK_EQ(evidenceFor(CompletionMechanism::EposJobId).grade,
+           ConfidenceGrade::APlus_DurableQueryableJob);
+  CHECK_EQ(evidenceFor(CompletionMechanism::EposJobId).authority,
+           CompletionAuthority::VendorSpooler);
   for (const CompletionMechanism mechanism :
        {CompletionMechanism::GsParenH, CompletionMechanism::GsR1,
-        CompletionMechanism::VendorIdle, CompletionMechanism::EposJobId,
-        CompletionMechanism::StarCheckedBlock, CompletionMechanism::None}) {
+        CompletionMechanism::VendorIdle, CompletionMechanism::StarCheckedBlock,
+        CompletionMechanism::StarEtb, CompletionMechanism::StarEscGsEtx,
+        CompletionMechanism::None}) {
     CHECK(evidenceFor(mechanism).grade != ConfidenceGrade::APlus_DurableQueryableJob);
   }
 
