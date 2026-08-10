@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <mutex>
 #include <string>
 
@@ -68,6 +69,35 @@ struct Rig {
 JobResult runOne(Rig& rig, const std::string& text, JobOptions options = {}) {
   auto job = rig.printer->print(Payload::raw(textPayload(text)), options);
   return job->result();
+}
+
+// A four-character literal is never a safe stand-in for "a token nobody minted", and
+// never a safe stand-in for "another instance's token" either. The space is
+// [2-char instance nonce][2-char sequence] (docs/api.md §14) and the nonce is drawn at
+// random, so every literal is the token some instance mints: "!!!!" is sequence 0 under
+// nonce "!!" — the first print token this driver hands out — and "~~~~" is sequence 8835
+// under nonce "~~". Spell either one and the test fails on the 1 run in 8836 that draws
+// that nonce. Build probes against the driver's own nonce instead.
+constexpr char kTokenAlphabetLast = '~';  // '!' + 93, the top of the 94-char alphabet
+
+// This driver's nonce at a sequence it has not reached: 8835 is the last of the 8836, so
+// a rig that has printed a handful of jobs is thousands of leases short of it.
+std::string unmintedToken(const PrinterDriver& driver) {
+  return driver.instanceNonce() + "~~";
+}
+
+// A nonce that is provably not this driver's, for echoes that have to read as foreign.
+std::string foreignNonce(const PrinterDriver& driver) {
+  std::string nonce = driver.instanceNonce();
+  nonce[0] = nonce[0] == kTokenAlphabetLast ? '!' : static_cast<char>(nonce[0] + 1);
+  return nonce;
+}
+
+// Pins the nonce a file-backed driver loads on construction, which turns a token layout
+// that is otherwise 1-in-8836 into one a test can ask for on purpose.
+void writeInstanceNonce(const std::string& directory, const std::string& nonce) {
+  std::ofstream out(directory + "/instance.nonce", std::ios::trunc);
+  out << nonce << "\n";
 }
 
 }  // namespace
@@ -934,8 +964,38 @@ PD_TEST(engine_resolves_a_job_from_either_of_its_printed_tokens) {
   CHECK(job != nullptr);
   CHECK(rig.driver->jobByToken(job->printToken()).get() == job.get());
   CHECK(rig.driver->jobByToken(job->cutToken()).get() == job.get());
-  CHECK(rig.driver->jobByToken("!!!!") == nullptr);
+  // Well-formed tokens that resolve to nothing: ours at a sequence we have not reached,
+  // and another instance's. Both are derived rather than spelled — see unmintedToken.
+  CHECK(rig.driver->jobByToken(unmintedToken(*rig.driver)) == nullptr);
+  CHECK(rig.driver->jobByToken(foreignNonce(*rig.driver) + "!!") == nullptr);
   CHECK(rig.driver->jobByToken("") == nullptr);
+}
+
+PD_TEST(engine_mints_the_floor_of_the_token_space_when_the_nonce_is_the_alphabet_floor) {
+  // Regression for a once-in-8836 flake: this file, the C ABI suite and the Swift suite
+  // all used "!!!!" as the token no driver could have minted. It is the opposite — the
+  // floor of the space, sequence 0, which is precisely the first print token a driver
+  // hands out — so on the run where the instance nonce came up "!!", the negative
+  // control resolved to the job under test and the assertion failed. Pinning the nonce
+  // through the store makes that run reproducible instead of annual.
+  pdfake::TempDir dir("engine-token-floor");
+  { JobStore store(StorageConfig::at(dir.path())); }  // creates the directory
+  writeInstanceNonce(dir.path(), "!!");
+
+  Rig rig(CompletionMechanism::GsParenH, StorageConfig::at(dir.path()));
+  rig.build();
+  JobOptions options;
+  options.key = "order-token-floor";
+  CHECK_EQ(runOne(rig, "FLOOR", options).outcome, JobOutcome::Done);
+
+  auto job = rig.driver->findJob(options.key);
+  CHECK(job != nullptr);
+  CHECK_EQ(rig.driver->instanceNonce(), std::string("!!"));
+  CHECK_EQ(job->printToken(), std::string("!!!!"));
+  CHECK(rig.driver->jobByToken("!!!!").get() == job.get());
+  // What a negative control has to look like instead: same driver, a sequence it is
+  // 4 417 jobs short of leasing.
+  CHECK(rig.driver->jobByToken(unmintedToken(*rig.driver)) == nullptr);
 }
 
 PD_TEST(engine_reprint_takes_a_fresh_token_and_the_newest_holder_wins) {
@@ -1036,8 +1096,9 @@ PD_TEST(engine_reports_a_foreign_echo_without_consuming_a_fence) {
   pdfake::Script script;
   // Another instance's nonce, so the token is structurally perfect and provably not
   // ours (docs/sdk-spec.md §14: direct multi-instance writing is unsupported, and the
-  // instance nonce exists to make a violation loud).
-  script.foreign_process_id = "~~~~";
+  // instance nonce exists to make a violation loud). Derived from this driver's nonce,
+  // because a spelled one is ours on the run that happens to draw it.
+  script.foreign_process_id = foreignNonce(*rig.driver) + "~~";
   rig.link.device->setScript(script);
   rig.build();
 
@@ -1052,6 +1113,30 @@ PD_TEST(engine_reports_a_foreign_echo_without_consuming_a_fence) {
         events.end());
   CHECK_EQ(std::string(to_string(DeviceEvent::ForeignWriterDetected)),
            std::string("ForeignWriterDetected"));
+}
+
+PD_TEST(engine_owns_the_ceiling_of_the_token_space_when_the_nonce_is_the_alphabet_top) {
+  // The same trap inverted. "~~~~" was this file's stand-in for another instance's
+  // token, but under nonce "~~" it is ours — sequence 8835 — so the echo reads as a
+  // late marker rather than a foreign one and ForeignWriterDetected is correctly not
+  // raised. That is why the foreign-echo test above derives its nonce.
+  pdfake::TempDir dir("engine-token-ceiling");
+  { JobStore store(StorageConfig::at(dir.path())); }  // creates the directory
+  writeInstanceNonce(dir.path(), "~~");
+
+  Rig rig(CompletionMechanism::GsParenH, StorageConfig::at(dir.path()));
+  CHECK_EQ(rig.driver->instanceNonce(), std::string("~~"));
+  pdfake::Script script;
+  script.foreign_process_id = "~~~~";
+  rig.link.device->setScript(script);
+  rig.build();
+
+  std::vector<DeviceEvent> events;
+  rig.printer->subscribe([&events](DeviceEvent event) { events.push_back(event); });
+  CHECK_EQ(runOne(rig, "OURS").outcome, JobOutcome::Done);
+  CHECK(std::find(events.begin(), events.end(), DeviceEvent::ForeignWriterDetected) ==
+        events.end());
+  CHECK(foreignNonce(*rig.driver) != rig.driver->instanceNonce());
 }
 
 PD_TEST(engine_does_not_cry_foreign_over_our_own_late_echo) {

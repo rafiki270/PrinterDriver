@@ -209,7 +209,11 @@ final class PrintJobTests: XCTestCase {
     XCTAssertTrue(kitchen.scriptedReceivedContains("ORDER: rvi-1  V:\(printToken)"))
     XCTAssertTrue(driver.job(token: printToken) === job)
     XCTAssertTrue(driver.job(token: cutToken) === job)
-    XCTAssertNil(driver.job(token: "!!!!"))
+    // Not a literal. A token is [2-char instance nonce][2-char sequence], so every
+    // four-character string is some instance's: "!!!!" is sequence 0 under nonce "!!",
+    // which is this very job's print token on 1 run in 8836. Probe this driver's nonce
+    // at a sequence it has not reached.
+    XCTAssertNil(driver.job(token: driver.instanceNonce + "~~"))
   }
 
   func testSuppressingTheVerificationIDRemovesTheInkAndNotTheEvidence() throws {

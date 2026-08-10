@@ -426,6 +426,30 @@ The idempotency key remains the fleet-wide business identity; the RVI is the
 per-print physical-evidence identity. Key ↔ UUID ↔ RVI resolve in both directions
 through the journal.
 
+### 14.1 No four-character literal is a valid test probe
+
+A consequence of the layout that has already cost us one intermittent failure across
+three suites. Because the nonce is drawn at random and the sequence starts at 0, **every
+four-character string in the alphabet is a token some instance mints**, and the two
+literals a human reaches for first are the worst two available:
+
+| Literal  | What it actually is                | Fails when the run draws |
+|----------|------------------------------------|--------------------------|
+| `"!!!!"` | sequence 0 — the *first* print token a driver hands out | nonce `!!` |
+| `"~~~~"` | sequence 8835 — the last of the space | nonce `~~` |
+
+Used as "a token nobody minted", `"!!!!"` resolves to the job under test on 1 run in
+8 836; used as "another instance's token", `"~~~~"` is ours on the same odds and no
+`ForeignWriterDetected` is raised. Both reproduce on demand by pinning the nonce — write
+the two characters to `<store>/instance.nonce` before constructing the driver.
+
+Build probes from `instanceNonce()` (`pd_instance_nonce`) instead:
+
+- **Unminted, ours:** `instanceNonce() + "~~"` — sequence 8835, which a rig that has
+  printed a handful of jobs is thousands of leases short of reaching.
+- **Foreign:** bump the first nonce character within the alphabet (`~` wraps to `!`) and
+  append any sequence.
+
 ## 15. Self-test and auto-detection
 
 Two composition APIs over existing machinery (discovery, identify, probe, DSL, fences):

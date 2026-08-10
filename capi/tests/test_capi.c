@@ -146,7 +146,13 @@ static void test_verification_identifier_round_trip(void) {
   CHECK(pd_test_received_contains(printer, "ORDER: capi-rvi-1"));
   CHECK(pd_job_by_token(driver, print_token) == job);
   CHECK(pd_job_by_token(driver, cut_token) == job);
-  CHECK(pd_job_by_token(driver, "!!!!") == NULL);
+  /* Not a literal. A token is [2-char instance nonce][2-char sequence], so every
+     four-character string is some instance's: "!!!!" is sequence 0 under nonce "!!",
+     which is this very job's print token on 1 run in 8836. Probe this driver's nonce at
+     a sequence it has not reached. */
+  char unminted[5];
+  snprintf(unminted, sizeof(unminted), "%.2s~~", pd_instance_nonce(driver));
+  CHECK(pd_job_by_token(driver, unminted) == NULL);
 
   /* Suppressed per job: the token is still minted and still resolves, but no ink. */
   pd_job_options quiet;
